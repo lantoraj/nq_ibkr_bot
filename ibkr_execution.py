@@ -9,7 +9,10 @@ Handles:
 """
 from __future__ import annotations
 
+import json
 import logging
+import threading
+import urllib.request
 from datetime import datetime
 from typing import List, Optional
 
@@ -45,6 +48,43 @@ class IBKRNQBotRunner:
         self._entry_submitted_bar: int = -1
         self._be_moved: bool = False
         self._decay_moved: bool = False
+
+    def _send_discord_alert(self, title: str, description: str, color: int = 0x3498DB) -> None:
+        """Send an asynchronous rich embed notification to Discord if DISCORD_WEBHOOK_URL is configured."""
+        url = (self.cfg.ibkr.discord_webhook_url or "").strip()
+        if not url:
+            return
+
+        payload = {
+            "username": "NQ Quant Bot (v4)",
+            "embeds": [
+                {
+                    "title": title,
+                    "description": description,
+                    "color": color,
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                }
+            ],
+        }
+
+        def _post() -> None:
+            try:
+                data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=data,
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "NQ-IBKR-Quant-Bot/4.0",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10):
+                    pass
+            except Exception as exc:
+                logger.warning("Failed to send Discord alert: %s", exc)
+
+        threading.Thread(target=_post, daemon=True).start()
 
     def connect(self, max_retries: int = 12, retry_wait_sec: int = 10) -> None:
         """Connect to IBKR TWS or IB Gateway (with automatic retries for Docker IB Gateway bootup)."""
@@ -256,6 +296,19 @@ class IBKRNQBotRunner:
             signal.take_profit,
             signal.reason,
         )
+        icon = "🟢 LONG ENTRY" if signal.direction == "LONG" else "🔴 SHORT ENTRY"
+        color = 0x2ECC71 if signal.direction == "LONG" else 0xE74C3C
+        self._send_discord_alert(
+            title=f"{icon} — {action} {quantity} {self.contract.localSymbol} @ {signal.entry_price:.2f}",
+            description=(
+                f"**Mode:** `{self.mode.upper()}`\n"
+                f"**Entry Price:** `{signal.entry_price:.2f}`\n"
+                f"**Stop Loss (`-1R`):** `{signal.stop_loss:.2f}`\n"
+                f"**Take Profit (`+3R`):** `{signal.take_profit:.2f}`\n"
+                f"**Signal Setup:** {signal.reason}"
+            ),
+            color=color,
+        )
         return trades
 
     def _bars_to_dataframe(self, bars: BarDataList) -> pd.DataFrame:
@@ -355,6 +408,11 @@ class IBKRNQBotRunner:
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
                         logger.info("Moved LONG StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
+                        self._send_discord_alert(
+                            title=f"🛡️ BREAK-EVEN (+1R) LOCKED — {self.contract.localSymbol} LONG",
+                            description=f"Moved Stop Loss up to **`{new_sl:.2f}`** (`+1.0 pt` above entry `{sig.entry_price:.2f}`).",
+                            color=0xF1C40F,
+                        )
                 elif sig.direction == "SHORT" and low_p <= sig.entry_price - one_r:
                     new_sl = round_to_tick(sig.entry_price - self.cfg.risk.breakeven_offset_points)
                     if new_sl < self._active_stop_order.stopPrice:
@@ -362,6 +420,11 @@ class IBKRNQBotRunner:
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
                         logger.info("Moved SHORT StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
+                        self._send_discord_alert(
+                            title=f"🛡️ BREAK-EVEN (+1R) LOCKED — {self.contract.localSymbol} SHORT",
+                            description=f"Moved Stop Loss down to **`{new_sl:.2f}`** (`-1.0 pt` below entry `{sig.entry_price:.2f}`).",
+                            color=0xF1C40F,
+                        )
                 elif (
                     self.cfg.risk.time_decay_bars > 0
                     and not self._decay_moved
@@ -374,6 +437,11 @@ class IBKRNQBotRunner:
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
                             logger.info("Time-Decay Stop Tightening: Moved LONG StopOrder to -0.5R (%.2f)", dec_sl)
+                            self._send_discord_alert(
+                                title=f"⏳ TIME-DECAY STOP (-0.5R) — {self.contract.localSymbol} LONG",
+                                description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after 6 bars without reaching `+1R`.",
+                                color=0xE67E22,
+                            )
                     else:
                         dec_sl = round_to_tick(sig.entry_price + self.cfg.risk.time_decay_stop_r * one_r)
                         if high_p < dec_sl and dec_sl < self._active_stop_order.stopPrice:
@@ -381,6 +449,11 @@ class IBKRNQBotRunner:
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
                             logger.info("Time-Decay Stop Tightening: Moved SHORT StopOrder to -0.5R (%.2f)", dec_sl)
+                            self._send_discord_alert(
+                                title=f"⏳ TIME-DECAY STOP (-0.5R) — {self.contract.localSymbol} SHORT",
+                                description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after 6 bars without reaching `+1R`.",
+                                color=0xE67E22,
+                            )
             return
 
         # 4. Check intraday risk guardrails
@@ -431,6 +504,20 @@ class IBKRNQBotRunner:
                 self.risk.state.realized_pnl_usd,
                 self.risk.state.trades_taken,
             )
+            win_str = "💰 TRADE CLOSED (PROFIT)" if net_pnl > 0 else "🛑 TRADE CLOSED (LOSS)"
+            color = 0x2ECC71 if net_pnl > 0 else 0xE74C3C
+            sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+            fill_price = getattr(getattr(fill, "execution", None), "price", 0.0)
+            self._send_discord_alert(
+                title=f"{win_str} — {sym} ({net_pnl:+.2f} USD)",
+                description=(
+                    f"**Exit Fill Price:** `{fill_price:.2f}`\n"
+                    f"**Trade Realized PnL:** **`${net_pnl:+.2f}`**\n"
+                    f"**Daily Session PnL:** `${self.risk.state.realized_pnl_usd:+.2f}`\n"
+                    f"**Trades Today:** `{self.risk.state.trades_taken}/{self.cfg.risk.max_daily_trades}`"
+                ),
+                color=color,
+            )
             if self.risk.state.halted:
                 self.flatten_all(reason=self.risk.state.halt_reason)
 
@@ -458,6 +545,15 @@ class IBKRNQBotRunner:
                 keepUpToDate=False,
             )
             logger.info("Bot is now live and polling 2-min bar closes every 20s. Press Ctrl+C to stop.")
+            self._send_discord_alert(
+                title=f"🤖 NQ Quant Bot Online — {self.contract.localSymbol} ({self.mode.upper()})",
+                description=(
+                    f"**Contract:** `{self.contract.localSymbol}` (Expiry `{self.contract.lastTradeDateOrContractMonth}`)\n"
+                    f"**Timeframe:** `{self.cfg.strategy.bar_size}` | **Contracts:** `{self.cfg.risk.fixed_contracts}`\n"
+                    f"**Window:** `{self.cfg.risk.entry_start_time}–{self.cfg.risk.entry_end_time} ET`"
+                ),
+                color=0x3498DB,
+            )
             # Process the latest closed historical bar immediately on startup
             self._on_bar_update(self.bars, has_new_bar=True)
 

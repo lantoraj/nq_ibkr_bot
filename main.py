@@ -108,6 +108,11 @@ def parse_args() -> argparse.Namespace:
         default=101,
         help="IBKR API clientId (default: 101)",
     )
+    parser.add_argument(
+        "--discord-webhook",
+        default="",
+        help="Optional Discord Webhook URL for live trade entry/exit notifications (or set DISCORD_WEBHOOK_URL env var)",
+    )
     return parser.parse_args()
 
 
@@ -125,6 +130,8 @@ def main() -> int:
     cfg.risk.max_daily_loss_usd = args.max_daily_loss
     cfg.ibkr.host = args.host
     cfg.ibkr.client_id = args.client_id
+    if args.discord_webhook:
+        cfg.ibkr.discord_webhook_url = args.discord_webhook
 
     if args.port > 0:
         if args.mode == "live":

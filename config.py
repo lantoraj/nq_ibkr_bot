@@ -7,18 +7,20 @@ of real IBKR Continuous MNQ futures data (July 27 - Oct 27, 2026), achieving:
 - Profit Factor: 1.97 | Sharpe Ratio: 2.47 | Max Drawdown: $790.52
 """
 from dataclasses import dataclass, field
+import os
 from typing import Literal
 
 
 @dataclass
 class IBKRConfig:
-    """Interactive Brokers TWS / IB Gateway connection settings."""
+    """Interactive Brokers TWS / IB Gateway connection & notification settings."""
     host: str = "127.0.0.1"
     paper_port: int = 7497      # Default TWS Paper Trading port (4002 for IB Gateway Paper)
     live_port: int = 7496       # Default TWS Live Trading port (4001 for IB Gateway Live)
     client_id: int = 101
     account: str = ""           # Optional: specify IBKR account code if multiple accounts exist
     timeout: int = 20
+    discord_webhook_url: str = field(default_factory=lambda: os.getenv("DISCORD_WEBHOOK_URL", ""))
 
 
 @dataclass
