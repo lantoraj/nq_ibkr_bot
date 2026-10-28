@@ -13,7 +13,7 @@ import json
 import logging
 import threading
 import urllib.request
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional
 
 import pandas as pd
@@ -48,6 +48,7 @@ class IBKRNQBotRunner:
         self._entry_submitted_bar: int = -1
         self._be_moved: bool = False
         self._decay_moved: bool = False
+        self._last_summary_date: Optional[date] = None
 
     def _send_discord_alert(self, title: str, description: str, color: int = 0x3498DB) -> None:
         """Send an asynchronous rich embed notification to Discord if DISCORD_WEBHOOK_URL is configured."""
@@ -338,10 +339,15 @@ class IBKRNQBotRunner:
         self._last_processed_bar_time = latest_closed_ts
         self.bar_count += 1
 
-        # 1. Check mandatory EOD Flatten
+        # 1. Check mandatory EOD Flatten & Send Daily Summary Report (15:55 ET)
+        self.risk.check_and_reset_session(latest_closed_ts)
         if self.risk.should_flatten_eod(latest_closed_ts):
             if self.has_open_position_or_orders():
                 self.flatten_all(reason="End of Day (15:55 ET) Auto-Flatten")
+            curr_date = self.risk.state.session_date
+            if curr_date is not None and self._last_summary_date != curr_date:
+                self._last_summary_date = curr_date
+                self.send_daily_summary_report(df, latest_closed_ts)
             return
 
         # 2. Compute indicators on latest closed bar
@@ -520,6 +526,69 @@ class IBKRNQBotRunner:
             )
             if self.risk.state.halted:
                 self.flatten_all(reason=self.risk.state.halt_reason)
+
+    def send_daily_summary_report(self, df: pd.DataFrame, latest_ts: pd.Timestamp) -> None:
+        """Send an End-of-Day (15:55 ET) Session Summary Report to Discord and console logs."""
+        st = self.risk.state
+        sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+        session_date_str = str(st.session_date or self.risk._to_session_dt(latest_ts).date())
+
+        enriched = self.strategy.prepare_dataframe(df)
+        last = enriched.iloc[-1]
+        close_p = float(last["close"])
+        vwap_p = float(last.get("vwap", close_p))
+
+        # Calculate today's RTH session High & Low
+        ts_et = pd.to_datetime(enriched["timestamp"], utc=True).dt.tz_convert(self.cfg.risk.timezone)
+        today_mask = ts_et.dt.date == st.session_date
+        if today_mask.any():
+            day_high = float(enriched.loc[today_mask, "high"].max())
+            day_low = float(enriched.loc[today_mask, "low"].min())
+        else:
+            day_high = float(enriched["high"].tail(100).max())
+            day_low = float(enriched["low"].tail(100).min())
+
+        win_rate = (st.wins / st.trades_taken * 100.0) if st.trades_taken > 0 else 0.0
+        pnl = st.realized_pnl_usd
+
+        if st.trades_taken == 0:
+            color = 0x3498DB
+            outcome_icon = "📊 DAILY SUMMARY (NO TRADES)"
+        elif pnl > 0:
+            color = 0x2ECC71
+            outcome_icon = "🏆 DAILY SUMMARY (PROFITABLE DAY)"
+        else:
+            color = 0xE74C3C
+            outcome_icon = "📉 DAILY SUMMARY (NET LOSS)"
+
+        status_line = f"Halted ({st.halt_reason})" if st.halted else "Completed Normally (15:55 ET EOD)"
+
+        logger.info(
+            "EOD DAILY SUMMARY [%s] %s | Trades: %d (W:%d / L:%d, %.1f%%) | Net PnL: $%+.2f | Close: %.2f | VWAP: %.2f",
+            session_date_str,
+            sym,
+            st.trades_taken,
+            st.wins,
+            st.losses,
+            win_rate,
+            pnl,
+            close_p,
+            vwap_p,
+        )
+
+        self._send_discord_alert(
+            title=f"{outcome_icon} — {sym} ({session_date_str})",
+            description=(
+                f"**Mode:** `{self.mode.upper()}` | **Contract:** `{sym}`\n"
+                f"**Session Net PnL:** **`${pnl:+.2f} USD`**\n"
+                f"**Trades Taken:** `{st.trades_taken}/{self.cfg.risk.max_daily_trades}` "
+                f"(Wins: `{st.wins}` | Losses: `{st.losses}` | WR: `{win_rate:.1f}%`)\n"
+                f"**Closing Price (15:55 ET):** `{close_p:.2f}` (VWAP: `{vwap_p:.2f}`)\n"
+                f"**Session Range:** `{day_low:.2f} – {day_high:.2f}` (`{day_high - day_low:.2f} pts`)\n"
+                f"**Session Status:** `{status_line}`"
+            ),
+            color=color,
+        )
 
     def run_streaming(self) -> None:
         """Start real-time bar subscription and run the IBKR event loop."""

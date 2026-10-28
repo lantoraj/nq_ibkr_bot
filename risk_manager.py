@@ -25,6 +25,8 @@ class DailyRiskState:
     session_date: Optional[date] = None
     realized_pnl_usd: float = 0.0
     trades_taken: int = 0
+    wins: int = 0
+    losses: int = 0
     consecutive_losses: int = 0
     last_exit_bar_index: int = -999
     halted: bool = False
@@ -138,8 +140,10 @@ class RiskManager:
         self.state.last_exit_bar_index = exit_bar_index
 
         if net_pnl_usd < 0:
+            self.state.losses += 1
             self.state.consecutive_losses += 1
         else:
+            self.state.wins += 1
             self.state.consecutive_losses = 0
 
         if self.state.realized_pnl_usd <= -abs(self.r_cfg.max_daily_loss_usd):
