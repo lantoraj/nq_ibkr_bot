@@ -1,0 +1,37 @@
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ib-gateway
+    restart: always
+    environment:
+      TWS_USERID: ${TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      READ_ONLY_API: "no"
+      TWOFA_TIMEOUT_ACTION: "restart"
+      AUTO_RESTART_TIME: "11:55 PM"
+      TIME_ZONE: "America/New_York"
+      TWS_ACCEPT_INCOMING: "accept"
+    ports:
+      # Localhost-only bindings so API and optional VNC are never exposed to the public internet
+      - "127.0.0.1:4001:4001"
+      - "127.0.0.1:4002:4002"
+      - "127.0.0.1:5900:5900"
+
+  nq-bot:
+    build: .
+    container_name: nq-ibkr-bot
+    restart: unless-stopped
+    network_mode: "service:ib-gateway"
+    depends_on:
+      - ib-gateway
+    command: >
+      python -u main.py
+      --mode ${TRADING_MODE:-paper}
+      --symbol ${BOT_SYMBOL:-MNQ}
+      --bar-size "${BOT_BAR_SIZE:-2 mins}"
+      --contracts ${BOT_CONTRACTS:-1}
+      --max-daily-loss ${BOT_MAX_DAILY_LOSS:-250.0}
+      --host 127.0.0.1
+      --port ${IB_GATEWAY_PORT:-4002}
+      --client-id ${BOT_CLIENT_ID:-101}

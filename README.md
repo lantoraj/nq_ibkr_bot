@@ -155,3 +155,26 @@ python -m pytest
 # 3. Run Live on IBKR Paper Account (TWS Port 7497)
 python main.py --mode paper --symbol MNQ --bar-size "2 mins" --contracts 1
 ```
+
+---
+
+## 6. Cloud Deployment on DigitalOcean Droplet (Docker + IB Gateway 24/7)
+
+You can run **IB Gateway + the NQ Quant Bot** 24/7 on a headless Linux **DigitalOcean Droplet** (`2 GB RAM / 1 vCPU` in `NYC1`/`NYC3` region, Ubuntu 24.04 + Docker) using the included `Dockerfile` and `docker-compose.yml`:
+
+```bash
+# 1. SSH into your DigitalOcean Droplet and clone the repository
+git clone https://github.com/lantoraj/nq_ibkr_bot.git
+cd nq_ibkr_bot
+
+# 2. Create your .env file from .env.example and set your IBKR username/password
+cp .env.example .env
+nano .env
+
+# 3. Build and start IB Gateway + NQ Bot in the background
+docker compose up -d --build
+
+# 4. Follow live 2-minute bar heartbeats and trade logs
+docker compose logs -f nq-bot
+```
+

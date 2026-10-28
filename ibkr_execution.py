@@ -46,24 +46,42 @@ class IBKRNQBotRunner:
         self._be_moved: bool = False
         self._decay_moved: bool = False
 
-    def connect(self) -> None:
-        """Connect to IBKR TWS or IB Gateway."""
+    def connect(self, max_retries: int = 12, retry_wait_sec: int = 10) -> None:
+        """Connect to IBKR TWS or IB Gateway (with automatic retries for Docker IB Gateway bootup)."""
+        import time
+
         port = self.cfg.ibkr.paper_port if self.mode == "paper" else self.cfg.ibkr.live_port
-        logger.info(
-            "Connecting to IBKR (%s mode) at %s:%d (clientId=%d)...",
-            self.mode.upper(),
-            self.cfg.ibkr.host,
-            port,
-            self.cfg.ibkr.client_id,
-        )
-        self.ib.connect(
-            host=self.cfg.ibkr.host,
-            port=port,
-            clientId=self.cfg.ibkr.client_id,
-            timeout=self.cfg.ibkr.timeout,
-            account=self.cfg.ibkr.account or "",
-        )
-        logger.info("Connected to IBKR. Managed accounts: %s", self.ib.managedAccounts())
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(
+                    "Connecting to IBKR (%s mode) at %s:%d (clientId=%d, attempt %d/%d)...",
+                    self.mode.upper(),
+                    self.cfg.ibkr.host,
+                    port,
+                    self.cfg.ibkr.client_id,
+                    attempt,
+                    max_retries,
+                )
+                self.ib.connect(
+                    host=self.cfg.ibkr.host,
+                    port=port,
+                    clientId=self.cfg.ibkr.client_id,
+                    timeout=self.cfg.ibkr.timeout,
+                    account=self.cfg.ibkr.account or "",
+                )
+                logger.info("Connected to IBKR. Managed accounts: %s", self.ib.managedAccounts())
+                return
+            except Exception as exc:
+                if attempt >= max_retries:
+                    raise
+                logger.warning(
+                    "IBKR connection attempt %d/%d failed (%s). Retrying in %ds...",
+                    attempt,
+                    max_retries,
+                    exc,
+                    retry_wait_sec,
+                )
+                time.sleep(retry_wait_sec)
 
     def resolve_front_month_contract(self) -> Contract:
         """
