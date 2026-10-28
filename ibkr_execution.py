@@ -273,11 +273,36 @@ class IBKRNQBotRunner:
                 self.flatten_all(reason="End of Day (15:55 ET) Auto-Flatten")
             return
 
-        # 2. If already in a position or working order, check Unfilled Timeout & +1R Break-Even Stop
+        # 2. Compute indicators on latest closed bar
+        enriched = self.strategy.prepare_dataframe(df)
+        last = enriched.iloc[-1]
+        close_p = float(last["close"])
+        vwap_p = float(last.get("vwap", close_p))
+        ema_fast_p = float(last.get("ema_fast", close_p))
+        ema_slow_p = float(last.get("ema_slow", close_p))
+        vwap_z = float(last.get("vwap_z", 0.0))
+        hurst_v = float(last.get("hurst", 0.5))
+        kalman_vel = float(last.get("kalman_vel_atr", 0.0))
+        et_ts_str = self.risk._to_session_dt(latest_closed_ts).strftime("%H:%M ET")
+
+        # 3. If already in a position or working order, check Unfilled Timeout & +1R Break-Even Stop
         if self.has_open_position_or_orders():
             has_pos = any(
                 pos.contract.conId == self.contract.conId and pos.position != 0
                 for pos in self.ib.positions()
+            )
+            logger.info(
+                "BAR CLOSE [%s] %s=%.2f | VWAP=%.2f (Z=%+.2f) | EMA9/21=%.2f/%.2f | Hurst=%.2f | KalVel=%+.2f | Status: %s",
+                et_ts_str,
+                self.contract.localSymbol if self.contract else "MNQ",
+                close_p,
+                vwap_p,
+                vwap_z,
+                ema_fast_p,
+                ema_slow_p,
+                hurst_v,
+                kalman_vel,
+                "In Active Position" if has_pos else "Working Entry Order",
             )
             if (
                 not has_pos
@@ -340,23 +365,12 @@ class IBKRNQBotRunner:
                             logger.info("Time-Decay Stop Tightening: Moved SHORT StopOrder to -0.5R (%.2f)", dec_sl)
             return
 
-        # 3. Compute indicators on latest closed bar & print 1-line heartbeat
-        enriched = self.strategy.prepare_dataframe(df)
-        last = enriched.iloc[-1]
-        close_p = float(last["close"])
-        vwap_p = float(last.get("vwap", close_p))
-        ema_fast_p = float(last.get("ema_fast", close_p))
-        ema_slow_p = float(last.get("ema_slow", close_p))
-        vwap_z = float(last.get("vwap_zscore", 0.0))
-        hurst_v = float(last.get("hurst", 0.5))
-        kalman_vel = float(last.get("kalman_vel", 0.0))
-
         # 4. Check intraday risk guardrails
         allowed, risk_reason = self.risk.can_open_trade(latest_closed_ts, self.bar_count)
         if not allowed:
             logger.info(
                 "BAR CLOSE [%s] %s=%.2f | VWAP=%.2f (Z=%+.2f) | EMA9/21=%.2f/%.2f | Hurst=%.2f | KalVel=%+.2f | Status: %s",
-                latest_closed_ts.strftime("%H:%M"),
+                et_ts_str,
                 self.contract.localSymbol if self.contract else "MNQ",
                 close_p,
                 vwap_p,
@@ -377,7 +391,7 @@ class IBKRNQBotRunner:
         else:
             logger.info(
                 "BAR CLOSE [%s] %s=%.2f | VWAP=%.2f (Z=%+.2f) | EMA9/21=%.2f/%.2f | Hurst=%.2f | KalVel=%+.2f | Status: Scanning (No trigger)",
-                latest_closed_ts.strftime("%H:%M"),
+                et_ts_str,
                 self.contract.localSymbol if self.contract else "MNQ",
                 close_p,
                 vwap_p,
@@ -386,7 +400,7 @@ class IBKRNQBotRunner:
                 ema_slow_p,
                 hurst_v,
                 kalman_vel,
-                )
+            )
 
     def _on_commission_report(self, trade: Trade, fill, report) -> None:
         """Track realized PnL from IBKR commission reports as positions close."""
@@ -423,13 +437,29 @@ class IBKRNQBotRunner:
                 whatToShow="TRADES",
                 useRTH=self.cfg.risk.rth_only,
                 formatDate=1,
-                keepUpToDate=True,
+                keepUpToDate=False,
             )
-            self.bars.updateEvent += self._on_bar_update
-            logger.info("Bot is now live and listening for bar closes. Press Ctrl+C to stop.")
-            # Process the latest closed historical bar immediately on startup so user sees current indicator state
+            logger.info("Bot is now live and polling 2-min bar closes every 20s. Press Ctrl+C to stop.")
+            # Process the latest closed historical bar immediately on startup
             self._on_bar_update(self.bars, has_new_bar=True)
-            self.ib.run()
+
+            # Poll every 20 seconds so both real-time CME subscriptions and 10-min delayed Paper feeds
+            # reliably advance on every 2-minute bar close without stalling.
+            while self.ib.isConnected():
+                self.ib.sleep(20)
+                fresh_bars = self.ib.reqHistoricalData(
+                    self.contract,
+                    endDateTime="",
+                    durationStr=self.cfg.strategy.history_duration,
+                    barSizeSetting=self.cfg.strategy.bar_size,
+                    whatToShow="TRADES",
+                    useRTH=self.cfg.risk.rth_only,
+                    formatDate=1,
+                    keepUpToDate=False,
+                )
+                if fresh_bars:
+                    self.bars = fresh_bars
+                    self._on_bar_update(self.bars, has_new_bar=True)
         except KeyboardInterrupt:
             logger.info("Shutdown requested by user (Ctrl+C).")
         finally:
