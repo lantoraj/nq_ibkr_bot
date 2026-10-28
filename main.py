@@ -32,6 +32,10 @@ def setup_logging(level: int = logging.INFO) -> None:
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    # Silence noisy ib_async wrapper/client portfolio & position heartbeats from unrelated account holdings
+    logging.getLogger("ib_async.wrapper").setLevel(logging.WARNING)
+    logging.getLogger("ib_async.client").setLevel(logging.WARNING)
+    logging.getLogger("ib_async.ib").setLevel(logging.WARNING)
 
 
 def parse_args() -> argparse.Namespace:
