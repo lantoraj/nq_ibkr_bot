@@ -297,7 +297,7 @@ class IBKRNQBotRunner:
             signal.take_profit,
             signal.reason,
         )
-        icon = "🟢 LONG ENTRY" if signal.direction == "LONG" else "🔴 SHORT ENTRY"
+        icon = "🟢 LONG ORDER SUBMITTED" if signal.direction == "LONG" else "🔴 SHORT ORDER SUBMITTED"
         color = 0x2ECC71 if signal.direction == "LONG" else 0xE74C3C
         self._send_discord_alert(
             title=f"{icon} — {action} {quantity} {self.contract.localSymbol} @ {signal.entry_price:.2f}",
@@ -306,7 +306,9 @@ class IBKRNQBotRunner:
                 f"**Entry Price:** `{signal.entry_price:.2f}`\n"
                 f"**Stop Loss (`-1R`):** `{signal.stop_loss:.2f}`\n"
                 f"**Take Profit (`+3R`):** `{signal.take_profit:.2f}`\n"
-                f"**Signal Setup:** {signal.reason}"
+                f"**Signal Setup:** {signal.reason}\n"
+                f"_Limit order working — a separate ✅ FILLED alert follows if executed, "
+                f"or ⚪ CANCELLED after {self.cfg.risk.cancel_unfilled_entry_bars} bars._"
             ),
             color=color,
         )
@@ -345,7 +347,10 @@ class IBKRNQBotRunner:
             if self.has_open_position_or_orders():
                 self.flatten_all(reason="End of Day (15:55 ET) Auto-Flatten")
             curr_date = self.risk.state.session_date
-            if curr_date is not None and self._last_summary_date != curr_date:
+            # Only report for the CURRENT ET trading day (prevents stale duplicate summaries
+            # after nightly IB Gateway restarts or weekend reconnects).
+            today_et = pd.Timestamp.now(tz=self.cfg.risk.timezone).date()
+            if curr_date is not None and curr_date == today_et and self._last_summary_date != curr_date:
                 self._last_summary_date = curr_date
                 self.send_daily_summary_report(df, latest_closed_ts)
             return
@@ -387,9 +392,20 @@ class IBKRNQBotRunner:
                 and self.cfg.risk.cancel_unfilled_entry_bars > 0
                 and (self.bar_count - self._entry_submitted_bar) >= self.cfg.risk.cancel_unfilled_entry_bars
             ):
+                cancelled_sig = self._active_signal
                 self.flatten_all(reason=f"Unfilled Entry Order Timeout ({self.cfg.risk.cancel_unfilled_entry_bars} bars)")
                 self._active_parent_order = None
                 self._active_signal = None
+                if cancelled_sig is not None:
+                    self._send_discord_alert(
+                        title=f"⚪ ENTRY CANCELLED (NOT FILLED) — {self.contract.localSymbol} {cancelled_sig.direction}",
+                        description=(
+                            f"Limit entry @ `{cancelled_sig.entry_price:.2f}` was not filled within "
+                            f"`{self.cfg.risk.cancel_unfilled_entry_bars}` bars and was cancelled.\n"
+                            f"**No position was opened — PnL `$0.00`.**"
+                        ),
+                        color=0x95A5A6,
+                    )
                 return
 
             if (
@@ -409,8 +425,8 @@ class IBKRNQBotRunner:
 
                 if sig.direction == "LONG" and high_p >= sig.entry_price + one_r:
                     new_sl = round_to_tick(sig.entry_price + self.cfg.risk.breakeven_offset_points)
-                    if new_sl > self._active_stop_order.stopPrice:
-                        self._active_stop_order.stopPrice = new_sl
+                    if new_sl > self._active_stop_order.auxPrice:
+                        self._active_stop_order.auxPrice = new_sl
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
                         logger.info("Moved LONG StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
@@ -421,8 +437,8 @@ class IBKRNQBotRunner:
                         )
                 elif sig.direction == "SHORT" and low_p <= sig.entry_price - one_r:
                     new_sl = round_to_tick(sig.entry_price - self.cfg.risk.breakeven_offset_points)
-                    if new_sl < self._active_stop_order.stopPrice:
-                        self._active_stop_order.stopPrice = new_sl
+                    if new_sl < self._active_stop_order.auxPrice:
+                        self._active_stop_order.auxPrice = new_sl
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
                         logger.info("Moved SHORT StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
@@ -438,8 +454,8 @@ class IBKRNQBotRunner:
                 ):
                     if sig.direction == "LONG":
                         dec_sl = round_to_tick(sig.entry_price - self.cfg.risk.time_decay_stop_r * one_r)
-                        if low_p > dec_sl and dec_sl > self._active_stop_order.stopPrice:
-                            self._active_stop_order.stopPrice = dec_sl
+                        if low_p > dec_sl and dec_sl > self._active_stop_order.auxPrice:
+                            self._active_stop_order.auxPrice = dec_sl
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
                             logger.info("Time-Decay Stop Tightening: Moved LONG StopOrder to -0.5R (%.2f)", dec_sl)
@@ -450,8 +466,8 @@ class IBKRNQBotRunner:
                             )
                     else:
                         dec_sl = round_to_tick(sig.entry_price + self.cfg.risk.time_decay_stop_r * one_r)
-                        if high_p < dec_sl and dec_sl < self._active_stop_order.stopPrice:
-                            self._active_stop_order.stopPrice = dec_sl
+                        if high_p < dec_sl and dec_sl < self._active_stop_order.auxPrice:
+                            self._active_stop_order.auxPrice = dec_sl
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
                             logger.info("Time-Decay Stop Tightening: Moved SHORT StopOrder to -0.5R (%.2f)", dec_sl)
@@ -527,6 +543,75 @@ class IBKRNQBotRunner:
             if self.risk.state.halted:
                 self.flatten_all(reason=self.risk.state.halt_reason)
 
+    def _on_exec_details(self, trade: Trade, fill) -> None:
+        """Send a Discord alert when the bracket's parent ENTRY order actually fills."""
+        parent = self._active_parent_order
+        if parent is None or self.contract is None:
+            return
+        if fill.contract.conId != self.contract.conId or fill.execution.orderId != parent.orderId:
+            return
+        sig = self._active_signal
+        e = fill.execution
+        logger.info("ENTRY FILLED: %s %s %s @ %.2f", e.side, e.shares, self.contract.localSymbol, e.price)
+        desc = f"**Fill Price:** `{e.price:.2f}` | **Qty:** `{int(e.shares)}`\n"
+        if sig is not None:
+            desc += f"**Stop Loss:** `{sig.stop_loss:.2f}` | **Take Profit:** `{sig.take_profit:.2f}`"
+        self._send_discord_alert(
+            title=f"✅ ENTRY FILLED — {'BUY' if e.side == 'BOT' else 'SELL'} {int(e.shares)} {self.contract.localSymbol} @ {e.price:.2f}",
+            description=desc,
+            color=0x2ECC71 if e.side == "BOT" else 0xE74C3C,
+        )
+
+    def _recover_active_trade(self) -> None:
+        """
+        After a container/gateway restart, re-attach to an existing position and its live bracket
+        StopOrder so +1R Break-Even and Time-Decay stop management keep working.
+        """
+        if self.contract is None:
+            return
+        pos = next(
+            (p for p in self.ib.positions() if p.contract.conId == self.contract.conId and p.position != 0),
+            None,
+        )
+        if pos is None:
+            return
+
+        open_trades = [t for t in self.ib.reqAllOpenOrders() if t.contract.conId == self.contract.conId]
+        stop_t = next((t for t in open_trades if t.order.orderType in ("STP", "STOP")), None)
+        tp_t = next((t for t in open_trades if t.order.orderType in ("LMT",) and t.order.parentId), None)
+        if stop_t is None:
+            logger.warning("Recovered %s position (%s) but no working StopOrder found!", self.contract.localSymbol, pos.position)
+            return
+
+        direction = "LONG" if pos.position > 0 else "SHORT"
+        mult = float(self.contract.multiplier or self.cfg.contract.point_value)
+        entry = round(pos.avgCost / mult, 2)
+        stop = float(stop_t.order.auxPrice)
+        tp = float(tp_t.order.lmtPrice) if tp_t else entry
+        self._active_signal = TradeSignal(
+            timestamp=pd.Timestamp.now(tz="UTC"),
+            direction=direction,
+            reason="Recovered after restart",
+            entry_price=entry,
+            stop_loss=stop,
+            take_profit=tp,
+            stop_distance_points=abs(entry - stop),
+            atr=0.0,
+            rsi=50.0,
+            vwap=entry,
+            ema_fast=entry,
+            ema_slow=entry,
+        )
+        self._active_stop_order = stop_t.order
+        self._entry_submitted_bar = self.bar_count
+        # If the stop is already at/through entry, Break-Even was already applied before the restart.
+        self._be_moved = (direction == "LONG" and stop >= entry) or (direction == "SHORT" and stop <= entry)
+        self._decay_moved = False
+        logger.warning(
+            "RECOVERED active %s %s position | entry=%.2f stop=%.2f tp=%.2f (BE already moved=%s)",
+            direction, self.contract.localSymbol, entry, stop, tp, self._be_moved,
+        )
+
     def send_daily_summary_report(self, df: pd.DataFrame, latest_ts: pd.Timestamp) -> None:
         """Send an End-of-Day (15:55 ET) Session Summary Report to Discord and console logs."""
         st = self.risk.state
@@ -596,6 +681,7 @@ class IBKRNQBotRunner:
         try:
             self.resolve_front_month_contract()
             self.ib.commissionReportEvent += self._on_commission_report
+            self.ib.execDetailsEvent += self._on_exec_details
 
             logger.info(
                 "Subscribing to %s real-time bars (%s, RTH=%s)...",
@@ -624,25 +710,29 @@ class IBKRNQBotRunner:
                 color=0x3498DB,
             )
             # Process the latest closed historical bar immediately on startup
+            self._recover_active_trade()
             self._on_bar_update(self.bars, has_new_bar=True)
 
             # Poll every 20 seconds so both real-time CME subscriptions and 10-min delayed Paper feeds
             # reliably advance on every 2-minute bar close without stalling.
             while self.ib.isConnected():
                 self.ib.sleep(20)
-                fresh_bars = self.ib.reqHistoricalData(
-                    self.contract,
-                    endDateTime="",
-                    durationStr=self.cfg.strategy.history_duration,
-                    barSizeSetting=self.cfg.strategy.bar_size,
-                    whatToShow="TRADES",
-                    useRTH=self.cfg.risk.rth_only,
-                    formatDate=1,
-                    keepUpToDate=False,
-                )
-                if fresh_bars:
-                    self.bars = fresh_bars
-                    self._on_bar_update(self.bars, has_new_bar=True)
+                try:
+                    fresh_bars = self.ib.reqHistoricalData(
+                        self.contract,
+                        endDateTime="",
+                        durationStr=self.cfg.strategy.history_duration,
+                        barSizeSetting=self.cfg.strategy.bar_size,
+                        whatToShow="TRADES",
+                        useRTH=self.cfg.risk.rth_only,
+                        formatDate=1,
+                        keepUpToDate=False,
+                    )
+                    if fresh_bars:
+                        self.bars = fresh_bars
+                        self._on_bar_update(self.bars, has_new_bar=True)
+                except Exception as exc:  # never let one bad bar/timeout kill a bot that manages live stops
+                    logger.exception("Error during bar polling/processing (bot continues): %s", exc)
         except KeyboardInterrupt:
             logger.info("Shutdown requested by user (Ctrl+C).")
         finally:
