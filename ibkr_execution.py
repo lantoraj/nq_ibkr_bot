@@ -49,6 +49,7 @@ class IBKRNQBotRunner:
         self._active_parent_order: Optional[Order] = None
         self._active_stop_order: Optional[Order] = None
         self._entry_submitted_bar: int = -1
+        self._trade_filled_bar: int = -1
         self._be_moved: bool = False
         self._decay_moved: bool = False
         self._last_summary_date: Optional[date] = None
@@ -56,6 +57,7 @@ class IBKRNQBotRunner:
         self._trade_direction: Optional[str] = None
         self._trade_initial_sl: Optional[float] = None
         self._trade_initial_tp: Optional[float] = None
+        self._pending_post_trade_chart: Optional[dict] = None
 
     def _send_discord_alert(
         self,
@@ -131,8 +133,12 @@ class IBKRNQBotRunner:
         tp_price: Optional[float],
         direction: str,
         pnl: float,
+        entry_bar_offset: int = 6,
+        post_exit_bars: int = 0,
+        pre_entry_bars: int = 15,
+        title_prefix: Optional[str] = None,
     ) -> Optional[bytes]:
-        """Generate a clean dark-theme candlestick chart of the completed trade for Discord."""
+        """Generate a clean dark-theme candlestick chart of the trade with surrounding context for Discord."""
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -147,7 +153,8 @@ class IBKRNQBotRunner:
                 return None
 
             enriched = self.strategy.prepare_dataframe(df)
-            chart_df = enriched.tail(35).copy().reset_index(drop=True)
+            total_needed = max(35, pre_entry_bars + entry_bar_offset + post_exit_bars)
+            chart_df = enriched.tail(total_needed).copy().reset_index(drop=True)
             if len(chart_df) < 5:
                 return None
 
@@ -157,7 +164,7 @@ class IBKRNQBotRunner:
             chart_df["time_str"] = time_strs
 
             plt.style.use("dark_background")
-            fig, ax = plt.subplots(figsize=(10, 5), dpi=130)
+            fig, ax = plt.subplots(figsize=(11, 5.2), dpi=130)
             fig.patch.set_facecolor("#131722")
             ax.set_facecolor("#131722")
 
@@ -185,28 +192,28 @@ class IBKRNQBotRunner:
                 ax.plot(x, chart_df["ema_slow"], color="#9b59b6", linewidth=1.2, label="EMA(21)", alpha=0.9)
 
             # Determine entry and exit x indices
-            exit_idx = len(chart_df) - 1
-            entry_offset = max(1, (self.bar_count - self._entry_submitted_bar)) if self._entry_submitted_bar >= 0 else 6
-            entry_idx = max(0, exit_idx - entry_offset)
-            if entry_idx >= exit_idx:
-                entry_idx = max(0, exit_idx - 6)
+            exit_idx = max(0, len(chart_df) - 1 - post_exit_bars)
+            entry_idx = max(0, exit_idx - max(1, entry_bar_offset))
+            if entry_idx >= exit_idx and exit_idx > 0:
+                entry_idx = max(0, exit_idx - 1)
 
             entry_time = time_strs[entry_idx]
             exit_time = time_strs[exit_idx]
 
-            # Horizontal Lines for Initial SL & TP (spanning from entry to end of chart)
-            span_x = [entry_idx, len(chart_df) - 0.5]
+            # Horizontal Lines for Initial SL & TP (spanning from entry to exit + 4 bars or chart end)
+            span_end = min(len(chart_df) - 0.5, exit_idx + 6)
+            span_x = [entry_idx, span_end]
             if sl_price is not None:
                 ax.hlines(sl_price, xmin=span_x[0], xmax=span_x[1], colors="#e74c3c", linestyles="--", linewidth=1.4, zorder=4)
                 ax.text(
-                    span_x[1], sl_price, f" Initial SL: {sl_price:.2f}",
+                    span_x[1], sl_price, f" Initial SL: {sl_price:.2f} [Set @ {entry_time} ET]",
                     color="#e74c3c", fontsize=8, fontweight="bold", va="center", ha="left"
                 )
 
             if tp_price is not None:
                 ax.hlines(tp_price, xmin=span_x[0], xmax=span_x[1], colors="#2ecc71", linestyles="--", linewidth=1.4, zorder=4)
                 ax.text(
-                    span_x[1], tp_price, f" Initial TP: {tp_price:.2f}",
+                    span_x[1], tp_price, f" Initial TP: {tp_price:.2f} [Set @ {entry_time} ET]",
                     color="#2ecc71", fontsize=8, fontweight="bold", va="center", ha="left"
                 )
 
@@ -218,7 +225,7 @@ class IBKRNQBotRunner:
             ax.annotate(
                 f"{direction} ENTRY [{entry_time} ET]\n{entry_price:.2f}",
                 xy=(entry_idx, entry_price),
-                xytext=(max(0, entry_idx - 3), entry_price + (26 if direction == "SHORT" else -26)),
+                xytext=(max(0, entry_idx - 3.5), entry_price + (26 if direction == "SHORT" else -26)),
                 arrowprops=dict(facecolor=entry_color, edgecolor=entry_color, shrink=0.08, width=2, headwidth=7),
                 fontsize=8.5,
                 fontweight="bold",
@@ -233,7 +240,7 @@ class IBKRNQBotRunner:
             ax.annotate(
                 f"EXIT [{exit_time} ET] ({pnl_str})\n{exit_price:.2f}",
                 xy=(exit_idx, exit_price),
-                xytext=(max(0, exit_idx - 5), exit_price - 22 if pnl >= 0 else exit_price + 22),
+                xytext=(max(0, exit_idx - 3.5), exit_price - 22 if pnl >= 0 else exit_price + 22),
                 arrowprops=dict(facecolor=exit_color, edgecolor=exit_color, shrink=0.08, width=2, headwidth=7),
                 fontsize=8.5,
                 fontweight="bold",
@@ -243,7 +250,7 @@ class IBKRNQBotRunner:
             )
 
             # Horizontal Axis: Exact time labels
-            tick_step = max(1, len(chart_df) // 7)
+            tick_step = max(1, len(chart_df) // 8)
             tick_indices = list(range(0, len(chart_df), tick_step))
             if (len(chart_df) - 1) not in tick_indices:
                 tick_indices.append(len(chart_df) - 1)
@@ -259,10 +266,13 @@ class IBKRNQBotRunner:
 
             sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
             title_color = "#2ecc71" if pnl >= 0 else "#e74c3c"
-            ax.set_title(
-                f"{sym} (2 min) — {direction} Trade [{entry_time} → {exit_time} ET] ({pnl_str} USD)",
-                color=title_color, fontsize=11, fontweight="bold", pad=10
-            )
+            if title_prefix:
+                full_title = f"{sym} (2 min) — {title_prefix} [{entry_time} → {exit_time} ET] ({pnl_str} USD)"
+            elif post_exit_bars > 0:
+                full_title = f"{sym} (2 min) — {direction} Trade [{entry_time} → {exit_time} ET] ({pnl_str} USD) (+{post_exit_bars} Bars Context)"
+            else:
+                full_title = f"{sym} (2 min) — {direction} Trade Closed [{entry_time} → {exit_time} ET] ({pnl_str} USD)"
+            ax.set_title(full_title, color=title_color, fontsize=11, fontweight="bold", pad=10)
             ax.legend(loc="upper right", framealpha=0.4, facecolor="#1e222d", edgecolor="none", fontsize=8)
 
             # Adjust limits for SL/TP and text labels
@@ -280,6 +290,40 @@ class IBKRNQBotRunner:
         except Exception as exc:
             logger.warning("Could not generate trade chart image: %s", exc)
             return None
+
+    def _dispatch_post_trade_review_chart(self, task: dict) -> None:
+        """Generate and post the 10-bar delayed post-trade review chart to Discord."""
+        try:
+            chart_bytes = self._generate_trade_chart(
+                entry_price=task["entry_price"],
+                exit_price=task["exit_price"],
+                sl_price=task["sl_price"],
+                tp_price=task["tp_price"],
+                direction=task["direction"],
+                pnl=task["pnl"],
+                entry_bar_offset=task.get("trade_duration_bars", 6),
+                post_exit_bars=10,
+                pre_entry_bars=15,
+                title_prefix=f"{task['direction']} Post-Trade Review (+10 Bars)",
+            )
+            sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+            pnl = task["pnl"]
+            pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+            color = 0x2ECC71 if pnl >= 0 else 0xE74C3C
+            self._send_discord_alert(
+                title=f"📊 POST-TRADE REVIEW (10 BARS POST-EXIT) — {sym} ({pnl_str} USD)",
+                description=(
+                    f"**Trade Realized PnL:** **`{pnl_str} USD`**\n"
+                    f"**Execution:** `{task['direction']}` @ `{task['entry_price']:.2f}` → Exit @ `{task['exit_price']:.2f}`\n"
+                    f"**Surrounding Context:** `15 bars prior to entry` | `10 bars following exit`\n"
+                    f"_Review market structure, liquidity reaction, and continuation after trade close._"
+                ),
+                color=color,
+                image_bytes=chart_bytes,
+            )
+            logger.info("Dispatched 10-bar post-trade review chart to Discord for trade PnL $%.2f", pnl)
+        except Exception as exc:
+            logger.warning("Error generating/dispatching post-trade review chart: %s", exc)
 
     def connect(self, max_retries: int = 12, retry_wait_sec: int = 10) -> None:
         """Connect to IBKR TWS or IB Gateway (with automatic retries for Docker IB Gateway bootup)."""
@@ -539,11 +583,22 @@ class IBKRNQBotRunner:
         self._last_processed_bar_time = latest_closed_ts
         self.bar_count += 1
 
+        # 0. Check if a pending 10-bar post-trade review chart is ready to be dispatched
+        if self._pending_post_trade_chart is not None:
+            task = self._pending_post_trade_chart
+            if self.bar_count >= task["target_bar_count"]:
+                self._pending_post_trade_chart = None
+                self._dispatch_post_trade_review_chart(task)
+
         # 1. Check mandatory EOD Flatten & Send Daily Summary Report (15:55 ET)
         self.risk.check_and_reset_session(latest_closed_ts)
         if self.risk.should_flatten_eod(latest_closed_ts):
             if self.has_open_position_or_orders():
                 self.flatten_all(reason="End of Day (15:55 ET) Auto-Flatten")
+            if self._pending_post_trade_chart is not None:
+                task = self._pending_post_trade_chart
+                self._pending_post_trade_chart = None
+                self._dispatch_post_trade_review_chart(task)
             curr_date = self.risk.state.session_date
             # Only report for the CURRENT ET trading day (prevents stale duplicate summaries
             # after nightly IB Gateway restarts or weekend reconnects).
@@ -733,7 +788,10 @@ class IBKRNQBotRunner:
             sl_p = self._trade_initial_sl or (self._active_signal.stop_loss if self._active_signal else None)
             tp_p = self._trade_initial_tp or (self._active_signal.take_profit if self._active_signal else None)
 
-            # Render clean dark-theme candlestick chart of the completed trade
+            # Compute trade duration in bars
+            entry_offset = max(1, (self.bar_count - (self._trade_filled_bar if self._trade_filled_bar >= 0 else self._entry_submitted_bar))) if self._entry_submitted_bar >= 0 else 6
+
+            # Render clean dark-theme candlestick chart of the completed trade (with 15 bars prior)
             chart_bytes = self._generate_trade_chart(
                 entry_price=entry_p,
                 exit_price=fill_price,
@@ -741,6 +799,9 @@ class IBKRNQBotRunner:
                 tp_price=tp_p,
                 direction=direction,
                 pnl=net_pnl,
+                entry_bar_offset=entry_offset,
+                post_exit_bars=0,
+                pre_entry_bars=15,
             )
 
             self._send_discord_alert(
@@ -749,11 +810,26 @@ class IBKRNQBotRunner:
                     f"**Exit Fill Price:** `{fill_price:.2f}`\n"
                     f"**Trade Realized PnL:** **`${net_pnl:+.2f}`**\n"
                     f"**Daily Session PnL:** `${self.risk.state.realized_pnl_usd:+.2f}`\n"
-                    f"**Trades Today:** `{self.risk.state.trades_taken}/{self.cfg.risk.max_daily_trades}`"
+                    f"**Trades Today:** `{self.risk.state.trades_taken}/{self.cfg.risk.max_daily_trades}`\n"
+                    f"_Post-trade context chart (+10 bars after exit) will post automatically in 20 mins._"
                 ),
                 color=color,
                 image_bytes=chart_bytes,
             )
+
+            # Schedule comprehensive 10-bar post-trade review chart
+            self._pending_post_trade_chart = {
+                "entry_price": entry_p,
+                "exit_price": fill_price,
+                "sl_price": sl_p,
+                "tp_price": tp_p,
+                "direction": direction,
+                "pnl": net_pnl,
+                "trade_duration_bars": entry_offset,
+                "exit_bar_count": self.bar_count,
+                "target_bar_count": self.bar_count + 10,
+            }
+
             if self.risk.state.halted:
                 self.flatten_all(reason=self.risk.state.halt_reason)
 
@@ -768,6 +844,7 @@ class IBKRNQBotRunner:
         e = fill.execution
         self._trade_entry_price = float(e.price)
         self._trade_direction = "LONG" if e.side == "BOT" else "SHORT"
+        self._trade_filled_bar = self.bar_count
         logger.info("ENTRY FILLED: %s %s %s @ %.2f", e.side, e.shares, self.contract.localSymbol, e.price)
         desc = f"**Fill Price:** `{e.price:.2f}` | **Qty:** `{int(e.shares)}`\n"
         if sig is not None:
@@ -808,6 +885,7 @@ class IBKRNQBotRunner:
         self._trade_direction = direction
         self._trade_initial_sl = stop
         self._trade_initial_tp = tp if tp_t else None
+        self._trade_filled_bar = self.bar_count
         self._active_signal = TradeSignal(
             timestamp=pd.Timestamp.now(tz="UTC"),
             direction=direction,

@@ -106,3 +106,59 @@ def test_strategy_and_backtester_end_to_end() -> None:
             assert t.take_profit > t.entry_price
         else:
             assert t.take_profit < t.entry_price
+
+
+def test_trade_chart_generation_immediate_and_post_exit() -> None:
+    from ibkr_execution import IBKRNQBotRunner
+    from ib_async import BarData
+
+    cfg = BotConfig()
+    runner = IBKRNQBotRunner(cfg, mode="paper")
+
+    # Mock bar data list
+    df = generate_synthetic_nq_data(num_days=1, seed=42)
+    fake_bars = []
+    for _, r in df.iterrows():
+        fake_bars.append(
+            BarData(
+                date=r["timestamp"],
+                open=r["open"],
+                high=r["high"],
+                low=r["low"],
+                close=r["close"],
+                volume=r["volume"],
+            )
+        )
+    runner.bars = fake_bars
+    runner.bar_count = len(df)
+    runner._entry_submitted_bar = len(df) - 10
+
+    # 1. Immediate trade exit chart
+    img_bytes = runner._generate_trade_chart(
+        entry_price=28648.25,
+        exit_price=28535.75,
+        sl_price=28685.75,
+        tp_price=28535.75,
+        direction="SHORT",
+        pnl=223.28,
+        entry_bar_offset=10,
+        post_exit_bars=0,
+        pre_entry_bars=15,
+    )
+    assert img_bytes is not None
+    assert img_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+
+    # 2. Delayed post-trade review chart (+10 bars context)
+    review_bytes = runner._generate_trade_chart(
+        entry_price=28648.25,
+        exit_price=28535.75,
+        sl_price=28685.75,
+        tp_price=28535.75,
+        direction="SHORT",
+        pnl=223.28,
+        entry_bar_offset=10,
+        post_exit_bars=10,
+        pre_entry_bars=15,
+    )
+    assert review_bytes is not None
+    assert review_bytes.startswith(b"\x89PNG\r\n\x1a\n")
