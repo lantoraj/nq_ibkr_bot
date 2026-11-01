@@ -54,6 +54,8 @@ class IBKRNQBotRunner:
         self._last_summary_date: Optional[date] = None
         self._trade_entry_price: Optional[float] = None
         self._trade_direction: Optional[str] = None
+        self._trade_initial_sl: Optional[float] = None
+        self._trade_initial_tp: Optional[float] = None
 
     def _send_discord_alert(
         self,
@@ -125,6 +127,8 @@ class IBKRNQBotRunner:
         self,
         entry_price: float,
         exit_price: float,
+        sl_price: Optional[float],
+        tp_price: Optional[float],
         direction: str,
         pnl: float,
     ) -> Optional[bytes]:
@@ -147,8 +151,13 @@ class IBKRNQBotRunner:
             if len(chart_df) < 5:
                 return None
 
+            # Compute New York ET time string for each candle
+            ts_et = pd.to_datetime(chart_df["timestamp"], utc=True).dt.tz_convert(self.cfg.risk.timezone)
+            time_strs = ts_et.dt.strftime("%H:%M").tolist()
+            chart_df["time_str"] = time_strs
+
             plt.style.use("dark_background")
-            fig, ax = plt.subplots(figsize=(8.5, 4.2), dpi=120)
+            fig, ax = plt.subplots(figsize=(10, 5), dpi=130)
             fig.patch.set_facecolor("#131722")
             ax.set_facecolor("#131722")
 
@@ -182,50 +191,90 @@ class IBKRNQBotRunner:
             if entry_idx >= exit_idx:
                 entry_idx = max(0, exit_idx - 6)
 
+            entry_time = time_strs[entry_idx]
+            exit_time = time_strs[exit_idx]
+
+            # Horizontal Lines for Initial SL & TP (spanning from entry to end of chart)
+            span_x = [entry_idx, len(chart_df) - 0.5]
+            if sl_price is not None:
+                ax.hlines(sl_price, xmin=span_x[0], xmax=span_x[1], colors="#e74c3c", linestyles="--", linewidth=1.4, zorder=4)
+                ax.text(
+                    span_x[1], sl_price, f" Initial SL: {sl_price:.2f}",
+                    color="#e74c3c", fontsize=8, fontweight="bold", va="center", ha="left"
+                )
+
+            if tp_price is not None:
+                ax.hlines(tp_price, xmin=span_x[0], xmax=span_x[1], colors="#2ecc71", linestyles="--", linewidth=1.4, zorder=4)
+                ax.text(
+                    span_x[1], tp_price, f" Initial TP: {tp_price:.2f}",
+                    color="#2ecc71", fontsize=8, fontweight="bold", va="center", ha="left"
+                )
+
+            # Initial Entry reference guideline
+            ax.hlines(entry_price, xmin=span_x[0], xmax=span_x[1], colors="#787b86", linestyles=":", linewidth=1.0, zorder=4)
+
+            # Entry Annotation with exact time
             entry_color = "#e74c3c" if direction == "SHORT" else "#2ecc71"
             ax.annotate(
-                f"{direction} ENTRY\n{entry_price:.2f}",
+                f"{direction} ENTRY [{entry_time} ET]\n{entry_price:.2f}",
                 xy=(entry_idx, entry_price),
-                xytext=(max(0, entry_idx - 3), entry_price + (22 if direction == "SHORT" else -22)),
-                arrowprops=dict(facecolor=entry_color, edgecolor=entry_color, shrink=0.08, width=2, headwidth=6),
-                fontsize=8,
+                xytext=(max(0, entry_idx - 3), entry_price + (26 if direction == "SHORT" else -26)),
+                arrowprops=dict(facecolor=entry_color, edgecolor=entry_color, shrink=0.08, width=2, headwidth=7),
+                fontsize=8.5,
                 fontweight="bold",
                 color="#ffffff",
-                bbox=dict(boxstyle="round,pad=0.25", facecolor=entry_color, alpha=0.85, edgecolor="none"),
-                zorder=5,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor=entry_color, alpha=0.88, edgecolor="none"),
+                zorder=6,
             )
 
+            # Exit Annotation with exact time
             exit_color = "#2ecc71" if pnl >= 0 else "#e74c3c"
             pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
             ax.annotate(
-                f"EXIT ({pnl_str})\n{exit_price:.2f}",
+                f"EXIT [{exit_time} ET] ({pnl_str})\n{exit_price:.2f}",
                 xy=(exit_idx, exit_price),
-                xytext=(max(0, exit_idx - 4), exit_price - 20 if pnl >= 0 else exit_price + 20),
-                arrowprops=dict(facecolor=exit_color, edgecolor=exit_color, shrink=0.08, width=2, headwidth=6),
-                fontsize=8,
+                xytext=(max(0, exit_idx - 5), exit_price - 22 if pnl >= 0 else exit_price + 22),
+                arrowprops=dict(facecolor=exit_color, edgecolor=exit_color, shrink=0.08, width=2, headwidth=7),
+                fontsize=8.5,
                 fontweight="bold",
                 color="#ffffff",
-                bbox=dict(boxstyle="round,pad=0.25", facecolor=exit_color, alpha=0.85, edgecolor="none"),
-                zorder=5,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor=exit_color, alpha=0.88, edgecolor="none"),
+                zorder=6,
             )
 
+            # Horizontal Axis: Exact time labels
+            tick_step = max(1, len(chart_df) // 7)
+            tick_indices = list(range(0, len(chart_df), tick_step))
+            if (len(chart_df) - 1) not in tick_indices:
+                tick_indices.append(len(chart_df) - 1)
+            ax.set_xticks(tick_indices)
+            ax.set_xticklabels([time_strs[i] for i in tick_indices], rotation=0, fontsize=8, color="#d1d4dc")
+            ax.set_xlabel("Time (ET)", color="#787b86", fontsize=8.5)
+
             ax.grid(True, linestyle=":", alpha=0.22, color="#787b86")
-            ax.set_ylabel("Price (USD)", color="#d1d4dc", fontsize=8.5)
-            ax.tick_params(colors="#787b86", labelsize=7.5)
+            ax.set_ylabel("Price (USD)", color="#d1d4dc", fontsize=9)
+            ax.tick_params(colors="#787b86", labelsize=8)
             for spine in ax.spines.values():
                 spine.set_color("#2a2e39")
 
             sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
             title_color = "#2ecc71" if pnl >= 0 else "#e74c3c"
             ax.set_title(
-                f"{sym} (2 min) — {direction} Trade Closed ({pnl_str} USD)",
-                color=title_color, fontsize=10.5, fontweight="bold", pad=8
+                f"{sym} (2 min) — {direction} Trade [{entry_time} → {exit_time} ET] ({pnl_str} USD)",
+                color=title_color, fontsize=11, fontweight="bold", pad=10
             )
-            ax.legend(loc="upper left", framealpha=0.35, facecolor="#1e222d", edgecolor="none", fontsize=7.5)
+            ax.legend(loc="upper right", framealpha=0.4, facecolor="#1e222d", edgecolor="none", fontsize=8)
+
+            # Adjust limits for SL/TP and text labels
+            valid_targets = [p for p in (sl_price, tp_price, entry_price, exit_price) if p is not None]
+            y_min = min(chart_df["low"].min(), min(valid_targets)) - 10
+            y_max = max(chart_df["high"].max(), max(valid_targets)) + 12
+            ax.set_ylim(y_min, y_max)
+            ax.set_xlim(-1, len(chart_df) + 3.5)
 
             plt.tight_layout()
             buf = io.BytesIO()
-            plt.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor(), dpi=120)
+            plt.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor(), dpi=130)
             plt.close(fig)
             return buf.getvalue()
         except Exception as exc:
@@ -432,6 +481,8 @@ class IBKRNQBotRunner:
         self._decay_moved = False
         self._trade_entry_price = signal.entry_price
         self._trade_direction = signal.direction
+        self._trade_initial_sl = signal.stop_loss
+        self._trade_initial_tp = signal.take_profit
 
         logger.info(
             "BRACKET ORDER SUBMITTED [%s] %s %d %s @ %.2f | SL=%.2f | TP=%.2f | Reason: %s",
@@ -679,11 +730,15 @@ class IBKRNQBotRunner:
             fill_price = getattr(getattr(fill, "execution", None), "price", 0.0)
             entry_p = self._trade_entry_price or (self._active_signal.entry_price if self._active_signal else fill_price)
             direction = self._trade_direction or (self._active_signal.direction if self._active_signal else "LONG")
+            sl_p = self._trade_initial_sl or (self._active_signal.stop_loss if self._active_signal else None)
+            tp_p = self._trade_initial_tp or (self._active_signal.take_profit if self._active_signal else None)
 
             # Render clean dark-theme candlestick chart of the completed trade
             chart_bytes = self._generate_trade_chart(
                 entry_price=entry_p,
                 exit_price=fill_price,
+                sl_price=sl_p,
+                tp_price=tp_p,
                 direction=direction,
                 pnl=net_pnl,
             )
@@ -751,6 +806,8 @@ class IBKRNQBotRunner:
         tp = float(tp_t.order.lmtPrice) if tp_t else entry
         self._trade_entry_price = entry
         self._trade_direction = direction
+        self._trade_initial_sl = stop
+        self._trade_initial_tp = tp if tp_t else None
         self._active_signal = TradeSignal(
             timestamp=pd.Timestamp.now(tz="UTC"),
             direction=direction,
