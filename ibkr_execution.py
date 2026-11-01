@@ -190,6 +190,8 @@ class IBKRNQBotRunner:
                 ax.plot(x, chart_df["ema_fast"], color="#3498db", linewidth=1.2, label="EMA(9)", alpha=0.9)
             if "ema_slow" in chart_df.columns:
                 ax.plot(x, chart_df["ema_slow"], color="#9b59b6", linewidth=1.2, label="EMA(21)", alpha=0.9)
+            if "ema_trend" in chart_df.columns:
+                ax.plot(x, chart_df["ema_trend"], color="#00d2d3", linestyle="-.", linewidth=1.2, label="EMA(50)", alpha=0.9)
 
             # Determine entry and exit x indices
             exit_idx = max(0, len(chart_df) - 1 - post_exit_bars)
