@@ -9,13 +9,16 @@ Handles:
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 import threading
 import urllib.request
+import uuid
 from datetime import date, datetime
 from typing import List, Optional
 
+import numpy as np
 import pandas as pd
 from ib_async import IB, BarDataList, Contract, Future, LimitOrder, MarketOrder, Order, StopOrder, Trade, util
 
@@ -49,9 +52,17 @@ class IBKRNQBotRunner:
         self._be_moved: bool = False
         self._decay_moved: bool = False
         self._last_summary_date: Optional[date] = None
+        self._trade_entry_price: Optional[float] = None
+        self._trade_direction: Optional[str] = None
 
-    def _send_discord_alert(self, title: str, description: str, color: int = 0x3498DB) -> None:
-        """Send an asynchronous rich embed notification to Discord if DISCORD_WEBHOOK_URL is configured."""
+    def _send_discord_alert(
+        self,
+        title: str,
+        description: str,
+        color: int = 0x3498DB,
+        image_bytes: Optional[bytes] = None,
+    ) -> None:
+        """Send an asynchronous rich embed notification (with optional chart image) to Discord."""
         url = (self.cfg.ibkr.discord_webhook_url or "").strip()
         if not url:
             return
@@ -67,25 +78,159 @@ class IBKRNQBotRunner:
                 }
             ],
         }
+        if image_bytes is not None:
+            payload["embeds"][0]["image"] = {"url": "attachment://trade_chart.png"}
 
         def _post() -> None:
             try:
-                data = json.dumps(payload).encode("utf-8")
+                if image_bytes is not None:
+                    boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+                    body = io.BytesIO()
+                    body.write(f"--{boundary}\r\n".encode("utf-8"))
+                    body.write(b'Content-Disposition: form-data; name="payload_json"\r\n')
+                    body.write(b"Content-Type: application/json\r\n\r\n")
+                    body.write(json.dumps(payload).encode("utf-8"))
+                    body.write(b"\r\n")
+
+                    body.write(f"--{boundary}\r\n".encode("utf-8"))
+                    body.write(b'Content-Disposition: form-data; name="files[0]"; filename="trade_chart.png"\r\n')
+                    body.write(b"Content-Type: image/png\r\n\r\n")
+                    body.write(image_bytes)
+                    body.write(b"\r\n")
+                    body.write(f"--{boundary}--\r\n".encode("utf-8"))
+
+                    post_data = body.getvalue()
+                    content_type = f"multipart/form-data; boundary={boundary}"
+                else:
+                    post_data = json.dumps(payload).encode("utf-8")
+                    content_type = "application/json"
+
                 req = urllib.request.Request(
                     url,
-                    data=data,
+                    data=post_data,
                     headers={
-                        "Content-Type": "application/json",
+                        "Content-Type": content_type,
                         "User-Agent": "NQ-IBKR-Quant-Bot/4.0",
                     },
                     method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=10):
+                with urllib.request.urlopen(req, timeout=15):
                     pass
             except Exception as exc:
                 logger.warning("Failed to send Discord alert: %s", exc)
 
         threading.Thread(target=_post, daemon=True).start()
+
+    def _generate_trade_chart(
+        self,
+        entry_price: float,
+        exit_price: float,
+        direction: str,
+        pnl: float,
+    ) -> Optional[bytes]:
+        """Generate a clean dark-theme candlestick chart of the completed trade for Discord."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as patches
+
+            if not self.bars:
+                return None
+
+            df = self._bars_to_dataframe(self.bars)
+            if df.empty or len(df) < 5:
+                return None
+
+            enriched = self.strategy.prepare_dataframe(df)
+            chart_df = enriched.tail(35).copy().reset_index(drop=True)
+            if len(chart_df) < 5:
+                return None
+
+            plt.style.use("dark_background")
+            fig, ax = plt.subplots(figsize=(8.5, 4.2), dpi=120)
+            fig.patch.set_facecolor("#131722")
+            ax.set_facecolor("#131722")
+
+            # Candlesticks
+            width = 0.6
+            for i, row in chart_df.iterrows():
+                o, h, l, c = row["open"], row["high"], row["low"], row["close"]
+                color = "#26a69a" if c >= o else "#ef5350"
+                ax.plot([i, i], [l, h], color=color, linewidth=1.1, zorder=2)
+                b_bottom = min(o, c)
+                b_height = max(abs(c - o), 0.25)
+                rect = patches.Rectangle(
+                    (i - width / 2, b_bottom), width, b_height,
+                    facecolor=color, edgecolor=color, zorder=3
+                )
+                ax.add_patch(rect)
+
+            # Technical indicator overlays
+            x = np.arange(len(chart_df))
+            if "vwap" in chart_df.columns:
+                ax.plot(x, chart_df["vwap"], color="#f39c12", linestyle="--", linewidth=1.2, label="VWAP", alpha=0.9)
+            if "ema_fast" in chart_df.columns:
+                ax.plot(x, chart_df["ema_fast"], color="#3498db", linewidth=1.2, label="EMA(9)", alpha=0.9)
+            if "ema_slow" in chart_df.columns:
+                ax.plot(x, chart_df["ema_slow"], color="#9b59b6", linewidth=1.2, label="EMA(21)", alpha=0.9)
+
+            # Determine entry and exit x indices
+            exit_idx = len(chart_df) - 1
+            entry_offset = max(1, (self.bar_count - self._entry_submitted_bar)) if self._entry_submitted_bar >= 0 else 6
+            entry_idx = max(0, exit_idx - entry_offset)
+            if entry_idx >= exit_idx:
+                entry_idx = max(0, exit_idx - 6)
+
+            entry_color = "#e74c3c" if direction == "SHORT" else "#2ecc71"
+            ax.annotate(
+                f"{direction} ENTRY\n{entry_price:.2f}",
+                xy=(entry_idx, entry_price),
+                xytext=(max(0, entry_idx - 3), entry_price + (22 if direction == "SHORT" else -22)),
+                arrowprops=dict(facecolor=entry_color, edgecolor=entry_color, shrink=0.08, width=2, headwidth=6),
+                fontsize=8,
+                fontweight="bold",
+                color="#ffffff",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor=entry_color, alpha=0.85, edgecolor="none"),
+                zorder=5,
+            )
+
+            exit_color = "#2ecc71" if pnl >= 0 else "#e74c3c"
+            pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+            ax.annotate(
+                f"EXIT ({pnl_str})\n{exit_price:.2f}",
+                xy=(exit_idx, exit_price),
+                xytext=(max(0, exit_idx - 4), exit_price - 20 if pnl >= 0 else exit_price + 20),
+                arrowprops=dict(facecolor=exit_color, edgecolor=exit_color, shrink=0.08, width=2, headwidth=6),
+                fontsize=8,
+                fontweight="bold",
+                color="#ffffff",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor=exit_color, alpha=0.85, edgecolor="none"),
+                zorder=5,
+            )
+
+            ax.grid(True, linestyle=":", alpha=0.22, color="#787b86")
+            ax.set_ylabel("Price (USD)", color="#d1d4dc", fontsize=8.5)
+            ax.tick_params(colors="#787b86", labelsize=7.5)
+            for spine in ax.spines.values():
+                spine.set_color("#2a2e39")
+
+            sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+            title_color = "#2ecc71" if pnl >= 0 else "#e74c3c"
+            ax.set_title(
+                f"{sym} (2 min) — {direction} Trade Closed ({pnl_str} USD)",
+                color=title_color, fontsize=10.5, fontweight="bold", pad=8
+            )
+            ax.legend(loc="upper left", framealpha=0.35, facecolor="#1e222d", edgecolor="none", fontsize=7.5)
+
+            plt.tight_layout()
+            buf = io.BytesIO()
+            plt.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor(), dpi=120)
+            plt.close(fig)
+            return buf.getvalue()
+        except Exception as exc:
+            logger.warning("Could not generate trade chart image: %s", exc)
+            return None
 
     def connect(self, max_retries: int = 12, retry_wait_sec: int = 10) -> None:
         """Connect to IBKR TWS or IB Gateway (with automatic retries for Docker IB Gateway bootup)."""
@@ -285,6 +430,8 @@ class IBKRNQBotRunner:
         self._entry_submitted_bar = self.bar_count
         self._be_moved = False
         self._decay_moved = False
+        self._trade_entry_price = signal.entry_price
+        self._trade_direction = signal.direction
 
         logger.info(
             "BRACKET ORDER SUBMITTED [%s] %s %d %s @ %.2f | SL=%.2f | TP=%.2f | Reason: %s",
@@ -530,6 +677,17 @@ class IBKRNQBotRunner:
             color = 0x2ECC71 if net_pnl > 0 else 0xE74C3C
             sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
             fill_price = getattr(getattr(fill, "execution", None), "price", 0.0)
+            entry_p = self._trade_entry_price or (self._active_signal.entry_price if self._active_signal else fill_price)
+            direction = self._trade_direction or (self._active_signal.direction if self._active_signal else "LONG")
+
+            # Render clean dark-theme candlestick chart of the completed trade
+            chart_bytes = self._generate_trade_chart(
+                entry_price=entry_p,
+                exit_price=fill_price,
+                direction=direction,
+                pnl=net_pnl,
+            )
+
             self._send_discord_alert(
                 title=f"{win_str} — {sym} ({net_pnl:+.2f} USD)",
                 description=(
@@ -539,6 +697,7 @@ class IBKRNQBotRunner:
                     f"**Trades Today:** `{self.risk.state.trades_taken}/{self.cfg.risk.max_daily_trades}`"
                 ),
                 color=color,
+                image_bytes=chart_bytes,
             )
             if self.risk.state.halted:
                 self.flatten_all(reason=self.risk.state.halt_reason)
@@ -552,6 +711,8 @@ class IBKRNQBotRunner:
             return
         sig = self._active_signal
         e = fill.execution
+        self._trade_entry_price = float(e.price)
+        self._trade_direction = "LONG" if e.side == "BOT" else "SHORT"
         logger.info("ENTRY FILLED: %s %s %s @ %.2f", e.side, e.shares, self.contract.localSymbol, e.price)
         desc = f"**Fill Price:** `{e.price:.2f}` | **Qty:** `{int(e.shares)}`\n"
         if sig is not None:
@@ -588,6 +749,8 @@ class IBKRNQBotRunner:
         entry = round(pos.avgCost / mult, 2)
         stop = float(stop_t.order.auxPrice)
         tp = float(tp_t.order.lmtPrice) if tp_t else entry
+        self._trade_entry_price = entry
+        self._trade_direction = direction
         self._active_signal = TradeSignal(
             timestamp=pd.Timestamp.now(tz="UTC"),
             direction=direction,
