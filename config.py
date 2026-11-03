@@ -52,7 +52,7 @@ class StrategyConfig:
     require_trend_ema_alignment: bool = True
 
     # Trend strength & candle quality filters
-    min_ema_spread_atr: float = 0.10      # Minimum |EMA9 - EMA21| / ATR to avoid flat chop
+    min_ema_spread_atr: float = 0.06      # Minimum |EMA9 - EMA21| / ATR to avoid flat chop (optimized for active frequency)
     min_slow_slope_atr: float = 0.08      # Minimum 3-bar Slow EMA slope normalized by ATR
     min_body_ratio: float = 0.35          # Minimum |Close - Open| / (High - Low) to reject dojis
     max_opposing_wick_ratio: float = 0.40 # Reject longs with >40% upper wick or shorts with >40% lower wick
@@ -72,7 +72,7 @@ class StrategyConfig:
     kalman_r_meas: float = 1.0            # Kalman measurement noise variance
     hurst_lag_q: int = 4                  # Variance Ratio lag q
     hurst_window: int = 24                # Rolling window for Variance Ratio Hurst exponent
-    min_meta_probability: float = 0.58    # Minimum Logistic Meta-Model confidence P(Win | x_t) >= 58%
+    min_meta_probability: float = 0.52    # Minimum Logistic Meta-Model confidence P(Win | x_t) >= 52% (active mode)
 
     # Signal triggers ("pullback", "crossover", "both", or "hybrid_all")
     entry_mode: Literal["pullback", "crossover", "both", "hybrid_all"] = "hybrid_all"
@@ -89,7 +89,7 @@ class StrategyConfig:
     min_volume_ratio: float = 0.75        # Current bar volume vs 20-bar average volume
 
     # Pullback tolerance in ATR multiples (how close low/high needs to get to Fast EMA)
-    pullback_ema_tolerance_atr: float = 0.30
+    pullback_ema_tolerance_atr: float = 0.40
 
 
 @dataclass
@@ -118,9 +118,9 @@ class RiskConfig:
     time_decay_bars: int = 6              # If trade hasn't reached +1R within 6 bars (12 mins), tighten stop
     time_decay_stop_r: float = 0.50       # Tighten risk from -1.0R to -0.50R on stagnant trades
 
-    # Daily circuit breakers (3-Month Optimized: Morning Session Sniper, max 2 trades/day)
+    # Daily circuit breakers (Active Frequency Mode: max 4 trades/day across full RTH session)
     max_daily_loss_usd: float = 250.0     # Halts new entries & flattens if breached
-    max_daily_trades: int = 2             # Max 2 high-conviction morning trades per session
+    max_daily_trades: int = 4             # Max 4 high-conviction trades per session
     max_consecutive_losses: int = 2       # Stop trading for the day after 2 consecutive losses
     cooldown_bars_after_exit: int = 3     # Wait N bars before entering another trade
 
@@ -128,7 +128,7 @@ class RiskConfig:
     timezone: str = "America/New_York"
     rth_only: bool = True
     entry_start_time: str = "09:45"       # Enter after 15-min Opening Range settles
-    entry_end_time: str = "12:30"         # Stop new entries at 12:30 ET to avoid midday/afternoon chop
+    entry_end_time: str = "15:30"         # Extended entry window to 15:30 ET to trade full regular session
     flatten_eod_time: str = "15:55"       # Force flatten all open positions and cancel orders
 
 
