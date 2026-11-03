@@ -12,6 +12,7 @@ services:
       AUTO_RESTART_TIME: "11:55 PM"
       TIME_ZONE: "America/New_York"
       TWS_ACCEPT_INCOMING: "accept"
+      EXISTING_SESSION_DETECTED_ACTION: "primary"
     ports:
       # Localhost-only bindings so API and optional VNC are never exposed to the public internet
       - "127.0.0.1:4001:4001"
