@@ -9,7 +9,8 @@ services:
       TRADING_MODE: ${TRADING_MODE:-paper}
       READ_ONLY_API: "no"
       TWOFA_TIMEOUT_ACTION: "restart"
-      AUTO_RESTART_TIME: "11:55 PM"
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+      AUTO_RESTART_TIME: "11:30 PM"
       TIME_ZONE: "America/New_York"
       TWS_ACCEPT_INCOMING: "accept"
       EXISTING_SESSION_DETECTED_ACTION: "primary"

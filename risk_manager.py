@@ -21,10 +21,14 @@ from config import ContractConfig, RiskConfig
 
 @dataclass
 class DailyRiskState:
-    """Tracks live or simulated intraday risk metrics for a single trading session."""
+    """Tracks live or simulated intraday risk metrics for a single trading session (Pre-Market + RTH)."""
     session_date: Optional[date] = None
     realized_pnl_usd: float = 0.0
     trades_taken: int = 0
+    premarket_trades_taken: int = 0
+    rth_trades_taken: int = 0
+    rth_reset_done: bool = False
+    in_premarket_phase: bool = False
     wins: int = 0
     losses: int = 0
     consecutive_losses: int = 0
@@ -42,6 +46,8 @@ class RiskManager:
         self.tz = pytz.timezone(self.r_cfg.timezone)
         self.state = DailyRiskState()
 
+        self._pm_start = self._parse_hhmm(getattr(self.r_cfg, "premarket_start_time", "04:00"))
+        self._pm_end = self._parse_hhmm(getattr(self.r_cfg, "premarket_end_time", "08:20"))
         self._entry_start = self._parse_hhmm(self.r_cfg.entry_start_time)
         self._entry_end = self._parse_hhmm(self.r_cfg.entry_end_time)
         self._flatten_time = self._parse_hhmm(self.r_cfg.flatten_eod_time)
@@ -58,26 +64,41 @@ class RiskManager:
         return ts.tz_convert(self.tz)
 
     def check_and_reset_session(self, ts: pd.Timestamp) -> None:
-        """Reset daily counters automatically when a new trading date begins."""
+        """Reset daily counters on a new trading date and refresh RTH trade budget at 09:30 ET."""
         local_dt = self._to_session_dt(ts)
         curr_date = local_dt.date()
+        t = local_dt.time()
         if self.state.session_date != curr_date:
-            self.state = DailyRiskState(session_date=curr_date)
+            self.state = DailyRiskState(
+                session_date=curr_date,
+                rth_reset_done=(t >= time(9, 30)),
+                in_premarket_phase=(t < time(9, 30)),
+            )
+        else:
+            self.state.in_premarket_phase = t < time(9, 30)
+            if not self.state.rth_reset_done and t >= time(9, 30):
+                self.state.rth_reset_done = True
+                self.state.consecutive_losses = 0
+                if self.state.halted and self.state.realized_pnl_usd > -abs(self.r_cfg.max_daily_loss_usd):
+                    self.state.halted = False
+                    self.state.halt_reason = ""
 
     def should_flatten_eod(self, ts: pd.Timestamp) -> bool:
-        """Return True if current time is at or past the mandatory EOD flatten time (e.g., 15:55 ET)."""
-        if not self.r_cfg.rth_only:
+        """Return True if current time is at or past the mandatory EOD flatten time (15:55 - 17:00 ET)."""
+        if not self.r_cfg.rth_only and not getattr(self.r_cfg, "use_premarket_session", False):
             return False
         local_dt = self._to_session_dt(ts)
-        return local_dt.time() >= self._flatten_time
+        return self._flatten_time <= local_dt.time() <= time(17, 0)
 
     def is_within_entry_window(self, ts: pd.Timestamp) -> bool:
-        """Return True if current timestamp falls within allowed intraday entry hours."""
-        if not self.r_cfg.rth_only:
+        """Return True if current timestamp falls within allowed Pre-Market or RTH entry hours."""
+        if not self.r_cfg.rth_only and not getattr(self.r_cfg, "use_premarket_session", False):
             return True
         local_dt = self._to_session_dt(ts)
         t = local_dt.time()
-        return self._entry_start <= t <= self._entry_end
+        in_rth = self._entry_start <= t <= self._entry_end
+        in_pm = getattr(self.r_cfg, "use_premarket_session", False) and (self._pm_start <= t <= self._pm_end)
+        return in_rth or in_pm
 
     def can_open_trade(
         self,
@@ -94,17 +115,22 @@ class RiskManager:
             return False, f"Session halted: {self.state.halt_reason}"
 
         if not self.is_within_entry_window(ts):
-            return False, "Outside allowed RTH entry time window"
+            return False, "Outside allowed RTH / Premarket entry time window"
 
-        if self.state.realized_pnl_usd <= - abs(self.r_cfg.max_daily_loss_usd):
+        if self.state.realized_pnl_usd <= -abs(self.r_cfg.max_daily_loss_usd):
             self.state.halted = True
             self.state.halt_reason = (
                 f"Max daily loss reached (${self.state.realized_pnl_usd:.2f} <= -${self.r_cfg.max_daily_loss_usd:.2f})"
             )
             return False, self.state.halt_reason
 
-        if self.state.trades_taken >= self.r_cfg.max_daily_trades:
-            return False, f"Max daily trades reached ({self.state.trades_taken}/{self.r_cfg.max_daily_trades})"
+        if self.state.in_premarket_phase:
+            pm_max = getattr(self.r_cfg, "premarket_max_trades", 2)
+            if self.state.premarket_trades_taken >= pm_max:
+                return False, f"Max pre-market trades reached ({self.state.premarket_trades_taken}/{pm_max})"
+        else:
+            if self.state.rth_trades_taken >= self.r_cfg.max_daily_trades:
+                return False, f"Max daily trades reached ({self.state.rth_trades_taken}/{self.r_cfg.max_daily_trades})"
 
         if self.state.consecutive_losses >= self.r_cfg.max_consecutive_losses:
             self.state.halted = True
@@ -136,6 +162,10 @@ class RiskManager:
     def record_trade_closed(self, net_pnl_usd: float, exit_bar_index: int = 0) -> None:
         """Update session risk state after a position is closed."""
         self.state.trades_taken += 1
+        if self.state.in_premarket_phase:
+            self.state.premarket_trades_taken += 1
+        else:
+            self.state.rth_trades_taken += 1
         self.state.realized_pnl_usd += net_pnl_usd
         self.state.last_exit_bar_index = exit_bar_index
 

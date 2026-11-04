@@ -162,3 +162,55 @@ def test_trade_chart_generation_immediate_and_post_exit() -> None:
     )
     assert review_bytes is not None
     assert review_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_dual_session_vwap_reanchoring_and_premarket_risk() -> None:
+    # 1. Verify VWAP accumulates in Pre-Market (04:00 - 09:28 ET) and cleanly re-anchors at 09:30 ET RTH open
+    df = pd.DataFrame(
+        {
+            "timestamp": [
+                pd.Timestamp("2026-11-04 04:00:00", tz="America/New_York"),
+                pd.Timestamp("2026-11-04 04:02:00", tz="America/New_York"),
+                pd.Timestamp("2026-11-04 09:30:00", tz="America/New_York"),
+            ],
+            "high": [28010.0, 28030.0, 28410.0],
+            "low": [27990.0, 28010.0, 28390.0],
+            "close": [28000.0, 28020.0, 28400.0],
+            "volume": [1000, 1000, 500],
+        }
+    )
+    vwap = compute_session_vwap(df)
+    assert vwap.iloc[0] == 28000.0
+    assert vwap.iloc[1] == 28010.0
+    # At 09:30 ET Cash Open, VWAP must re-anchor strictly to the RTH opening bar (28400.0)
+    assert vwap.iloc[2] == 28400.0
+
+    # 2. Verify Dual-Session RiskManager entry windows and independent Pre-Market / RTH trade budgets
+    cfg = BotConfig()
+    rm = RiskManager(cfg.risk, cfg.contract)
+
+    # 03:30 ET (Asian session) -> blocked
+    allowed_asia, _ = rm.can_open_trade(pd.Timestamp("2026-11-04 03:30:00", tz="America/New_York"), 1)
+    assert not allowed_asia
+
+    # 04:30 ET (European Pre-Market) -> allowed
+    ts_pm = pd.Timestamp("2026-11-04 04:30:00", tz="America/New_York")
+    allowed_pm, _ = rm.can_open_trade(ts_pm, 5)
+    assert allowed_pm
+
+    # Exhaust Pre-Market max trades (2 trades)
+    rm.record_trade_closed(80.0, exit_bar_index=6)
+    rm.record_trade_closed(60.0, exit_bar_index=10)
+    allowed_pm_after, reason_pm = rm.can_open_trade(pd.Timestamp("2026-11-04 06:00:00", tz="America/New_York"), 15)
+    assert not allowed_pm_after
+    assert "pre-market trades reached" in reason_pm
+
+    # 08:30 ET (US Macro News release window) -> blocked
+    allowed_news, _ = rm.can_open_trade(pd.Timestamp("2026-11-04 08:30:00", tz="America/New_York"), 20)
+    assert not allowed_news
+
+    # 09:50 ET (US RTH Session) -> RTH trade budget is fresh even though 2 premarket trades were taken!
+    allowed_rth, _ = rm.can_open_trade(pd.Timestamp("2026-11-04 09:50:00", tz="America/New_York"), 30)
+    assert allowed_rth
+    assert rm.state.trades_taken == 2
+    assert rm.state.rth_trades_taken == 0

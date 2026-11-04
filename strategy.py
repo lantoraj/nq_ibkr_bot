@@ -190,66 +190,117 @@ class NQIntradayStrategy:
         tol = self.s_cfg.pullback_ema_tolerance_atr * atr
         mode = self.s_cfg.entry_mode
 
+        ts_raw = pd.Timestamp(curr["timestamp"])
+        ts_et = ts_raw.tz_localize(self.r_cfg.timezone) if ts_raw.tzinfo is None else ts_raw.tz_convert(self.r_cfg.timezone)
+        hm = ts_et.strftime("%H:%M")
+
+        pm_trend_end = getattr(self.r_cfg, "premarket_trend_end_time", "06:55")
+        pm_end = getattr(self.r_cfg, "premarket_end_time", "08:20")
+        v_rev_only_window = getattr(self.r_cfg, "use_premarket_session", False) and (pm_trend_end < hm <= pm_end)
+
         signal_dir: Optional[SignalDirection] = None
         reason = ""
 
-        # --- Check LONG setups ---
-        if bull_regime and bull_candle:
-            # A) Bullish EMA Pullback Rejection
-            if mode in ("pullback", "both", "hybrid_all") and (45.0 <= rsi <= 68.0):
-                touched_ema_zone = (low_p <= ema_f + tol) and (low_p >= ema_s - tol)
-                reclaimed_fast_ema = close_p > ema_f
-                broke_prev_high = (close_p > prev_high) if self.s_cfg.require_prev_extreme_break else True
-                if touched_ema_zone and reclaimed_fast_ema and broke_prev_high:
-                    signal_dir = "LONG"
-                    reason = f"Bullish Pullback off EMA({self.s_cfg.fast_ema_period}) > VWAP & EMA50"
+        # --- Check standard Trend Setups (A, B, C, D) outside V-Reversal-only premarket transition ---
+        if not v_rev_only_window:
+            # --- Check LONG setups ---
+            if bull_regime and bull_candle:
+                # A) Bullish EMA Pullback Rejection
+                if mode in ("pullback", "both", "hybrid_all") and (45.0 <= rsi <= 68.0):
+                    touched_ema_zone = (low_p <= ema_f + tol) and (low_p >= ema_s - tol)
+                    reclaimed_fast_ema = close_p > ema_f
+                    broke_prev_high = (close_p > prev_high) if self.s_cfg.require_prev_extreme_break else True
+                    if touched_ema_zone and reclaimed_fast_ema and broke_prev_high:
+                        signal_dir = "LONG"
+                        reason = f"Bullish Pullback off EMA({self.s_cfg.fast_ema_period}) > VWAP & EMA50"
 
-            # B) Bullish EMA Crossover
-            if signal_dir is None and mode in ("crossover", "both", "hybrid_all") and (50.0 <= rsi <= 70.0):
-                if prev_ema_f <= prev_ema_s and ema_f > ema_s and close_p > ema_f:
-                    signal_dir = "LONG"
-                    reason = f"Bullish EMA({self.s_cfg.fast_ema_period}/{self.s_cfg.slow_ema_period}) Crossover > VWAP"
+                # B) Bullish EMA Crossover
+                if signal_dir is None and mode in ("crossover", "both", "hybrid_all") and (50.0 <= rsi <= 70.0):
+                    if prev_ema_f <= prev_ema_s and ema_f > ema_s and close_p > ema_f:
+                        signal_dir = "LONG"
+                        reason = f"Bullish EMA({self.s_cfg.fast_ema_period}/{self.s_cfg.slow_ema_period}) Crossover > VWAP"
 
-            # C) 3-Bar Momentum Continuation Breakout
-            if signal_dir is None and mode == "hybrid_all" and (52.0 <= rsi <= 70.0) and vol_ratio >= 1.1:
-                if close_p > prev_3_high and (close_p - ema_f) <= 1.2 * atr:
-                    signal_dir = "LONG"
-                    reason = "Bullish 3-Bar Momentum Breakout > VWAP & EMA50"
+                # C) 3-Bar Momentum Continuation Breakout
+                if signal_dir is None and mode == "hybrid_all" and (52.0 <= rsi <= 70.0) and vol_ratio >= 1.1:
+                    if close_p > prev_3_high and (close_p - ema_f) <= 1.2 * atr:
+                        signal_dir = "LONG"
+                        reason = "Bullish 3-Bar Momentum Breakout > VWAP & EMA50"
 
-            # D) Opening Range High Breakout
-            if signal_dir is None and mode == "hybrid_all" and pd.notna(orb_high) and (52.0 <= rsi <= 72.0):
-                if prev_high <= orb_high and close_p > orb_high:
-                    signal_dir = "LONG"
-                    reason = "Bullish Opening Range Breakout (ORB High) > VWAP"
+                # D) Opening Range High Breakout
+                if signal_dir is None and mode == "hybrid_all" and pd.notna(orb_high) and (52.0 <= rsi <= 72.0):
+                    if prev_high <= orb_high and close_p > orb_high:
+                        signal_dir = "LONG"
+                        reason = "Bullish Opening Range Breakout (ORB High) > VWAP"
 
-        # --- Check SHORT setups ---
-        if signal_dir is None and bear_regime and bear_candle:
-            # A) Bearish EMA Pullback Rejection
-            if mode in ("pullback", "both", "hybrid_all") and (32.0 <= rsi <= 55.0):
-                touched_ema_zone = (high_p >= ema_f - tol) and (high_p <= ema_s + tol)
-                rejected_fast_ema = close_p < ema_f
-                broke_prev_low = (close_p < prev_low) if self.s_cfg.require_prev_extreme_break else True
-                if touched_ema_zone and rejected_fast_ema and broke_prev_low:
-                    signal_dir = "SHORT"
-                    reason = f"Bearish Pullback off EMA({self.s_cfg.fast_ema_period}) < VWAP & EMA50"
+            # --- Check SHORT setups ---
+            if signal_dir is None and bear_regime and bear_candle:
+                # A) Bearish EMA Pullback Rejection
+                if mode in ("pullback", "both", "hybrid_all") and (32.0 <= rsi <= 55.0):
+                    touched_ema_zone = (high_p >= ema_f - tol) and (high_p <= ema_s + tol)
+                    rejected_fast_ema = close_p < ema_f
+                    broke_prev_low = (close_p < prev_low) if self.s_cfg.require_prev_extreme_break else True
+                    if touched_ema_zone and rejected_fast_ema and broke_prev_low:
+                        signal_dir = "SHORT"
+                        reason = f"Bearish Pullback off EMA({self.s_cfg.fast_ema_period}) < VWAP & EMA50"
 
-            # B) Bearish EMA Crossover
-            if signal_dir is None and mode in ("crossover", "both", "hybrid_all") and (30.0 <= rsi <= 50.0):
-                if prev_ema_f >= prev_ema_s and ema_f < ema_s and close_p < ema_f:
-                    signal_dir = "SHORT"
-                    reason = f"Bearish EMA({self.s_cfg.fast_ema_period}/{self.s_cfg.slow_ema_period}) Crossover < VWAP"
+                # B) Bearish EMA Crossover
+                if signal_dir is None and mode in ("crossover", "both", "hybrid_all") and (30.0 <= rsi <= 50.0):
+                    if prev_ema_f >= prev_ema_s and ema_f < ema_s and close_p < ema_f:
+                        signal_dir = "SHORT"
+                        reason = f"Bearish EMA({self.s_cfg.fast_ema_period}/{self.s_cfg.slow_ema_period}) Crossover < VWAP"
 
-            # C) 3-Bar Momentum Continuation Breakdown
-            if signal_dir is None and mode == "hybrid_all" and (30.0 <= rsi <= 48.0) and vol_ratio >= 1.1:
-                if close_p < prev_3_low and (ema_f - close_p) <= 1.2 * atr:
-                    signal_dir = "SHORT"
-                    reason = "Bearish 3-Bar Momentum Breakdown < VWAP & EMA50"
+                # C) 3-Bar Momentum Continuation Breakdown
+                if signal_dir is None and mode == "hybrid_all" and (30.0 <= rsi <= 48.0) and vol_ratio >= 1.1:
+                    if close_p < prev_3_low and (ema_f - close_p) <= 1.2 * atr:
+                        signal_dir = "SHORT"
+                        reason = "Bearish 3-Bar Momentum Breakdown < VWAP & EMA50"
 
-            # D) Opening Range Low Breakdown
-            if signal_dir is None and mode == "hybrid_all" and pd.notna(orb_low) and (28.0 <= rsi <= 48.0):
-                if prev_low >= orb_low and close_p < orb_low:
-                    signal_dir = "SHORT"
-                    reason = "Bearish Opening Range Breakdown (ORB Low) < VWAP"
+                # D) Opening Range Low Breakdown
+                if signal_dir is None and mode == "hybrid_all" and pd.notna(orb_low) and (28.0 <= rsi <= 48.0):
+                    if prev_low >= orb_low and close_p < orb_low:
+                        signal_dir = "SHORT"
+                        reason = "Bearish Opening Range Breakdown (ORB Low) < VWAP"
+
+        # --- Check Setup E: Premarket / Morning VWAP Overextension V-Reversal ---
+        if signal_dir is None and getattr(self.s_cfg, "enable_v_reversal", True) and ("04:00" <= hm <= "11:30"):
+            roll_z_max = float(curr.get("roll_vwap_z_max", vwap_z))
+            roll_z_min = float(curr.get("roll_vwap_z_min", vwap_z))
+            z_ext = getattr(self.s_cfg, "v_reversal_min_z_extreme", 1.30)
+            min_k_vel = getattr(self.s_cfg, "v_reversal_min_kalman_vel", 0.35)
+            min_v_body = getattr(self.s_cfg, "v_reversal_min_body_ratio", 0.55)
+            min_vwap_dist = getattr(self.s_cfg, "v_reversal_min_vwap_dist_atr", 2.0)
+
+            # E1) Bearish V-Reversal from extreme positive VWAP overextension back toward VWAP
+            if (
+                roll_z_max >= z_ext
+                and (0.50 <= vwap_z <= 1.35)
+                and (ema_f < ema_s)
+                and (close_p < ema_f)
+                and (close_p < prev_3_low)
+                and bear_candle
+                and (body_ratio >= min_v_body)
+                and (lower_wick <= 0.30)
+                and (kalman_vel_atr <= -min_k_vel)
+                and ((close_p - vwap) >= min_vwap_dist * atr)
+            ):
+                signal_dir = "SHORT"
+                reason = f"Bearish VWAP Overextension V-Reversal (Peak Z={roll_z_max:+.2f} -> {vwap_z:+.2f})"
+
+            # E2) Bullish V-Reversal from extreme negative VWAP overextension back toward VWAP
+            elif (
+                roll_z_min <= -z_ext
+                and (-1.35 <= vwap_z <= -0.50)
+                and (ema_f > ema_s)
+                and (close_p > ema_f)
+                and (close_p > prev_3_high)
+                and bull_candle
+                and (body_ratio >= min_v_body)
+                and (upper_wick <= 0.30)
+                and (kalman_vel_atr >= min_k_vel)
+                and ((vwap - close_p) >= min_vwap_dist * atr)
+            ):
+                signal_dir = "LONG"
+                reason = f"Bullish VWAP Overextension V-Reversal (Trough Z={roll_z_min:+.2f} -> {vwap_z:+.2f})"
 
         if signal_dir is None:
             return None

@@ -116,23 +116,35 @@ def compute_garman_klass_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return gk_sigma_pts * 1.35
 
 
+def _session_vwap_groups(timestamps: pd.Series, timezone: str = "America/New_York") -> pd.Series:
+    """
+    Build session group keys in US Eastern Time so that:
+    - Overnight / European Pre-Market (00:00 - 09:29 ET) accumulates its own ETH Session VWAP.
+    - US Regular Trading Hours (09:30 - 16:59 ET) cleanly re-anchors VWAP at the 09:30 ET Cash Open.
+    - Evening Globex (17:00 - 23:59 ET) anchors its own evening session.
+    """
+    ts_local = pd.to_datetime(timestamps, utc=True).dt.tz_convert(timezone)
+    hhmm = ts_local.dt.strftime("%H:%M")
+    phase = np.where(hhmm < "09:30", "ETH_AM", np.where(hhmm < "17:00", "RTH", "ETH_PM"))
+    return pd.Series(ts_local.dt.strftime("%Y-%m-%d").to_numpy() + "_" + phase, index=timestamps.index)
+
+
 def compute_session_vwap(df: pd.DataFrame, timezone: str = "America/New_York") -> pd.Series:
     """
-    Calculate Session-Anchored VWAP that resets at the start of each calendar day
-    in US Eastern Time (or per date if timestamps are naive).
+    Calculate Dual-Session Anchored VWAP that resets at 00:00 ET for Pre-Market
+    and re-anchors cleanly at 09:30 ET for the US Regular Trading Hours session.
     """
     if df.empty:
         return pd.Series(dtype=float)
 
-    timestamps = pd.to_datetime(df["timestamp"], utc=True)
-    local_dates = timestamps.dt.tz_convert(timezone).dt.date
+    session_groups = _session_vwap_groups(df["timestamp"], timezone=timezone)
 
     typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
     volume = df["volume"].replace(0, 1)
     tp_vol = typical_price * volume
 
-    cum_tp_vol = tp_vol.groupby(local_dates).cumsum()
-    cum_vol = volume.groupby(local_dates).cumsum()
+    cum_tp_vol = tp_vol.groupby(session_groups).cumsum()
+    cum_vol = volume.groupby(session_groups).cumsum()
 
     return cum_tp_vol / cum_vol
 
@@ -144,19 +156,18 @@ def compute_session_vwap_zscore(
 ) -> pd.Series:
     """
     Calculate how many volume-weighted standard deviations (Z-score) the current Close is
-    from the Session VWAP.
+    from the active Session VWAP (Pre-Market or RTH).
     """
     if df.empty:
         return pd.Series(dtype=float)
 
-    timestamps = pd.to_datetime(df["timestamp"], utc=True)
-    local_dates = timestamps.dt.tz_convert(timezone).dt.date
+    session_groups = _session_vwap_groups(df["timestamp"], timezone=timezone)
 
     typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
     volume = df["volume"].replace(0, 1)
 
-    cum_vol = volume.groupby(local_dates).cumsum()
-    cum_tp2_vol = ((typical_price ** 2) * volume).groupby(local_dates).cumsum()
+    cum_vol = volume.groupby(session_groups).cumsum()
+    cum_tp2_vol = ((typical_price ** 2) * volume).groupby(session_groups).cumsum()
 
     vwap_var = (cum_tp2_vol / cum_vol) - (vwap_series ** 2)
     vwap_std = np.sqrt(np.maximum(0.0, vwap_var)).replace(0.0, 1.0)
@@ -222,6 +233,8 @@ def enrich_indicators(
     out["ema_trend"] = compute_ema(out["close"], trend_ema)
     out["vwap"] = compute_session_vwap(out, timezone=timezone)
     out["vwap_z"] = compute_session_vwap_zscore(out, out["vwap"], timezone=timezone)
+    out["roll_vwap_z_max"] = out["vwap_z"].rolling(12, min_periods=1).max()
+    out["roll_vwap_z_min"] = out["vwap_z"].rolling(12, min_periods=1).min()
     out["atr"] = compute_atr(out, period=atr_period)
     out["gk_atr"] = compute_garman_klass_atr(out, period=atr_period)
     out["rsi"] = compute_rsi(out["close"], period=rsi_period)

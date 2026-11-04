@@ -1000,12 +1000,18 @@ class IBKRNQBotRunner:
                 keepUpToDate=False,
             )
             logger.info("Bot is now live and polling 2-min bar closes every 20s. Press Ctrl+C to stop.")
+            window_desc = (
+                f"`{self.cfg.risk.premarket_start_time}–{self.cfg.risk.premarket_end_time} ET (Pre-Market)` + "
+                f"`{self.cfg.risk.entry_start_time}–{self.cfg.risk.entry_end_time} ET (RTH)`"
+                if getattr(self.cfg.risk, "use_premarket_session", False)
+                else f"`{self.cfg.risk.entry_start_time}–{self.cfg.risk.entry_end_time} ET`"
+            )
             self._send_discord_alert(
                 title=f"🤖 NQ Quant Bot Online — {self.contract.localSymbol} ({self.mode.upper()})",
                 description=(
                     f"**Contract:** `{self.contract.localSymbol}` (Expiry `{self.contract.lastTradeDateOrContractMonth}`)\n"
                     f"**Timeframe:** `{self.cfg.strategy.bar_size}` | **Contracts:** `{self.cfg.risk.fixed_contracts}`\n"
-                    f"**Window:** `{self.cfg.risk.entry_start_time}–{self.cfg.risk.entry_end_time} ET`"
+                    f"**Session Windows:** {window_desc}"
                 ),
                 color=0x3498DB,
             )

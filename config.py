@@ -77,9 +77,9 @@ class StrategyConfig:
     # Signal triggers ("pullback", "crossover", "both", or "hybrid_all")
     entry_mode: Literal["pullback", "crossover", "both", "hybrid_all"] = "hybrid_all"
 
-    # Volatility & Momentum filters
+    #Volatility & Momentum filters
     atr_period: int = 14
-    min_atr_points: float = 4.0           # Avoid dead/chop markets with tiny ranges
+    min_atr_points: float = 3.0           # Avoid dead/chop markets (3.0 pts allows clean European premarket trends)
     max_atr_points: float = 65.0          # Avoid extreme news-spike bars
     rsi_period: int = 14
     rsi_long_min: float = 45.0
@@ -90,6 +90,13 @@ class StrategyConfig:
 
     # Pullback tolerance in ATR multiples (how close low/high needs to get to Fast EMA)
     pullback_ema_tolerance_atr: float = 0.40
+
+    # Setup E: Premarket / Morning VWAP Overextension V-Reversal
+    enable_v_reversal: bool = True
+    v_reversal_min_z_extreme: float = 1.30  # Rolling 12-bar |VWAP Z| must have reached >= 1.30 SD
+    v_reversal_min_kalman_vel: float = 0.35 # Minimum opposing Kalman velocity (|vel|/ATR >= 0.35)
+    v_reversal_min_body_ratio: float = 0.55 # Strong impulse reversal candle body >= 55% of range
+    v_reversal_min_vwap_dist_atr: float = 2.0 # At least 2.0 * ATR room back to Session VWAP
 
 
 @dataclass
@@ -125,11 +132,19 @@ class RiskConfig:
     cooldown_bars_after_exit: int = 3     # Wait N bars before entering another trade
 
     # Trading session window (America/New_York - US Eastern Time)
+    # Dual-Session Mode:
+    #   1) European Pre-Market Session: 04:00 - 06:55 ET (Trend + V-Reversal), 06:55 - 08:20 ET (V-Reversal only)
+    #   2) US Regular Trading Hours (RTH): 09:45 - 15:30 ET (VWAP re-anchored at 09:30 ET Cash Open)
     timezone: str = "America/New_York"
-    rth_only: bool = True
-    entry_start_time: str = "09:45"       # Enter after 15-min Opening Range settles
-    entry_end_time: str = "15:30"         # Extended entry window to 15:30 ET to trade full regular session
-    flatten_eod_time: str = "15:55"       # Force flatten all open positions and cancel orders
+    rth_only: bool = False                # False = stream ETH+RTH bars and set outsideRth=True on orders
+    use_premarket_session: bool = True    # Enable European Pre-Market trading window
+    premarket_start_time: str = "04:00"   # 10:00 CET (European Cash Open)
+    premarket_trend_end_time: str = "06:55"  # 12:55 CET (End of standard trend entries in pre-market)
+    premarket_end_time: str = "08:20"     # 14:20 CET (Stop 10m before 08:30 ET US macro news releases)
+    premarket_max_trades: int = 2         # Dedicated Pre-Market trade cap (does not reduce RTH trade cap)
+    entry_start_time: str = "09:45"       # Enter US RTH after 15-min Opening Range settles (15:45 CET)
+    entry_end_time: str = "15:30"         # Extended RTH entry window to 15:30 ET (21:30 CET)
+    flatten_eod_time: str = "15:55"       # Force flatten all open positions and cancel orders (21:55 CET)
 
 
 @dataclass
