@@ -686,6 +686,8 @@ class IBKRNQBotRunner:
                     new_sl = round_to_tick(sig.entry_price + self.cfg.risk.breakeven_offset_points)
                     if new_sl > self._active_stop_order.auxPrice:
                         self._active_stop_order.auxPrice = new_sl
+                        self._active_stop_order.cashQty = float("nan")
+                        self._active_stop_order.overridePercentageConstraints = True
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
                         logger.info("Moved LONG StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
@@ -698,6 +700,8 @@ class IBKRNQBotRunner:
                     new_sl = round_to_tick(sig.entry_price - self.cfg.risk.breakeven_offset_points)
                     if new_sl < self._active_stop_order.auxPrice:
                         self._active_stop_order.auxPrice = new_sl
+                        self._active_stop_order.cashQty = float("nan")
+                        self._active_stop_order.overridePercentageConstraints = True
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
                         logger.info("Moved SHORT StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
@@ -715,6 +719,8 @@ class IBKRNQBotRunner:
                         dec_sl = round_to_tick(sig.entry_price - self.cfg.risk.time_decay_stop_r * one_r)
                         if low_p > dec_sl and dec_sl > self._active_stop_order.auxPrice:
                             self._active_stop_order.auxPrice = dec_sl
+                            self._active_stop_order.cashQty = float("nan")
+                            self._active_stop_order.overridePercentageConstraints = True
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
                             logger.info("Time-Decay Stop Tightening: Moved LONG StopOrder to -0.5R (%.2f)", dec_sl)
@@ -727,6 +733,8 @@ class IBKRNQBotRunner:
                         dec_sl = round_to_tick(sig.entry_price + self.cfg.risk.time_decay_stop_r * one_r)
                         if high_p < dec_sl and dec_sl < self._active_stop_order.auxPrice:
                             self._active_stop_order.auxPrice = dec_sl
+                            self._active_stop_order.cashQty = float("nan")
+                            self._active_stop_order.overridePercentageConstraints = True
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
                             logger.info("Time-Decay Stop Tightening: Moved SHORT StopOrder to -0.5R (%.2f)", dec_sl)
