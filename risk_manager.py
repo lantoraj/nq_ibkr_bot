@@ -26,9 +26,11 @@ class DailyRiskState:
     realized_pnl_usd: float = 0.0
     trades_taken: int = 0
     premarket_trades_taken: int = 0
+    premarket_vrev_trades_taken: int = 0
     rth_trades_taken: int = 0
     rth_reset_done: bool = False
     in_premarket_phase: bool = False
+    in_vrev_phase: bool = False
     wins: int = 0
     losses: int = 0
     consecutive_losses: int = 0
@@ -47,6 +49,7 @@ class RiskManager:
         self.state = DailyRiskState()
 
         self._pm_start = self._parse_hhmm(getattr(self.r_cfg, "premarket_start_time", "04:00"))
+        self._pm_trend_end = self._parse_hhmm(getattr(self.r_cfg, "premarket_trend_end_time", "06:55"))
         self._pm_end = self._parse_hhmm(getattr(self.r_cfg, "premarket_end_time", "08:20"))
         self._entry_start = self._parse_hhmm(self.r_cfg.entry_start_time)
         self._entry_end = self._parse_hhmm(self.r_cfg.entry_end_time)
@@ -68,14 +71,18 @@ class RiskManager:
         local_dt = self._to_session_dt(ts)
         curr_date = local_dt.date()
         t = local_dt.time()
+        in_pm = t < time(9, 30)
+        in_vrev = in_pm and (t > self._pm_trend_end)
         if self.state.session_date != curr_date:
             self.state = DailyRiskState(
                 session_date=curr_date,
                 rth_reset_done=(t >= time(9, 30)),
-                in_premarket_phase=(t < time(9, 30)),
+                in_premarket_phase=in_pm,
+                in_vrev_phase=in_vrev,
             )
         else:
-            self.state.in_premarket_phase = t < time(9, 30)
+            self.state.in_premarket_phase = in_pm
+            self.state.in_vrev_phase = in_vrev
             if not self.state.rth_reset_done and t >= time(9, 30):
                 self.state.rth_reset_done = True
                 self.state.consecutive_losses = 0
@@ -84,11 +91,14 @@ class RiskManager:
                     self.state.halt_reason = ""
 
     def should_flatten_eod(self, ts: pd.Timestamp) -> bool:
-        """Return True if current time is at or past the mandatory EOD flatten time (15:55 - 17:00 ET)."""
+        """Return True if current time is at Pre-Market close (09:24-09:29 ET) or EOD flatten time (15:55-17:00 ET)."""
         if not self.r_cfg.rth_only and not getattr(self.r_cfg, "use_premarket_session", False):
             return False
         local_dt = self._to_session_dt(ts)
-        return self._flatten_time <= local_dt.time() <= time(17, 0)
+        t = local_dt.time()
+        if getattr(self.r_cfg, "use_premarket_session", False) and (time(9, 24) <= t < time(9, 30)):
+            return True
+        return self._flatten_time <= t <= time(17, 0)
 
     def is_within_entry_window(self, ts: pd.Timestamp) -> bool:
         """Return True if current timestamp falls within allowed Pre-Market or RTH entry hours."""
@@ -125,9 +135,13 @@ class RiskManager:
             return False, self.state.halt_reason
 
         if self.state.in_premarket_phase:
-            pm_max = getattr(self.r_cfg, "premarket_max_trades", 2)
-            if self.state.premarket_trades_taken >= pm_max:
-                return False, f"Max pre-market trades reached ({self.state.premarket_trades_taken}/{pm_max})"
+            if self.state.in_vrev_phase:
+                if self.state.premarket_vrev_trades_taken >= 1:
+                    return False, "Max pre-market V-Reversal trades reached (1/1)"
+            else:
+                pm_max = getattr(self.r_cfg, "premarket_max_trades", 2)
+                if self.state.premarket_trades_taken >= pm_max:
+                    return False, f"Max pre-market trades reached ({self.state.premarket_trades_taken}/{pm_max})"
         else:
             if self.state.rth_trades_taken >= self.r_cfg.max_daily_trades:
                 return False, f"Max daily trades reached ({self.state.rth_trades_taken}/{self.r_cfg.max_daily_trades})"
@@ -163,7 +177,10 @@ class RiskManager:
         """Update session risk state after a position is closed."""
         self.state.trades_taken += 1
         if self.state.in_premarket_phase:
-            self.state.premarket_trades_taken += 1
+            if self.state.in_vrev_phase:
+                self.state.premarket_vrev_trades_taken += 1
+            else:
+                self.state.premarket_trades_taken += 1
         else:
             self.state.rth_trades_taken += 1
         self.state.realized_pnl_usd += net_pnl_usd

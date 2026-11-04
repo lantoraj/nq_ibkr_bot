@@ -592,20 +592,24 @@ class IBKRNQBotRunner:
                 self._pending_post_trade_chart = None
                 self._dispatch_post_trade_review_chart(task)
 
-        # 1. Check mandatory EOD Flatten & Send Daily Summary Report (15:55 ET)
+        # 1. Check mandatory Session / EOD Flatten & Send Daily Summary Report (15:55 ET)
         self.risk.check_and_reset_session(latest_closed_ts)
         if self.risk.should_flatten_eod(latest_closed_ts):
+            is_eod = self.risk._to_session_dt(latest_closed_ts).time() >= self.risk._flatten_time
             if self.has_open_position_or_orders():
-                self.flatten_all(reason="End of Day (15:55 ET) Auto-Flatten")
+                self.flatten_all(
+                    reason="End of Day (15:55 ET) Auto-Flatten"
+                    if is_eod
+                    else "Pre-Market Close (09:24 ET) Auto-Flatten"
+                )
             if self._pending_post_trade_chart is not None:
                 task = self._pending_post_trade_chart
                 self._pending_post_trade_chart = None
                 self._dispatch_post_trade_review_chart(task)
             curr_date = self.risk.state.session_date
-            # Only report for the CURRENT ET trading day (prevents stale duplicate summaries
-            # after nightly IB Gateway restarts or weekend reconnects).
+            # Only report EOD summary at/after 15:55 ET for the CURRENT ET trading day
             today_et = pd.Timestamp.now(tz=self.cfg.risk.timezone).date()
-            if curr_date is not None and curr_date == today_et and self._last_summary_date != curr_date:
+            if is_eod and curr_date is not None and curr_date == today_et and self._last_summary_date != curr_date:
                 self._last_summary_date = curr_date
                 self.send_daily_summary_report(df, latest_closed_ts)
             return

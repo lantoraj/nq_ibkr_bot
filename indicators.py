@@ -214,7 +214,7 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return rsi.fillna(50.0)
 
 
-def enrich_indicators(
+def _enrich_single_stream(
     df: pd.DataFrame,
     fast_ema: int = 9,
     slow_ema: int = 21,
@@ -223,10 +223,7 @@ def enrich_indicators(
     rsi_period: int = 14,
     timezone: str = "America/New_York",
 ) -> pd.DataFrame:
-    """
-    Compute and attach all technical and quantitative v4 indicators to an OHLCV DataFrame.
-    Expected columns: ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-    """
+    """Compute all technical and quantitative v4 indicators on a homogeneous session stream."""
     out = df.copy()
     out["ema_fast"] = compute_ema(out["close"], fast_ema)
     out["ema_slow"] = compute_ema(out["close"], slow_ema)
@@ -282,3 +279,48 @@ def enrich_indicators(
         out["orb_low"] = np.nan
 
     return out
+
+
+def enrich_indicators(
+    df: pd.DataFrame,
+    fast_ema: int = 9,
+    slow_ema: int = 21,
+    trend_ema: int = 50,
+    atr_period: int = 14,
+    rsi_period: int = 14,
+    timezone: str = "America/New_York",
+) -> pd.DataFrame:
+    """
+    Compute and attach all technical and quantitative v4 indicators to an OHLCV DataFrame.
+    When both ETH/Pre-Market and US RTH bars are present, applies Dual-Session Regime Isolation:
+    - Pre-Market bars (00:00 - 09:29 ET) are computed on the 00:00 - 16:00 ET session stream.
+    - US RTH bars (09:30 - 16:00 ET) are computed strictly on the 09:30 - 16:00 ET RTH stream
+      so 08:30 - 09:29 ET pre-open whipsaws do not distort RTH EMAs, ATR, Kalman velocity, or PDH/PDL.
+    """
+    if df.empty:
+        return df.copy()
+
+    ts_et = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert(timezone)
+    hhmms = ts_et.dt.strftime("%H:%M")
+    has_eth = ((hhmms < "09:30") | (hhmms > "16:00")).any()
+    has_rth = ((hhmms >= "09:30") & (hhmms <= "16:00")).any()
+
+    if has_eth and has_rth:
+        out = _enrich_single_stream(df, fast_ema, slow_ema, trend_ema, atr_period, rsi_period, timezone)
+
+        eth_day_mask = (hhmms >= "00:00") & (hhmms <= "16:00")
+        if eth_day_mask.any():
+            eth_enriched = _enrich_single_stream(
+                df.loc[eth_day_mask].copy(), fast_ema, slow_ema, trend_ema, atr_period, rsi_period, timezone
+            )
+            pm_mask = (hhmms >= "00:00") & (hhmms < "09:30")
+            out.loc[pm_mask, eth_enriched.columns] = eth_enriched.loc[pm_mask]
+
+        rth_mask = (hhmms >= "09:30") & (hhmms <= "16:00")
+        rth_enriched = _enrich_single_stream(
+            df.loc[rth_mask].copy(), fast_ema, slow_ema, trend_ema, atr_period, rsi_period, timezone
+        )
+        out.loc[rth_mask, rth_enriched.columns] = rth_enriched
+        return out
+
+    return _enrich_single_stream(df, fast_ema, slow_ema, trend_ema, atr_period, rsi_period, timezone)
