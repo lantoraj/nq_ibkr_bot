@@ -58,6 +58,7 @@ class IBKRNQBotRunner:
         self._trade_initial_sl: Optional[float] = None
         self._trade_initial_tp: Optional[float] = None
         self._pending_post_trade_chart: Optional[dict] = None
+        self._last_error_alert_ts: dict[int, float] = {}
 
     def _send_discord_alert(
         self,
@@ -65,8 +66,9 @@ class IBKRNQBotRunner:
         description: str,
         color: int = 0x3498DB,
         image_bytes: Optional[bytes] = None,
+        blocking: bool = False,
     ) -> None:
-        """Send an asynchronous rich embed notification (with optional chart image) to Discord."""
+        """Send a rich embed notification (with optional chart image) to Discord."""
         url = (self.cfg.ibkr.discord_webhook_url or "").strip()
         if not url:
             return
@@ -123,7 +125,10 @@ class IBKRNQBotRunner:
             except Exception as exc:
                 logger.warning("Failed to send Discord alert: %s", exc)
 
-        threading.Thread(target=_post, daemon=True).start()
+        if blocking:
+            _post()
+        else:
+            threading.Thread(target=_post, daemon=True).start()
 
     def _generate_trade_chart(
         self,
@@ -354,6 +359,17 @@ class IBKRNQBotRunner:
                 return
             except Exception as exc:
                 if attempt >= max_retries:
+                    self._send_discord_alert(
+                        title=f"🚨 BOT CONNECTION ERROR — IBKR API Unreachable ({self.mode.upper()})",
+                        description=(
+                            f"**Host / Port:** `{self.cfg.ibkr.host}:{port}` (`clientId={self.cfg.ibkr.client_id}`)\n"
+                            f"**Failed Attempts:** `{attempt}/{max_retries}`\n"
+                            f"**Error Details:** `{exc}`\n"
+                            f"_Bot process is stopping; Docker & IB Gateway Watchdog will attempt automatic recovery._"
+                        ),
+                        color=0xE74C3C,
+                        blocking=True,
+                    )
                     raise
                 logger.warning(
                     "IBKR connection attempt %d/%d failed (%s). Retrying in %ds...",
@@ -987,6 +1003,32 @@ class IBKRNQBotRunner:
             color=color,
         )
 
+    def _on_ib_error(self, reqId: int, errorCode: int, errorString: str, contract=None) -> None:
+        """Forward critical IBKR order/connectivity errors to Discord (rate-limited per errorCode)."""
+        import time
+
+        # Ignore routine informational messages and benign historical query cancellations
+        critical_codes = {103, 110, 200, 201, 203, 354, 451, 502, 504, 1100, 1300, 10141, 10197}
+        if errorCode not in critical_codes:
+            return
+
+        now = time.time()
+        last_sent = self._last_error_alert_ts.get(errorCode, 0.0)
+        if (now - last_sent) < 300.0:  # Max 1 Discord alert per error code every 5 minutes
+            return
+        self._last_error_alert_ts[errorCode] = now
+
+        sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+        self._send_discord_alert(
+            title=f"⚠️ IBKR API ERROR [Code {errorCode}] — {sym}",
+            description=(
+                f"**Request ID:** `{reqId}` | **Error Code:** `{errorCode}`\n"
+                f"**IBKR Message:** `{errorString}`\n"
+                f"**Mode:** `{self.mode.upper()}`"
+            ),
+            color=0xE67E22,
+        )
+
     def run_streaming(self) -> None:
         """Start real-time bar subscription and run the IBKR event loop."""
         self.connect()
@@ -994,6 +1036,7 @@ class IBKRNQBotRunner:
             self.resolve_front_month_contract()
             self.ib.commissionReportEvent += self._on_commission_report
             self.ib.execDetailsEvent += self._on_exec_details
+            self.ib.errorEvent += self._on_ib_error
 
             logger.info(
                 "Subscribing to %s real-time bars (%s, RTH=%s)...",
@@ -1058,14 +1101,50 @@ class IBKRNQBotRunner:
                             consecutive_empty_polls,
                         )
                         if consecutive_empty_polls >= 3:
+                            sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+                            self._send_discord_alert(
+                                title=f"⚠️ IBKR DATA FEED STALLED — Auto-Restarting ({sym})",
+                                description=(
+                                    f"**Status:** `reqHistoricalData` timed out `3` times consecutively (`60s`).\n"
+                                    f"**Action:** Disconnecting bot so Docker & the Host Watchdog automatically restart `ib-gateway` and `nq-ibkr-bot`.\n"
+                                    f"_You will receive a 🤖 NQ Quant Bot Online alert once reconnected._"
+                                ),
+                                color=0xE67E22,
+                                blocking=True,
+                            )
                             raise RuntimeError("IB Gateway historical data feed timed out 3 times consecutively")
                 except RuntimeError:
                     logger.error("Historical feed stalled after 3 consecutive timeouts; disconnecting to trigger clean restart.")
                     break
                 except Exception as exc:  # never let one transient error kill a bot that manages live stops
                     logger.exception("Error during bar polling/processing (bot continues): %s", exc)
+
+            if not self.ib.isConnected():
+                sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+                self._send_discord_alert(
+                    title=f"⚠️ IBKR CONNECTION LOST — Reconnecting ({sym})",
+                    description=(
+                        f"**Status:** Active socket connection to IB Gateway (`{self.cfg.ibkr.host}`) was closed.\n"
+                        f"**Action:** Bot process is exiting so Docker automatically reconnects."
+                    ),
+                    color=0xE67E22,
+                    blocking=True,
+                )
         except KeyboardInterrupt:
             logger.info("Shutdown requested by user (Ctrl+C).")
+        except Exception as exc:
+            sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+            self._send_discord_alert(
+                title=f"🚨 BOT STOPPED (UNHANDLED ERROR) — {sym}",
+                description=(
+                    f"**Error Type:** `{type(exc).__name__}`\n"
+                    f"**Details:** `{exc}`\n"
+                    f"_Docker (`restart: unless-stopped`) will automatically restart the bot._"
+                ),
+                color=0xE74C3C,
+                blocking=True,
+            )
+            raise
         finally:
             if self.ib.isConnected():
                 self.ib.disconnect()
