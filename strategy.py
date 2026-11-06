@@ -206,7 +206,7 @@ class NQIntradayStrategy:
             # --- Check LONG setups ---
             if bull_regime and bull_candle:
                 # A) Bullish EMA Pullback Rejection
-                if mode in ("pullback", "both", "hybrid_all") and (45.0 <= rsi <= 68.0):
+                if mode in ("pullback", "both", "hybrid_all") and (self.s_cfg.rsi_long_min <= rsi <= self.s_cfg.rsi_overbought):
                     touched_ema_zone = (low_p <= ema_f + tol) and (low_p >= ema_s - tol)
                     reclaimed_fast_ema = close_p > ema_f
                     broke_prev_high = (close_p > prev_high) if self.s_cfg.require_prev_extreme_break else True
@@ -215,13 +215,13 @@ class NQIntradayStrategy:
                         reason = f"Bullish Pullback off EMA({self.s_cfg.fast_ema_period}) > VWAP & EMA50"
 
                 # B) Bullish EMA Crossover
-                if signal_dir is None and mode in ("crossover", "both", "hybrid_all") and (50.0 <= rsi <= 70.0):
+                if signal_dir is None and mode in ("crossover", "both", "hybrid_all") and (50.0 <= rsi <= self.s_cfg.rsi_overbought):
                     if prev_ema_f <= prev_ema_s and ema_f > ema_s and close_p > ema_f:
                         signal_dir = "LONG"
                         reason = f"Bullish EMA({self.s_cfg.fast_ema_period}/{self.s_cfg.slow_ema_period}) Crossover > VWAP"
 
                 # C) 3-Bar Momentum Continuation Breakout
-                if signal_dir is None and mode == "hybrid_all" and (52.0 <= rsi <= 70.0) and vol_ratio >= 1.1:
+                if signal_dir is None and mode == "hybrid_all" and (52.0 <= rsi <= self.s_cfg.rsi_overbought) and vol_ratio >= 1.1:
                     if close_p > prev_3_high and (close_p - ema_f) <= 1.2 * atr:
                         signal_dir = "LONG"
                         reason = "Bullish 3-Bar Momentum Breakout > VWAP & EMA50"
@@ -235,7 +235,7 @@ class NQIntradayStrategy:
             # --- Check SHORT setups ---
             if signal_dir is None and bear_regime and bear_candle:
                 # A) Bearish EMA Pullback Rejection
-                if mode in ("pullback", "both", "hybrid_all") and (32.0 <= rsi <= 55.0):
+                if mode in ("pullback", "both", "hybrid_all") and (self.s_cfg.rsi_oversold <= rsi <= self.s_cfg.rsi_short_max):
                     touched_ema_zone = (high_p >= ema_f - tol) and (high_p <= ema_s + tol)
                     rejected_fast_ema = close_p < ema_f
                     broke_prev_low = (close_p < prev_low) if self.s_cfg.require_prev_extreme_break else True

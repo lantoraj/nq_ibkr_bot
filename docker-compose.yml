@@ -10,7 +10,7 @@ services:
       READ_ONLY_API: "no"
       TWOFA_TIMEOUT_ACTION: "restart"
       RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
-      AUTO_RESTART_TIME: "11:30 PM"
+      AUTO_RESTART_TIME: "01:15 AM"
       TIME_ZONE: "America/New_York"
       TWS_ACCEPT_INCOMING: "accept"
       EXISTING_SESSION_DETECTED_ACTION: "primary"

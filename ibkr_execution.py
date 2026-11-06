@@ -1033,6 +1033,7 @@ class IBKRNQBotRunner:
 
             # Poll every 20 seconds so both real-time CME subscriptions and 10-min delayed Paper feeds
             # reliably advance on every 2-minute bar close without stalling.
+            consecutive_empty_polls = 0
             while self.ib.isConnected():
                 self.ib.sleep(20)
                 try:
@@ -1047,9 +1048,21 @@ class IBKRNQBotRunner:
                         keepUpToDate=False,
                     )
                     if fresh_bars:
+                        consecutive_empty_polls = 0
                         self.bars = fresh_bars
                         self._on_bar_update(self.bars, has_new_bar=True)
-                except Exception as exc:  # never let one bad bar/timeout kill a bot that manages live stops
+                    else:
+                        consecutive_empty_polls += 1
+                        logger.warning(
+                            "Empty/timed-out historical bar poll (%d/3) from IB Gateway.",
+                            consecutive_empty_polls,
+                        )
+                        if consecutive_empty_polls >= 3:
+                            raise RuntimeError("IB Gateway historical data feed timed out 3 times consecutively")
+                except RuntimeError:
+                    logger.error("Historical feed stalled after 3 consecutive timeouts; disconnecting to trigger clean restart.")
+                    break
+                except Exception as exc:  # never let one transient error kill a bot that manages live stops
                     logger.exception("Error during bar polling/processing (bot continues): %s", exc)
         except KeyboardInterrupt:
             logger.info("Shutdown requested by user (Ctrl+C).")

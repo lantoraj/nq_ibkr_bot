@@ -80,7 +80,7 @@ class StrategyConfig:
     #Volatility & Momentum filters
     atr_period: int = 14
     min_atr_points: float = 3.0           # Avoid dead/chop markets (3.0 pts allows clean European premarket trends)
-    max_atr_points: float = 65.0          # Avoid extreme news-spike bars
+    max_atr_points: float = 95.0          # Allow high-velocity sell-off/trend sessions up to 95 pts 2m ATR while blocking >100 pt capitulation spikes
     rsi_period: int = 14
     rsi_long_min: float = 45.0
     rsi_overbought: float = 70.0          # Do not enter new longs above this RSI
