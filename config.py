@@ -82,7 +82,8 @@ class StrategyConfig:
 
     # Volatility & Momentum filters
     atr_period: int = 14
-    min_atr_points: float = 3.0           # Avoid dead/chop markets (3.0 pts allows clean European premarket trends)
+    min_atr_points: float = 22.0          # Minimum 2-min ATR(14) in RTH to avoid dead low-volatility chop (validated on 2-Year data)
+    premarket_min_atr_points: float = 16.0  # Minimum 2-min ATR(14) in European Pre-Market (04:00-06:00 ET)
     max_atr_points: float = 95.0          # Allow high-velocity sell-off/trend sessions up to 95 pts 2m ATR while blocking >100 pt capitulation spikes
     rsi_period: int = 14
     rsi_long_min: float = 45.0
@@ -94,8 +95,8 @@ class StrategyConfig:
     # Pullback tolerance in ATR multiples (how close low/high needs to get to Fast EMA)
     pullback_ema_tolerance_atr: float = 0.40
 
-    # Setup E: Premarket / Morning VWAP Overextension V-Reversal
-    enable_v_reversal: bool = True
+    # Setup E: Premarket / Morning VWAP Overextension V-Reversal (Disabled after 2-Year Ablation showed negative expectancy)
+    enable_v_reversal: bool = False
     v_reversal_min_z_extreme: float = 1.30  # Rolling 12-bar |VWAP Z| must have reached >= 1.30 SD
     v_reversal_min_kalman_vel: float = 0.35 # Minimum opposing Kalman velocity (|vel|/ATR >= 0.35)
     v_reversal_min_body_ratio: float = 0.55 # Strong impulse reversal candle body >= 55% of range

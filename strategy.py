@@ -123,8 +123,17 @@ class NQIntradayStrategy:
         kalman_vel_atr = float(curr["kalman_vel_atr"])
         hurst = float(curr["hurst"])
 
+        ts_raw = pd.Timestamp(curr["timestamp"])
+        ts_et = ts_raw.tz_localize(self.r_cfg.timezone) if ts_raw.tzinfo is None else ts_raw.tz_convert(self.r_cfg.timezone)
+        hm = ts_et.strftime("%H:%M")
+
         # 1. Volatility, Trend Spread, Candle Body, Volume & VWAP Z-Score Band filters
-        if pd.isna(atr) or atr < self.s_cfg.min_atr_points or atr > self.s_cfg.max_atr_points:
+        req_min_atr = (
+            getattr(self.s_cfg, "premarket_min_atr_points", self.s_cfg.min_atr_points)
+            if hm < "09:30"
+            else self.s_cfg.min_atr_points
+        )
+        if pd.isna(atr) or atr < req_min_atr or atr > self.s_cfg.max_atr_points:
             return None
         if spread_atr < self.s_cfg.min_ema_spread_atr:
             return None
@@ -189,10 +198,6 @@ class NQIntradayStrategy:
         bear_candle = (close_p < open_p) and (lower_wick <= self.s_cfg.max_opposing_wick_ratio)
         tol = self.s_cfg.pullback_ema_tolerance_atr * atr
         mode = self.s_cfg.entry_mode
-
-        ts_raw = pd.Timestamp(curr["timestamp"])
-        ts_et = ts_raw.tz_localize(self.r_cfg.timezone) if ts_raw.tzinfo is None else ts_raw.tz_convert(self.r_cfg.timezone)
-        hm = ts_et.strftime("%H:%M")
 
         pm_trend_end = getattr(self.r_cfg, "premarket_trend_end_time", "06:00")
         pm_end = getattr(self.r_cfg, "premarket_end_time", "08:20")
