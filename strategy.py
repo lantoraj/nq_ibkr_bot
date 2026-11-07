@@ -194,9 +194,11 @@ class NQIntradayStrategy:
         ts_et = ts_raw.tz_localize(self.r_cfg.timezone) if ts_raw.tzinfo is None else ts_raw.tz_convert(self.r_cfg.timezone)
         hm = ts_et.strftime("%H:%M")
 
-        pm_trend_end = getattr(self.r_cfg, "premarket_trend_end_time", "06:55")
+        pm_trend_end = getattr(self.r_cfg, "premarket_trend_end_time", "06:00")
         pm_end = getattr(self.r_cfg, "premarket_end_time", "08:20")
         v_rev_only_window = getattr(self.r_cfg, "use_premarket_session", False) and (pm_trend_end < hm <= pm_end)
+        max_cross_atr = float(getattr(self.s_cfg, "max_crossover_atr", 20.0))
+        allow_lagging_triggers = atr < max_cross_atr
 
         signal_dir: Optional[SignalDirection] = None
         reason = ""
@@ -214,14 +216,14 @@ class NQIntradayStrategy:
                         signal_dir = "LONG"
                         reason = f"Bullish Pullback off EMA({self.s_cfg.fast_ema_period}) > VWAP & EMA50"
 
-                # B) Bullish EMA Crossover
-                if signal_dir is None and mode in ("crossover", "both", "hybrid_all") and (50.0 <= rsi <= self.s_cfg.rsi_overbought):
+                # B) Bullish EMA Crossover (Situation-Adaptive: only in calm/moderate volatility ATR < max_crossover_atr)
+                if signal_dir is None and allow_lagging_triggers and mode in ("crossover", "both", "hybrid_all") and (50.0 <= rsi <= self.s_cfg.rsi_overbought):
                     if prev_ema_f <= prev_ema_s and ema_f > ema_s and close_p > ema_f:
                         signal_dir = "LONG"
                         reason = f"Bullish EMA({self.s_cfg.fast_ema_period}/{self.s_cfg.slow_ema_period}) Crossover > VWAP"
 
-                # C) 3-Bar Momentum Continuation Breakout
-                if signal_dir is None and mode == "hybrid_all" and (52.0 <= rsi <= self.s_cfg.rsi_overbought) and vol_ratio >= 1.1:
+                # C) 3-Bar Momentum Continuation Breakout (Situation-Adaptive: only when ATR < max_crossover_atr)
+                if signal_dir is None and allow_lagging_triggers and mode == "hybrid_all" and (52.0 <= rsi <= self.s_cfg.rsi_overbought) and vol_ratio >= 1.1:
                     if close_p > prev_3_high and (close_p - ema_f) <= 1.2 * atr:
                         signal_dir = "LONG"
                         reason = "Bullish 3-Bar Momentum Breakout > VWAP & EMA50"
@@ -243,14 +245,14 @@ class NQIntradayStrategy:
                         signal_dir = "SHORT"
                         reason = f"Bearish Pullback off EMA({self.s_cfg.fast_ema_period}) < VWAP & EMA50"
 
-                # B) Bearish EMA Crossover
-                if signal_dir is None and mode in ("crossover", "both", "hybrid_all") and (30.0 <= rsi <= 50.0):
+                # B) Bearish EMA Crossover (Situation-Adaptive: only in calm/moderate volatility ATR < max_crossover_atr)
+                if signal_dir is None and allow_lagging_triggers and mode in ("crossover", "both", "hybrid_all") and (30.0 <= rsi <= 50.0):
                     if prev_ema_f >= prev_ema_s and ema_f < ema_s and close_p < ema_f:
                         signal_dir = "SHORT"
                         reason = f"Bearish EMA({self.s_cfg.fast_ema_period}/{self.s_cfg.slow_ema_period}) Crossover < VWAP"
 
-                # C) 3-Bar Momentum Continuation Breakdown
-                if signal_dir is None and mode == "hybrid_all" and (30.0 <= rsi <= 48.0) and vol_ratio >= 1.1:
+                # C) 3-Bar Momentum Continuation Breakdown (Situation-Adaptive: only when ATR < max_crossover_atr)
+                if signal_dir is None and allow_lagging_triggers and mode == "hybrid_all" and (30.0 <= rsi <= 48.0) and vol_ratio >= 1.1:
                     if close_p < prev_3_low and (ema_f - close_p) <= 1.2 * atr:
                         signal_dir = "SHORT"
                         reason = "Bearish 3-Bar Momentum Breakdown < VWAP & EMA50"

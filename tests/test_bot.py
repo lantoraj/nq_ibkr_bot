@@ -333,3 +333,11 @@ def test_tradingview_hybrid_feed_and_dataframe_bars() -> None:
     assert not parsed_df.empty
     assert list(parsed_df.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
 
+
+def test_v41_adaptive_volatility_gate_and_premarket_cutoff() -> None:
+    """Verify v4.1 max_crossover_atr=20.0 gate and premarket_trend_end_time='06:00'."""
+    cfg = BotConfig()
+    assert cfg.strategy.max_crossover_atr == 20.0
+    assert cfg.risk.premarket_trend_end_time == "06:00"
+
+

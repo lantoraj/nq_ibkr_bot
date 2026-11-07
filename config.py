@@ -80,7 +80,12 @@ class StrategyConfig:
     # Signal triggers ("pullback", "crossover", "both", or "hybrid_all")
     entry_mode: Literal["pullback", "crossover", "both", "hybrid_all"] = "hybrid_all"
 
-    #Volatility & Momentum filters
+    # Situation-Adaptive Volatility Gate (v4.1):
+    # Disable lagging EMA Crossover & 3-Bar Momentum breakouts when 2m ATR >= 20.0 pts
+    # (requires discounted EMA21 Pullback, ORB, or V-Reversal in elevated volatility)
+    max_crossover_atr: float = 20.0
+
+    # Volatility & Momentum filters
     atr_period: int = 14
     min_atr_points: float = 3.0           # Avoid dead/chop markets (3.0 pts allows clean European premarket trends)
     max_atr_points: float = 95.0          # Allow high-velocity sell-off/trend sessions up to 95 pts 2m ATR while blocking >100 pt capitulation spikes
@@ -137,13 +142,13 @@ class RiskConfig:
 
     # Trading session window (America/New_York - US Eastern Time)
     # Dual-Session Mode:
-    #   1) European Pre-Market Session: 04:00 - 06:55 ET (Trend + V-Reversal), 06:55 - 08:20 ET (V-Reversal only)
+    #   1) European Pre-Market Session: 04:00 - 06:00 ET (Trend + V-Reversal), 06:00 - 08:20 ET (V-Reversal only)
     #   2) US Regular Trading Hours (RTH): 09:45 - 15:30 ET (VWAP re-anchored at 09:30 ET Cash Open)
     timezone: str = "America/New_York"
     rth_only: bool = False                # False = stream ETH+RTH bars and set outsideRth=True on orders
     use_premarket_session: bool = True    # Enable European Pre-Market trading window
     premarket_start_time: str = "04:00"   # 10:00 CET (European Cash Open)
-    premarket_trend_end_time: str = "06:55"  # 12:55 CET (End of standard trend entries in pre-market)
+    premarket_trend_end_time: str = "06:00"  # 12:00 CET (End of standard trend entries before EU lunch chop; 06:00-08:20 ET = V-Reversal only)
     premarket_end_time: str = "08:20"     # 14:20 CET (Stop 10m before 08:30 ET US macro news releases)
     premarket_max_trades: int = 2         # Dedicated Pre-Market trade cap (does not reduce RTH trade cap)
     entry_start_time: str = "09:45"       # Enter US RTH after 15-min Opening Range settles (15:45 CET)
