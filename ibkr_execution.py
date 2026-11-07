@@ -38,6 +38,7 @@ from ib_async.objects import UNSET_DOUBLE
 from config import BotConfig
 from risk_manager import RiskManager
 from strategy import NQIntradayStrategy, TradeSignal
+from trade_journal import TradeJournal
 from tv_data_feed import TradingViewDataFeed
 
 logger = logging.getLogger("nq_ibkr_bot")
@@ -86,6 +87,12 @@ class IBKRNQBotRunner:
         self._trade_initial_tp: Optional[float] = None
         self._pending_post_trade_chart: Optional[dict] = None
         self._last_error_alert_ts: dict[int, float] = {}
+
+        # Live-vs-Backtest reconciliation journal (append-only JSONL; never interrupts trading)
+        self.journal = TradeJournal(timezone=config.risk.timezone)
+        self._signal_bar_ts: Optional[pd.Timestamp] = None
+        self._signal_price_orig: Optional[float] = None
+        self._signal_submitted_utc: Optional[pd.Timestamp] = None
 
     def _send_discord_alert(
         self,
@@ -608,7 +615,23 @@ class IBKRNQBotRunner:
         self._trade_direction = signal.direction
         self._trade_initial_sl = signal.stop_loss
         self._trade_initial_tp = signal.take_profit
+        self._signal_bar_ts = pd.Timestamp(signal.timestamp)
+        self._signal_price_orig = float(signal.entry_price)
+        self._signal_submitted_utc = pd.Timestamp.now(tz="UTC")
 
+        self.journal.log(
+            "order_submitted",
+            bar_ts=signal.timestamp,
+            direction=signal.direction,
+            quantity=quantity,
+            order_type=type(parent).__name__,
+            parent_order_id=parent_id,
+            limit_price=getattr(parent, "lmtPrice", None),
+            stop_trigger=getattr(parent, "auxPrice", None),
+            signal_price=signal.entry_price,
+            stop_loss=signal.stop_loss,
+            take_profit=signal.take_profit,
+        )
         logger.info(
             "BRACKET ORDER SUBMITTED [%s] %s %d %s @ %.2f | SL=%.2f | TP=%.2f | Reason: %s",
             signal.direction,
@@ -680,6 +703,23 @@ class IBKRNQBotRunner:
         self._last_processed_bar_time = latest_closed_ts
         self.bar_count += 1
 
+        # Journal the closed bar exactly as the live bot saw it (for feed-accuracy reconciliation)
+        _lb = df.iloc[-1]
+        _tv = self.tv_feed
+        self.journal.log(
+            "bar",
+            bar_ts=latest_closed_ts,
+            open=float(_lb["open"]),
+            high=float(_lb["high"]),
+            low=float(_lb["low"]),
+            close=float(_lb["close"]),
+            volume=float(_lb["volume"]),
+            feed="tradingview" if isinstance(bars, pd.DataFrame) else "ibkr",
+            tv_basis=getattr(_tv, "last_basis_points", None) if _tv else None,
+            tv_stitched_bars=getattr(_tv, "last_stitched_bars_count", None) if _tv else None,
+            tv_cme_mode=getattr(_tv, "last_cme_update_mode", None) if _tv else None,
+            processed_lag_sec=(pd.Timestamp.now(tz="UTC") - (pd.Timestamp(latest_closed_ts).tz_convert("UTC") + pd.Timedelta(minutes=2))).total_seconds(),
+        )
         # 0. Check if a pending 10-bar post-trade review chart is ready to be dispatched
         if self._pending_post_trade_chart is not None:
             task = self._pending_post_trade_chart
@@ -751,6 +791,14 @@ class IBKRNQBotRunner:
                 self._active_parent_order = None
                 self._active_signal = None
                 if cancelled_sig is not None:
+                    self.journal.log(
+                        "entry_cancelled",
+                        bar_ts=self._signal_bar_ts,
+                        direction=cancelled_sig.direction,
+                        signal_price=self._signal_price_orig,
+                        last_close=close_p,
+                        bars_waited=self.bar_count - self._entry_submitted_bar,
+                    )
                     self._send_discord_alert(
                         title=f"⚪ ENTRY CANCELLED (NOT FILLED) — {self.contract.localSymbol} {cancelled_sig.direction}",
                         description=(
@@ -844,6 +892,7 @@ class IBKRNQBotRunner:
                         self._active_stop_order.overridePercentageConstraints = True
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
+                        self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="breakeven", direction="LONG", new_stop=new_sl, entry_price=sig.entry_price)
                         logger.info("Moved LONG StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
                         self._send_discord_alert(
                             title=f"🛡️ BREAK-EVEN (+1R) LOCKED — {self.contract.localSymbol} LONG",
@@ -858,6 +907,7 @@ class IBKRNQBotRunner:
                         self._active_stop_order.overridePercentageConstraints = True
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
+                        self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="breakeven", direction="SHORT", new_stop=new_sl, entry_price=sig.entry_price)
                         logger.info("Moved SHORT StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
                         self._send_discord_alert(
                             title=f"🛡️ BREAK-EVEN (+1R) LOCKED — {self.contract.localSymbol} SHORT",
@@ -877,6 +927,7 @@ class IBKRNQBotRunner:
                             self._active_stop_order.overridePercentageConstraints = True
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
+                            self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="LONG", new_stop=dec_sl, entry_price=sig.entry_price)
                             logger.info("Time-Decay Stop Tightening: Moved LONG StopOrder to -0.5R (%.2f)", dec_sl)
                             self._send_discord_alert(
                                 title=f"⏳ TIME-DECAY STOP (-0.5R) — {self.contract.localSymbol} LONG",
@@ -891,6 +942,7 @@ class IBKRNQBotRunner:
                             self._active_stop_order.overridePercentageConstraints = True
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
+                            self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="SHORT", new_stop=dec_sl, entry_price=sig.entry_price)
                             logger.info("Time-Decay Stop Tightening: Moved SHORT StopOrder to -0.5R (%.2f)", dec_sl)
                             self._send_discord_alert(
                                 title=f"⏳ TIME-DECAY STOP (-0.5R) — {self.contract.localSymbol} SHORT",
@@ -902,6 +954,22 @@ class IBKRNQBotRunner:
         # 4. Check intraday risk guardrails
         allowed, risk_reason = self.risk.can_open_trade(latest_closed_ts, self.bar_count)
         if not allowed:
+            # Record signals that would have fired but were blocked by risk rules (inside session windows only)
+            if not risk_reason.startswith("Outside"):
+                try:
+                    blocked_sig = self.strategy.evaluate_bar(enriched, idx=-1)
+                    if blocked_sig is not None:
+                        self.journal.log(
+                            "signal_blocked",
+                            bar_ts=latest_closed_ts,
+                            direction=blocked_sig.direction,
+                            reason=blocked_sig.reason,
+                            entry_price=blocked_sig.entry_price,
+                            atr=blocked_sig.atr,
+                            block_reason=risk_reason,
+                        )
+                except Exception as exc:
+                    logger.debug("Blocked-signal journal evaluation failed: %s", exc)
             logger.info(
                 "BAR CLOSE [%s] %s=%.2f | VWAP=%.2f (Z=%+.2f) | EMA9/21=%.2f/%.2f | Hurst=%.2f | KalVel=%+.2f | Status: %s",
                 et_ts_str,
@@ -921,6 +989,21 @@ class IBKRNQBotRunner:
         signal = self.strategy.evaluate_bar(enriched, idx=-1)
         if signal is not None:
             qty = self.risk.calculate_contracts(signal.stop_distance_points)
+            self.journal.log(
+                "signal",
+                bar_ts=latest_closed_ts,
+                direction=signal.direction,
+                reason=signal.reason,
+                entry_price=signal.entry_price,
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                stop_distance=signal.stop_distance_points,
+                atr=signal.atr,
+                rsi=signal.rsi,
+                vwap=signal.vwap,
+                meta_probability=signal.meta_probability,
+                quantity=qty,
+            )
             self.place_bracket_order(signal, quantity=qty)
         else:
             logger.info(
@@ -962,6 +1045,25 @@ class IBKRNQBotRunner:
             direction = self._trade_direction or (self._active_signal.direction if self._active_signal else "LONG")
             sl_p = self._trade_initial_sl or (self._active_signal.stop_loss if self._active_signal else None)
             tp_p = self._trade_initial_tp or (self._active_signal.take_profit if self._active_signal else None)
+
+            gross_pts = (fill_price - entry_p) if direction == "LONG" else (entry_p - fill_price)
+            self.journal.log(
+                "trade_closed",
+                bar_ts=self._signal_bar_ts or self._last_processed_bar_time,
+                direction=direction,
+                signal_price=self._signal_price_orig,
+                entry_price=entry_p,
+                exit_price=fill_price,
+                stop_loss=sl_p,
+                take_profit=tp_p,
+                be_moved=self._be_moved,
+                decay_moved=self._decay_moved,
+                gross_points=round(gross_pts, 2),
+                net_pnl_usd=round(net_pnl, 2),
+                commission=float(getattr(report, "commission", 0.0) or 0.0),
+                entry_filled_utc=self._trade_filled_ts_utc,
+                exit_filled_utc=self._trade_closed_ts_utc,
+            )
 
             # Compute trade duration in bars
             entry_offset = max(1, (self.bar_count - (self._trade_filled_bar if self._trade_filled_bar >= 0 else self._entry_submitted_bar))) if self._entry_submitted_bar >= 0 else 6
@@ -1073,6 +1175,26 @@ class IBKRNQBotRunner:
             )
 
         logger.info("ENTRY FILLED: %s %s %s @ %.2f", e.side, e.shares, self.contract.localSymbol, e.price)
+        sig_orig = self._signal_price_orig if self._signal_price_orig is not None else fill_p
+        slip_pts = (fill_p - sig_orig) if self._trade_direction == "LONG" else (sig_orig - fill_p)
+        fill_delay_s = (
+            (self._trade_filled_ts_utc - self._signal_submitted_utc).total_seconds()
+            if (self._trade_filled_ts_utc is not None and self._signal_submitted_utc is not None)
+            else None
+        )
+        self.journal.log(
+            "entry_filled",
+            bar_ts=self._signal_bar_ts,
+            direction=self._trade_direction,
+            quantity=int(e.shares),
+            signal_price=sig_orig,
+            fill_price=fill_p,
+            slippage_points=round(slip_pts, 2),
+            stop_loss=sig.stop_loss if sig else self._trade_initial_sl,
+            take_profit=sig.take_profit if sig else self._trade_initial_tp,
+            fill_delay_sec=round(fill_delay_s, 2) if fill_delay_s is not None else None,
+            filled_at_utc=self._trade_filled_ts_utc,
+        )
         desc = f"**Fill Price:** `{e.price:.2f}` | **Qty:** `{int(e.shares)}`\n"
         if sig is not None:
             desc += f"**Stop Loss:** `{sig.stop_loss:.2f}` | **Take Profit:** `{sig.take_profit:.2f}`"

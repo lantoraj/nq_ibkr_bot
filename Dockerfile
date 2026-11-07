@@ -8,6 +8,6 @@ ENV PYTHONUNBUFFERED=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY config.py indicators.py strategy.py risk_manager.py tv_data_feed.py ibkr_execution.py backtest.py optimize.py main.py ./
+COPY config.py indicators.py strategy.py risk_manager.py tv_data_feed.py trade_journal.py reconcile.py ibkr_execution.py backtest.py optimize.py main.py ./
 
 CMD ["python", "-u", "main.py", "--mode", "paper", "--symbol", "MNQ", "--bar-size", "2 mins", "--contracts", "1", "--host", "127.0.0.1", "--port", "4002"]

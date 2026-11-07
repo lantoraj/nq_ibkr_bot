@@ -5,3 +5,6 @@ __pycache__/
 .venv/
 venv/
 .env
+journal/
+data/*.csv
+nq_v41_quant_report.html

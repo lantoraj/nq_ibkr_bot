@@ -29,6 +29,8 @@ services:
       - ib-gateway
     environment:
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+    volumes:
+      - ./journal:/app/journal
     command: >
       python -u main.py
       --mode ${TRADING_MODE:-paper}

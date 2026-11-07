@@ -341,3 +341,28 @@ def test_v41_adaptive_volatility_gate_and_premarket_cutoff() -> None:
     assert cfg.risk.premarket_trend_end_time == "06:00"
 
 
+def test_trade_journal_and_reconcile(tmp_path) -> None:
+    """Verify append-only JSONL TradeJournal and live-vs-backtest reconciliation."""
+    from reconcile import reconcile_day
+    from trade_journal import TradeJournal, load_journal
+
+    jdir = str(tmp_path / "journal")
+    j = TradeJournal(base_dir=jdir, timezone="America/New_York")
+    ts = pd.Timestamp("2026-11-06 15:00:00", tz="UTC")
+    j.log("bar", bar_ts=ts, open=27000.0, high=27010.0, low=26995.0, close=27005.0, volume=500.0)
+    j.log("signal", bar_ts=ts, direction="LONG", reason="Bullish Pullback", entry_price=27005.0, atr=18.5)
+    j.log("entry_filled", bar_ts=ts, direction="LONG", signal_price=27005.0, fill_price=27005.25, slippage_points=0.25, fill_delay_sec=1.4)
+    j.log("trade_closed", bar_ts=ts, direction="LONG", signal_price=27005.0, entry_price=27005.25, exit_price=27050.25, net_pnl_usd=88.76)
+
+    events = load_journal("2026-11-06", base_dir=jdir)
+    assert len(events) == 4
+    res = reconcile_day("2026-11-06", base_dir=jdir)
+    assert res["bars_logged"] == 1
+    assert res["live_signals"] == 1
+    assert res["live_fills"] == 1
+    assert res["live_closed"] == 1
+    assert res["avg_slippage_pts"] == 0.25
+    assert res["live_net_pnl_usd"] == 88.76
+
+
+
