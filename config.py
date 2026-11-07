@@ -107,8 +107,9 @@ class RiskConfig:
     risk_per_trade_usd: float = 0.0       # If > 0, dynamically sizes contracts up to max_contracts
     max_contracts: int = 3
 
-    # Order execution improvements (Marketable Limit + Unfilled Order Timeout)
+    # Order execution improvements (Two-Sided Stop-Limit Collar + Unfilled Order Timeout)
     entry_limit_slippage_ticks: int = 1   # Submit Limit entry 1 tick (0.25 pt) marketable to prevent missed breakouts
+    entry_collar_points: float = 6.0      # Stop-Limit protection band (pts) so delayed signals never fill far past entry/SL
     cancel_unfilled_entry_bars: int = 3   # Automatically cancel unfilled parent entry order after 3 bars
 
     # Stop Loss, Take Profit, +1R Break-Even & v4 Time-Decay Stagnant Stop Tightening

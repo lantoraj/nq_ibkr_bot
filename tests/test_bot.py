@@ -214,3 +214,61 @@ def test_dual_session_vwap_reanchoring_and_premarket_risk() -> None:
     assert allowed_rth
     assert rm.state.trades_taken == 2
     assert rm.state.rth_trades_taken == 0
+
+
+def test_delayed_paper_execution_collar_and_unset_double() -> None:
+    """Verify StopLimitOrder collar, UNSET_DOUBLE (never NaN) on cashQty, and dynamic SL/TP re-anchoring."""
+    from types import SimpleNamespace
+    import math
+    from ib_async import Future, StopLimitOrder
+    from ib_async.objects import UNSET_DOUBLE
+    from ibkr_execution import IBKRNQBotRunner
+    from strategy import TradeSignal
+
+    cfg = BotConfig()
+    runner = IBKRNQBotRunner(cfg, mode="paper")
+    runner.contract = Future(conId=815824267, symbol="MNQ", localSymbol="MNQZ6", multiplier="2", exchange="CME", currency="USD")
+
+    placed_orders = []
+    runner.ib.client.getReqId = lambda: len(placed_orders) + 100
+    runner.ib.placeOrder = lambda contract, order: placed_orders.append(order) or SimpleNamespace(order=order)
+
+    sig = TradeSignal(
+        timestamp=pd.Timestamp("2026-11-06 15:30:00", tz="UTC"),
+        direction="SHORT",
+        reason="Bearish EMA(9/21) Crossover < VWAP",
+        entry_price=27100.25,
+        stop_loss=27140.25,
+        take_profit=26980.25,
+        stop_distance_points=40.0,
+        atr=35.0,
+        rsi=42.0,
+        vwap=27150.0,
+        ema_fast=27110.0,
+        ema_slow=27120.0,
+    )
+
+    runner.place_bracket_order(sig, quantity=1)
+    assert len(placed_orders) == 3
+    parent, tp, sl = placed_orders
+    assert isinstance(parent, StopLimitOrder)
+    assert parent.action == "SELL"
+    assert parent.lmtPrice == 27100.00
+    assert parent.auxPrice == 27106.25  # +6.0 pt collar prevents filling at 27147.75 / 27252.00
+
+    # Simulate fill within collar at 27104.25 (+4.0 pts above signal) and verify SL/TP re-anchor & UNSET_DOUBLE
+    fake_fill = SimpleNamespace(
+        contract=runner.contract,
+        execution=SimpleNamespace(
+            orderId=parent.orderId,
+            price=27104.25,
+            side="SLD",
+            shares=1.0,
+            time=pd.Timestamp("2026-11-06 15:42:50", tz="UTC").to_pydatetime(),
+        ),
+    )
+    runner._on_exec_details(None, fake_fill)
+    assert runner._active_stop_order.auxPrice == 27144.25
+    assert runner._active_tp_order.lmtPrice == 26984.25
+    assert runner._active_stop_order.cashQty == UNSET_DOUBLE
+    assert not math.isnan(runner._active_stop_order.cashQty)
