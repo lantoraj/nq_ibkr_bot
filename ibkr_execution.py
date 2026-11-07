@@ -94,6 +94,37 @@ class IBKRNQBotRunner:
         self._signal_price_orig: Optional[float] = None
         self._signal_submitted_utc: Optional[pd.Timestamp] = None
 
+    def _sync_discord_webhook_profile(self) -> None:
+        """Upload custom bot_icon.png and v4.1 name to the Discord webhook profile on startup."""
+        import base64
+        from pathlib import Path
+
+        url = (self.cfg.ibkr.discord_webhook_url or "").strip()
+        if not url:
+            return
+        icon_path = Path(__file__).resolve().parent / "assets" / "bot_icon.png"
+        if not icon_path.exists():
+            return
+        try:
+            b64_icon = base64.b64encode(icon_path.read_bytes()).decode("ascii")
+            bot_name = getattr(self.cfg.ibkr, "discord_bot_name", "NQ Quant Bot (v4.1)")
+            patch_body = json.dumps({"name": bot_name, "avatar": f"data:image/png;base64,{b64_icon}"}).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=patch_body,
+                headers={"Content-Type": "application/json", "User-Agent": "NQ-IBKR-Quant-Bot/4.1"},
+                method="PATCH",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                wh_id = data.get("id")
+                wh_av = data.get("avatar")
+                if wh_id and wh_av:
+                    self.cfg.ibkr.discord_avatar_url = f"https://cdn.discordapp.com/avatars/{wh_id}/{wh_av}.png"
+                    logger.info("Synced Discord webhook profile: %s (%s)", bot_name, self.cfg.ibkr.discord_avatar_url)
+        except Exception as exc:
+            logger.debug("Discord webhook profile sync skipped: %s", exc)
+
     def _send_discord_alert(
         self,
         title: str,
@@ -107,16 +138,23 @@ class IBKRNQBotRunner:
         if not url:
             return
 
+        bot_name = getattr(self.cfg.ibkr, "discord_bot_name", "NQ Quant Bot (v4.1)")
+        avatar_url = getattr(self.cfg.ibkr, "discord_avatar_url", "https://raw.githubusercontent.com/lantoraj/nq_ibkr_bot/main/assets/bot_icon.png")
+
+        embed_obj = {
+            "title": title,
+            "description": description,
+            "color": color,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "footer": {
+                "text": f"{bot_name} • {self.mode.upper()}",
+                "icon_url": avatar_url,
+            },
+        }
         payload = {
-            "username": "NQ Quant Bot (v4)",
-            "embeds": [
-                {
-                    "title": title,
-                    "description": description,
-                    "color": color,
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                }
-            ],
+            "username": bot_name,
+            "avatar_url": avatar_url,
+            "embeds": [embed_obj],
         }
         if image_bytes is not None:
             payload["embeds"][0]["image"] = {"url": "attachment://trade_chart.png"}
@@ -150,7 +188,7 @@ class IBKRNQBotRunner:
                     data=post_data,
                     headers={
                         "Content-Type": content_type,
-                        "User-Agent": "NQ-IBKR-Quant-Bot/4.0",
+                        "User-Agent": "NQ-IBKR-Quant-Bot/4.1",
                     },
                     method="POST",
                 )
@@ -1416,9 +1454,11 @@ class IBKRNQBotRunner:
                 if getattr(self.cfg.risk, "use_premarket_session", False)
                 else f"`{self.cfg.risk.entry_start_time}–{self.cfg.risk.entry_end_time} ET`"
             )
+            self._sync_discord_webhook_profile()
             self._send_discord_alert(
-                title=f"🤖 NQ Quant Bot Online — {self.contract.localSymbol} ({self.mode.upper()})",
+                title=f"🤖 NQ Quant Bot v4.1 Online — {self.contract.localSymbol} ({self.mode.upper()})",
                 description=(
+                    f"**Version:** `v4.1 (Situation-Adaptive 3-Setup Engine)`\n"
                     f"**Contract:** `{self.contract.localSymbol}` (Expiry `{self.contract.lastTradeDateOrContractMonth}`)\n"
                     f"**Data Feed:** `{feed_label}`\n"
                     f"**Timeframe:** `{self.cfg.strategy.bar_size}` | **Contracts:** `{self.cfg.risk.fixed_contracts}`\n"
