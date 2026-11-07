@@ -67,3 +67,12 @@ services:
       --host 127.0.0.1
       --port ${IB_GATEWAY_PORT:-4002}
       --client-id 102
+
+  report-web:
+    image: nginx:alpine
+    container_name: nq-strategy-report
+    restart: always
+    ports:
+      - "80:80"
+    volumes:
+      - ./report:/usr/share/nginx/html:ro
