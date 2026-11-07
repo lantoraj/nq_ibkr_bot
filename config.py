@@ -68,22 +68,15 @@ class StrategyConfig:
     use_pdh_pdl_guard: bool = True        # Block buying directly below Prior Day High or shorting above Prior Day Low
     pdh_pdl_buffer_atr: float = 0.50      # Minimum distance in ATR below PDH / above PDL before breakout
 
-    # v4 Quant Engine: Kalman State-Space Filter, Hurst Regime & Meta-Probability Gate
-    use_quant_meta_filter: bool = True
+    # Kalman State-Space Filter (used for V-Reversal impulse velocity)
+    use_quant_meta_filter: bool = False
     kalman_q_pos: float = 0.05            # Kalman state position process variance
     kalman_q_vel: float = 0.01            # Kalman state velocity process variance
     kalman_r_meas: float = 1.0            # Kalman measurement noise variance
-    hurst_lag_q: int = 4                  # Variance Ratio lag q
-    hurst_window: int = 24                # Rolling window for Variance Ratio Hurst exponent
-    min_meta_probability: float = 0.52    # Minimum Logistic Meta-Model confidence P(Win | x_t) >= 52% (active mode)
 
-    # Signal triggers ("pullback", "crossover", "both", or "hybrid_all")
+    # Signal triggers ("pullback", "hybrid_all" = Pullback + ORB + V-Reversal)
     entry_mode: Literal["pullback", "crossover", "both", "hybrid_all"] = "hybrid_all"
-
-    # Situation-Adaptive Volatility Gate (v4.1):
-    # Disable lagging EMA Crossover & 3-Bar Momentum breakouts when 2m ATR >= 20.0 pts
-    # (requires discounted EMA21 Pullback, ORB, or V-Reversal in elevated volatility)
-    max_crossover_atr: float = 20.0
+    max_crossover_atr: float = 0.0        # 0.0 = Lagging Crossover & 3-Bar Momentum triggers disabled (Ablation Step #2)
 
     # Volatility & Momentum filters
     atr_period: int = 14

@@ -335,9 +335,10 @@ def test_tradingview_hybrid_feed_and_dataframe_bars() -> None:
 
 
 def test_v41_adaptive_volatility_gate_and_premarket_cutoff() -> None:
-    """Verify v4.1 max_crossover_atr=20.0 gate and premarket_trend_end_time='06:00'."""
+    """Verify simplified v4.2 3-setup engine (max_crossover_atr=0.0, use_quant_meta_filter=False) and premarket_trend_end_time='06:00'."""
     cfg = BotConfig()
-    assert cfg.strategy.max_crossover_atr == 20.0
+    assert cfg.strategy.max_crossover_atr == 0.0
+    assert cfg.strategy.use_quant_meta_filter is False
     assert cfg.risk.premarket_trend_end_time == "06:00"
 
 

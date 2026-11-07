@@ -197,17 +197,15 @@ class NQIntradayStrategy:
         pm_trend_end = getattr(self.r_cfg, "premarket_trend_end_time", "06:00")
         pm_end = getattr(self.r_cfg, "premarket_end_time", "08:20")
         v_rev_only_window = getattr(self.r_cfg, "use_premarket_session", False) and (pm_trend_end < hm <= pm_end)
-        max_cross_atr = float(getattr(self.s_cfg, "max_crossover_atr", 20.0))
-        allow_lagging_triggers = atr < max_cross_atr
 
         signal_dir: Optional[SignalDirection] = None
         reason = ""
 
-        # --- Check standard Trend Setups (A, B, C, D) outside V-Reversal-only premarket transition ---
+        # --- Check Trend Setups (1: EMA Pullback, 2: ORB Breakout) outside V-Reversal-only premarket transition ---
         if not v_rev_only_window:
             # --- Check LONG setups ---
             if bull_regime and bull_candle:
-                # A) Bullish EMA Pullback Rejection
+                # 1) Bullish EMA Pullback Rejection
                 if mode in ("pullback", "both", "hybrid_all") and (self.s_cfg.rsi_long_min <= rsi <= self.s_cfg.rsi_overbought):
                     touched_ema_zone = (low_p <= ema_f + tol) and (low_p >= ema_s - tol)
                     reclaimed_fast_ema = close_p > ema_f
@@ -216,19 +214,7 @@ class NQIntradayStrategy:
                         signal_dir = "LONG"
                         reason = f"Bullish Pullback off EMA({self.s_cfg.fast_ema_period}) > VWAP & EMA50"
 
-                # B) Bullish EMA Crossover (Situation-Adaptive: only in calm/moderate volatility ATR < max_crossover_atr)
-                if signal_dir is None and allow_lagging_triggers and mode in ("crossover", "both", "hybrid_all") and (50.0 <= rsi <= self.s_cfg.rsi_overbought):
-                    if prev_ema_f <= prev_ema_s and ema_f > ema_s and close_p > ema_f:
-                        signal_dir = "LONG"
-                        reason = f"Bullish EMA({self.s_cfg.fast_ema_period}/{self.s_cfg.slow_ema_period}) Crossover > VWAP"
-
-                # C) 3-Bar Momentum Continuation Breakout (Situation-Adaptive: only when ATR < max_crossover_atr)
-                if signal_dir is None and allow_lagging_triggers and mode == "hybrid_all" and (52.0 <= rsi <= self.s_cfg.rsi_overbought) and vol_ratio >= 1.1:
-                    if close_p > prev_3_high and (close_p - ema_f) <= 1.2 * atr:
-                        signal_dir = "LONG"
-                        reason = "Bullish 3-Bar Momentum Breakout > VWAP & EMA50"
-
-                # D) Opening Range High Breakout
+                # 2) Opening Range High Breakout
                 if signal_dir is None and mode == "hybrid_all" and pd.notna(orb_high) and (52.0 <= rsi <= 72.0):
                     if prev_high <= orb_high and close_p > orb_high:
                         signal_dir = "LONG"
@@ -236,7 +222,7 @@ class NQIntradayStrategy:
 
             # --- Check SHORT setups ---
             if signal_dir is None and bear_regime and bear_candle:
-                # A) Bearish EMA Pullback Rejection
+                # 1) Bearish EMA Pullback Rejection
                 if mode in ("pullback", "both", "hybrid_all") and (self.s_cfg.rsi_oversold <= rsi <= self.s_cfg.rsi_short_max):
                     touched_ema_zone = (high_p >= ema_f - tol) and (high_p <= ema_s + tol)
                     rejected_fast_ema = close_p < ema_f
@@ -245,25 +231,13 @@ class NQIntradayStrategy:
                         signal_dir = "SHORT"
                         reason = f"Bearish Pullback off EMA({self.s_cfg.fast_ema_period}) < VWAP & EMA50"
 
-                # B) Bearish EMA Crossover (Situation-Adaptive: only in calm/moderate volatility ATR < max_crossover_atr)
-                if signal_dir is None and allow_lagging_triggers and mode in ("crossover", "both", "hybrid_all") and (30.0 <= rsi <= 50.0):
-                    if prev_ema_f >= prev_ema_s and ema_f < ema_s and close_p < ema_f:
-                        signal_dir = "SHORT"
-                        reason = f"Bearish EMA({self.s_cfg.fast_ema_period}/{self.s_cfg.slow_ema_period}) Crossover < VWAP"
-
-                # C) 3-Bar Momentum Continuation Breakdown (Situation-Adaptive: only when ATR < max_crossover_atr)
-                if signal_dir is None and allow_lagging_triggers and mode == "hybrid_all" and (30.0 <= rsi <= 48.0) and vol_ratio >= 1.1:
-                    if close_p < prev_3_low and (ema_f - close_p) <= 1.2 * atr:
-                        signal_dir = "SHORT"
-                        reason = "Bearish 3-Bar Momentum Breakdown < VWAP & EMA50"
-
-                # D) Opening Range Low Breakdown
+                # 2) Opening Range Low Breakdown
                 if signal_dir is None and mode == "hybrid_all" and pd.notna(orb_low) and (28.0 <= rsi <= 48.0):
                     if prev_low >= orb_low and close_p < orb_low:
                         signal_dir = "SHORT"
                         reason = "Bearish Opening Range Breakdown (ORB Low) < VWAP"
 
-        # --- Check Setup E: Premarket / Morning VWAP Overextension V-Reversal ---
+        # --- Check Setup 3: Premarket / Morning VWAP Overextension V-Reversal ---
         if signal_dir is None and getattr(self.s_cfg, "enable_v_reversal", True) and ("04:00" <= hm <= "11:30"):
             roll_z_max = float(curr.get("roll_vwap_z_max", vwap_z))
             roll_z_min = float(curr.get("roll_vwap_z_min", vwap_z))
@@ -272,7 +246,7 @@ class NQIntradayStrategy:
             min_v_body = getattr(self.s_cfg, "v_reversal_min_body_ratio", 0.55)
             min_vwap_dist = getattr(self.s_cfg, "v_reversal_min_vwap_dist_atr", 2.0)
 
-            # E1) Bearish V-Reversal from extreme positive VWAP overextension back toward VWAP
+            # 3A) Bearish V-Reversal from extreme positive VWAP overextension back toward VWAP
             if (
                 roll_z_max >= z_ext
                 and (0.50 <= vwap_z <= 1.35)
@@ -288,7 +262,7 @@ class NQIntradayStrategy:
                 signal_dir = "SHORT"
                 reason = f"Bearish VWAP Overextension V-Reversal (Peak Z={roll_z_max:+.2f} -> {vwap_z:+.2f})"
 
-            # E2) Bullish V-Reversal from extreme negative VWAP overextension back toward VWAP
+            # 3B) Bullish V-Reversal from extreme negative VWAP overextension back toward VWAP
             elif (
                 roll_z_min <= -z_ext
                 and (-1.35 <= vwap_z <= -0.50)
@@ -307,16 +281,7 @@ class NQIntradayStrategy:
         if signal_dir is None:
             return None
 
-        # 4. v4 Quant Meta-Labeling Confidence Gate
-        meta_prob = self.compute_meta_probability(
-            direction=signal_dir,
-            kalman_vel_atr=kalman_vel_atr,
-            hurst=hurst,
-            body_ratio=body_ratio,
-            vwap_z=vwap_z,
-        )
-        if self.s_cfg.use_quant_meta_filter and meta_prob < self.s_cfg.min_meta_probability:
-            return None
+        meta_prob = 1.0
 
         # 5. Calculate Stop Loss & Take Profit levels rounded to NQ 0.25 tick increments
         raw_stop_dist = (
