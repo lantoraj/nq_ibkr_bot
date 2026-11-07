@@ -38,6 +38,7 @@ from ib_async.objects import UNSET_DOUBLE
 from config import BotConfig
 from risk_manager import RiskManager
 from strategy import NQIntradayStrategy, TradeSignal
+from tv_data_feed import TradingViewDataFeed
 
 logger = logging.getLogger("nq_ibkr_bot")
 
@@ -53,9 +54,18 @@ class IBKRNQBotRunner:
         self.risk = RiskManager(config.risk, config.contract)
 
         self.contract: Optional[Contract] = None
-        self.bars: Optional[BarDataList] = None
+        self.bars: Optional[BarDataList | pd.DataFrame] = None
         self.bar_count: int = 0
         self._last_processed_bar_time: Optional[datetime] = None
+        self.tv_feed: Optional[TradingViewDataFeed] = (
+            TradingViewDataFeed(
+                auth_token=getattr(config.ibkr, "tradingview_auth_token", ""),
+                realtime_proxy_symbol=getattr(config.ibkr, "tradingview_realtime_proxy", "CAPITALCOM:US100"),
+                tick_size=config.contract.tick_size,
+            )
+            if getattr(config.ibkr, "use_tradingview_data", True)
+            else None
+        )
 
         # Active bracket order tracking for +1R Break-Even, Time-Decay Stop & Unfilled Entry Timeout
         self._active_signal: Optional[TradeSignal] = None
@@ -169,7 +179,7 @@ class IBKRNQBotRunner:
             import matplotlib.pyplot as plt
             import matplotlib.patches as patches
 
-            if not self.bars:
+            if self.bars is None or len(self.bars) == 0:
                 return None
 
             df = self._bars_to_dataframe(self.bars)
@@ -627,8 +637,24 @@ class IBKRNQBotRunner:
         )
         return trades
 
-    def _bars_to_dataframe(self, bars: BarDataList) -> pd.DataFrame:
-        """Convert IBKR BarDataList to standardized OHLCV DataFrame (excluding incomplete forming bar)."""
+    def _bars_to_dataframe(self, bars: BarDataList | pd.DataFrame) -> pd.DataFrame:
+        """Convert IBKR BarDataList or TradingView DataFrame to standardized OHLCV DataFrame (excluding incomplete forming bar)."""
+        if isinstance(bars, pd.DataFrame):
+            if bars.empty:
+                return pd.DataFrame()
+            df = bars[["timestamp", "open", "high", "low", "close", "volume"]].copy().reset_index(drop=True)
+            if len(df) > 1:
+                import re
+                m_int = re.search(r"(\d+)", self.cfg.strategy.bar_size)
+                bar_mins = int(m_int.group(1)) if m_int else 2
+                now_utc = pd.Timestamp.now(tz="UTC")
+                last_ts = pd.Timestamp(df.iloc[-1]["timestamp"])
+                last_ts = last_ts.tz_localize("UTC") if last_ts.tzinfo is None else last_ts.tz_convert("UTC")
+                # If the last bar's window has not yet ended in real time, exclude it as still forming
+                if last_ts + pd.Timedelta(minutes=bar_mins) > now_utc:
+                    df = df.iloc[:-1].copy()
+            return df.reset_index(drop=True)
+
         df = util.df(bars)
         if df is None or df.empty:
             return pd.DataFrame()
@@ -1208,6 +1234,36 @@ class IBKRNQBotRunner:
             color=0xE67E22,
         )
 
+    def _fetch_latest_bars(self) -> BarDataList | pd.DataFrame | None:
+        """
+        Fetch the latest 2-minute OHLCV bars from TradingView (0-second real-time / hybrid CME feed)
+        when `use_tradingview_data` is enabled, automatically falling back to IBKR `reqHistoricalData`
+        if TradingView is temporarily unreachable.
+        """
+        if self.tv_feed is not None and self.contract is not None:
+            try:
+                tv_df = self.tv_feed.fetch_bars(
+                    local_symbol=self.contract.localSymbol,
+                    base_symbol=self.cfg.contract.symbol,
+                    bar_size=self.cfg.strategy.bar_size,
+                    n_bars=1500,
+                )
+                if tv_df is not None and not tv_df.empty:
+                    return tv_df
+            except Exception as exc:
+                logger.warning("TradingView data poll failed (%s); falling back to IBKR reqHistoricalData.", exc)
+
+        return self.ib.reqHistoricalData(
+            self.contract,
+            endDateTime="",
+            durationStr=self.cfg.strategy.history_duration,
+            barSizeSetting=self.cfg.strategy.bar_size,
+            whatToShow="TRADES",
+            useRTH=self.cfg.risk.rth_only,
+            formatDate=1,
+            keepUpToDate=False,
+        )
+
     def run_streaming(self) -> None:
         """Start real-time bar subscription and run the IBKR event loop."""
         self.connect()
@@ -1217,23 +1273,21 @@ class IBKRNQBotRunner:
             self.ib.execDetailsEvent += self._on_exec_details
             self.ib.errorEvent += self._on_ib_error
 
+            feed_label = (
+                f"TradingView Real-Time Hybrid ({self.contract.localSymbol} + {self.cfg.ibkr.tradingview_realtime_proxy})"
+                if self.tv_feed is not None
+                else "IBKR Historical/Streaming"
+            )
             logger.info(
-                "Subscribing to %s real-time bars (%s, RTH=%s)...",
+                "Subscribing to %s bars via %s (%s, RTH=%s)...",
                 self.contract.localSymbol,
+                feed_label,
                 self.cfg.strategy.bar_size,
                 self.cfg.risk.rth_only,
             )
-            self.bars = self.ib.reqHistoricalData(
-                self.contract,
-                endDateTime="",
-                durationStr=self.cfg.strategy.history_duration,
-                barSizeSetting=self.cfg.strategy.bar_size,
-                whatToShow="TRADES",
-                useRTH=self.cfg.risk.rth_only,
-                formatDate=1,
-                keepUpToDate=False,
-            )
-            logger.info("Bot is now live and polling 2-min bar closes every 20s. Press Ctrl+C to stop.")
+            self.bars = self._fetch_latest_bars()
+            poll_interval = 10 if self.tv_feed is not None else 20
+            logger.info("Bot is now live and polling 2-min bar closes every %ds (%s). Press Ctrl+C to stop.", poll_interval, feed_label)
             window_desc = (
                 f"`{self.cfg.risk.premarket_start_time}–{self.cfg.risk.premarket_end_time} ET (Pre-Market)` + "
                 f"`{self.cfg.risk.entry_start_time}–{self.cfg.risk.entry_end_time} ET (RTH)`"
@@ -1244,6 +1298,7 @@ class IBKRNQBotRunner:
                 title=f"🤖 NQ Quant Bot Online — {self.contract.localSymbol} ({self.mode.upper()})",
                 description=(
                     f"**Contract:** `{self.contract.localSymbol}` (Expiry `{self.contract.lastTradeDateOrContractMonth}`)\n"
+                    f"**Data Feed:** `{feed_label}`\n"
                     f"**Timeframe:** `{self.cfg.strategy.bar_size}` | **Contracts:** `{self.cfg.risk.fixed_contracts}`\n"
                     f"**Session Windows:** {window_desc}"
                 ),
@@ -1251,47 +1306,38 @@ class IBKRNQBotRunner:
             )
             # Process the latest closed historical bar immediately on startup
             self._recover_active_trade()
-            self._on_bar_update(self.bars, has_new_bar=True)
+            if self.bars is not None and len(self.bars) > 0:
+                self._on_bar_update(self.bars, has_new_bar=True)
 
-            # Poll every 20 seconds so both real-time CME subscriptions and 10-min delayed Paper feeds
-            # reliably advance on every 2-minute bar close without stalling.
+            # Poll every 10s (TradingView) / 20s (IBKR) so 2-minute bar closes are processed immediately
             consecutive_empty_polls = 0
             while self.ib.isConnected():
-                self.ib.sleep(20)
+                self.ib.sleep(poll_interval)
                 try:
-                    fresh_bars = self.ib.reqHistoricalData(
-                        self.contract,
-                        endDateTime="",
-                        durationStr=self.cfg.strategy.history_duration,
-                        barSizeSetting=self.cfg.strategy.bar_size,
-                        whatToShow="TRADES",
-                        useRTH=self.cfg.risk.rth_only,
-                        formatDate=1,
-                        keepUpToDate=False,
-                    )
-                    if fresh_bars:
+                    fresh_bars = self._fetch_latest_bars()
+                    if fresh_bars is not None and len(fresh_bars) > 0:
                         consecutive_empty_polls = 0
                         self.bars = fresh_bars
                         self._on_bar_update(self.bars, has_new_bar=True)
                     else:
                         consecutive_empty_polls += 1
                         logger.warning(
-                            "Empty/timed-out historical bar poll (%d/3) from IB Gateway.",
+                            "Empty/timed-out bar poll (%d/3).",
                             consecutive_empty_polls,
                         )
                         if consecutive_empty_polls >= 3:
                             sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
                             self._send_discord_alert(
-                                title=f"⚠️ IBKR DATA FEED STALLED — Auto-Restarting ({sym})",
+                                title=f"⚠️ DATA FEED STALLED — Auto-Restarting ({sym})",
                                 description=(
-                                    f"**Status:** `reqHistoricalData` timed out `3` times consecutively (`60s`).\n"
+                                    f"**Status:** Bar feed timed out `3` times consecutively.\n"
                                     f"**Action:** Disconnecting bot so Docker & the Host Watchdog automatically restart `ib-gateway` and `nq-ibkr-bot`.\n"
                                     f"_You will receive a 🤖 NQ Quant Bot Online alert once reconnected._"
                                 ),
                                 color=0xE67E22,
                                 blocking=True,
                             )
-                            raise RuntimeError("IB Gateway historical data feed timed out 3 times consecutively")
+                            raise RuntimeError("Bar data feed timed out 3 times consecutively")
                 except RuntimeError:
                     logger.error("Historical feed stalled after 3 consecutive timeouts; disconnecting to trigger clean restart.")
                     break

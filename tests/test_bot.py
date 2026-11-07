@@ -272,3 +272,64 @@ def test_delayed_paper_execution_collar_and_unset_double() -> None:
     assert runner._active_tp_order.lmtPrice == 26984.25
     assert runner._active_stop_order.cashQty == UNSET_DOUBLE
     assert not math.isnan(runner._active_stop_order.cashQty)
+
+
+def test_tradingview_hybrid_feed_and_dataframe_bars() -> None:
+    """Verify TradingView symbol resolution, 1m->2m resampling, basis stitching, and runner DataFrame ingestion."""
+    from ibkr_execution import IBKRNQBotRunner
+    from tv_data_feed import TradingViewDataFeed, ibkr_symbol_to_tv_cme_symbol, resample_1m_to_target
+
+    assert ibkr_symbol_to_tv_cme_symbol("MNQZ6", "MNQ") == "CME_MINI:MNQZ2026"
+    assert ibkr_symbol_to_tv_cme_symbol("NQH7", "NQ") == "CME_MINI:NQH2027"
+
+    # 1m -> 2m resampling check
+    df_1m = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-11-06 14:30:00", periods=4, freq="1min", tz="UTC"),
+            "open": [27000.0, 27005.0, 27010.0, 27008.0],
+            "high": [27006.0, 27012.0, 27015.0, 27014.0],
+            "low": [26998.0, 27002.0, 27007.0, 27004.0],
+            "close": [27005.0, 27010.0, 27008.0, 27012.0],
+            "volume": [100.0, 150.0, 200.0, 120.0],
+        }
+    )
+    df_2m = resample_1m_to_target(df_1m, target_minutes=2)
+    assert len(df_2m) == 2
+    assert df_2m.iloc[0]["open"] == 27000.0
+    assert df_2m.iloc[0]["high"] == 27012.0
+    assert df_2m.iloc[0]["low"] == 26998.0
+    assert df_2m.iloc[0]["close"] == 27010.0
+    assert df_2m.iloc[0]["volume"] == 250.0
+
+    # Basis stitching check: CME delayed by 5 bars (10 mins), proxy up-to-date with +100.0 pt basis
+    ts_all = pd.date_range("2026-11-06 14:00:00", periods=20, freq="2min", tz="UTC")
+    prx_df = pd.DataFrame(
+        {
+            "timestamp": ts_all,
+            "open": [26900.0 + i for i in range(20)],
+            "high": [26905.0 + i for i in range(20)],
+            "low": [26895.0 + i for i in range(20)],
+            "close": [26902.0 + i for i in range(20)],
+            "volume": [100.0] * 20,
+        }
+    )
+    cme_df = prx_df.iloc[:15].copy()
+    for col in ("open", "high", "low", "close"):
+        cme_df[col] = cme_df[col] + 100.0
+    cme_df["volume"] = 500.0
+
+    tv = TradingViewDataFeed()
+    tv._fetch_dual_series = lambda **kwargs: (cme_df, "delayed_streaming_600", prx_df, "streaming")
+    combined = tv.fetch_bars("MNQZ6", "MNQ", "2 mins", 20)
+    assert len(combined) == 20
+    assert tv.last_basis_points == 100.0
+    assert tv.last_stitched_bars_count == 6
+    assert combined.iloc[-1]["close"] == 26902.0 + 19 + 100.0
+
+    # Runner DataFrame bar ingestion check
+    cfg = BotConfig()
+    runner = IBKRNQBotRunner(cfg, mode="paper")
+    parsed_df = runner._bars_to_dataframe(combined)
+    assert not parsed_df.empty
+    assert list(parsed_df.columns) == ["timestamp", "open", "high", "low", "close", "volume"]
+

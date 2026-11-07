@@ -21,6 +21,9 @@ class IBKRConfig:
     account: str = ""           # Optional: specify IBKR account code if multiple accounts exist
     timeout: int = 20
     discord_webhook_url: str = field(default_factory=lambda: os.getenv("DISCORD_WEBHOOK_URL", ""))
+    use_tradingview_data: bool = True  # Use TradingView real-time / hybrid 2m bar feed to bypass IBKR Paper 10m delay
+    tradingview_auth_token: str = field(default_factory=lambda: os.getenv("TRADINGVIEW_AUTH_TOKEN", ""))
+    tradingview_realtime_proxy: str = "CAPITALCOM:US100"
 
 
 @dataclass
