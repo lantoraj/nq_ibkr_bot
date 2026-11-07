@@ -7,4 +7,7 @@ venv/
 .env
 journal/
 data/*.csv
+data/*.csv.gz
+data/*.gz
 nq_v41_quant_report.html
+nq_v41_strategy_report.html
