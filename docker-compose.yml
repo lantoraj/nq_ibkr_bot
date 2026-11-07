@@ -30,14 +30,40 @@ services:
     environment:
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
     volumes:
-      - ./journal:/app/journal
+      - ./journal/combo_e_mnq:/app/journal
     command: >
       python -u main.py
       --mode ${TRADING_MODE:-paper}
-      --symbol ${BOT_SYMBOL:-MNQ}
+      --symbol MNQ
       --bar-size "${BOT_BAR_SIZE:-2 mins}"
       --contracts ${BOT_CONTRACTS:-1}
       --max-daily-loss ${BOT_MAX_DAILY_LOSS:-250.0}
+      --premarket-min-atr 22.0
+      --bot-name "NQ Quant Bot v4.1 (Combo E · MNQ)"
       --host 127.0.0.1
       --port ${IB_GATEWAY_PORT:-4002}
-      --client-id ${BOT_CLIENT_ID:-101}
+      --client-id 101
+
+  nq-bot-combo-d:
+    build: .
+    container_name: nq-ibkr-bot-combo-d
+    restart: unless-stopped
+    network_mode: "service:ib-gateway"
+    depends_on:
+      - ib-gateway
+    environment:
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+    volumes:
+      - ./journal/combo_d_nq:/app/journal
+    command: >
+      python -u main.py
+      --mode ${TRADING_MODE:-paper}
+      --symbol NQ
+      --bar-size "${BOT_BAR_SIZE:-2 mins}"
+      --contracts ${BOT_CONTRACTS:-1}
+      --max-daily-loss 2500.0
+      --premarket-min-atr 16.0
+      --bot-name "NQ Quant Bot v4.1 (Combo D · NQ)"
+      --host 127.0.0.1
+      --port ${IB_GATEWAY_PORT:-4002}
+      --client-id 102

@@ -336,13 +336,15 @@ def test_tradingview_hybrid_feed_and_dataframe_bars() -> None:
 
 
 def test_v41_adaptive_volatility_gate_and_premarket_cutoff() -> None:
-    """Verify simplified v4.1 2-setup engine (enable_v_reversal=False, min_atr=22.0 RTH / 16.0 PM) and premarket_trend_end_time='06:00'."""
+    """Verify simplified v4.1 2-setup engine (enable_v_reversal=False, min_atr=22.0 RTH / 16.0 PM, BE=+2.0pt, decay=-0.40R) and premarket_trend_end_time='06:00'."""
     cfg = BotConfig()
     assert cfg.strategy.max_crossover_atr == 0.0
     assert cfg.strategy.use_quant_meta_filter is False
     assert cfg.strategy.enable_v_reversal is False
     assert cfg.strategy.min_atr_points == 22.0
     assert cfg.strategy.premarket_min_atr_points == 16.0
+    assert cfg.risk.breakeven_offset_points == 2.0
+    assert cfg.risk.time_decay_stop_r == 0.40
     assert cfg.risk.premarket_trend_end_time == "06:00"
 
 

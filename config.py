@@ -123,12 +123,12 @@ class RiskConfig:
     min_stop_points: float = 8.0          # Floor on stop distance (32 ticks)
     max_stop_points: float = 40.0         # Cap on stop distance (160 ticks)
     reward_risk_ratio: float = 3.0        # Take Profit distance = 3.0 * Stop distance
-    breakeven_at_1r: bool = True          # Automatically move Stop Loss to Entry + 1.0 pt once +1R is reached
-    breakeven_offset_points: float = 1.0  # Points locked in when break-even triggers
+    breakeven_at_1r: bool = True          # Automatically move Stop Loss to Entry + 2.0 pts once +1R is reached
+    breakeven_offset_points: float = 2.0  # Points locked in when break-even triggers (covers commission + slippage + $2.26 net on MNQ)
 
     # v4 Time-Decay Stop Tightening (Ornstein-Uhlenbeck Stagnation Decay)
     time_decay_bars: int = 6              # If trade hasn't reached +1R within 6 bars (12 mins), tighten stop
-    time_decay_stop_r: float = 0.50       # Tighten risk from -1.0R to -0.50R on stagnant trades
+    time_decay_stop_r: float = 0.40       # Tighten risk from -1.0R to -0.40R on stagnant trades (validated on 2-Year data)
 
     # Daily circuit breakers (Active Frequency Mode: max 4 trades/day across full RTH session)
     max_daily_loss_usd: float = 250.0     # Halts new entries & flattens if breached

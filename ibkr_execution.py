@@ -934,7 +934,7 @@ class IBKRNQBotRunner:
                         logger.info("Moved LONG StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
                         self._send_discord_alert(
                             title=f"🛡️ BREAK-EVEN (+1R) LOCKED — {self.contract.localSymbol} LONG",
-                            description=f"Moved Stop Loss up to **`{new_sl:.2f}`** (`+1.0 pt` above entry `{sig.entry_price:.2f}`).",
+                            description=f"Moved Stop Loss up to **`{new_sl:.2f}`** (`+{self.cfg.risk.breakeven_offset_points:.1f} pts` above entry `{sig.entry_price:.2f}`).",
                             color=0xF1C40F,
                         )
                 elif sig.direction == "SHORT" and low_p <= sig.entry_price - one_r:
@@ -949,7 +949,7 @@ class IBKRNQBotRunner:
                         logger.info("Moved SHORT StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
                         self._send_discord_alert(
                             title=f"🛡️ BREAK-EVEN (+1R) LOCKED — {self.contract.localSymbol} SHORT",
-                            description=f"Moved Stop Loss down to **`{new_sl:.2f}`** (`-1.0 pt` below entry `{sig.entry_price:.2f}`).",
+                            description=f"Moved Stop Loss down to **`{new_sl:.2f}`** (`-{self.cfg.risk.breakeven_offset_points:.1f} pts` below entry `{sig.entry_price:.2f}`).",
                             color=0xF1C40F,
                         )
                 elif (
@@ -966,10 +966,10 @@ class IBKRNQBotRunner:
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
                             self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="LONG", new_stop=dec_sl, entry_price=sig.entry_price)
-                            logger.info("Time-Decay Stop Tightening: Moved LONG StopOrder to -0.5R (%.2f)", dec_sl)
+                            logger.info("Time-Decay Stop Tightening: Moved LONG StopOrder to -%.2fR (%.2f)", self.cfg.risk.time_decay_stop_r, dec_sl)
                             self._send_discord_alert(
-                                title=f"⏳ TIME-DECAY STOP (-0.5R) — {self.contract.localSymbol} LONG",
-                                description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after 6 post-entry bars without reaching `+1R`.",
+                                title=f"⏳ TIME-DECAY STOP (-{self.cfg.risk.time_decay_stop_r:.2f}R) — {self.contract.localSymbol} LONG",
+                                description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after `{self.cfg.risk.time_decay_bars}` post-entry bars without reaching `+1R`.",
                                 color=0xE67E22,
                             )
                     else:
@@ -981,10 +981,10 @@ class IBKRNQBotRunner:
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
                             self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="SHORT", new_stop=dec_sl, entry_price=sig.entry_price)
-                            logger.info("Time-Decay Stop Tightening: Moved SHORT StopOrder to -0.5R (%.2f)", dec_sl)
+                            logger.info("Time-Decay Stop Tightening: Moved SHORT StopOrder to -%.2fR (%.2f)", self.cfg.risk.time_decay_stop_r, dec_sl)
                             self._send_discord_alert(
-                                title=f"⏳ TIME-DECAY STOP (-0.5R) — {self.contract.localSymbol} SHORT",
-                                description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after 6 post-entry bars without reaching `+1R`.",
+                                title=f"⏳ TIME-DECAY STOP (-{self.cfg.risk.time_decay_stop_r:.2f}R) — {self.contract.localSymbol} SHORT",
+                                description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after `{self.cfg.risk.time_decay_bars}` post-entry bars without reaching `+1R`.",
                                 color=0xE67E22,
                             )
             return
@@ -1455,11 +1455,14 @@ class IBKRNQBotRunner:
                 else f"`{self.cfg.risk.entry_start_time}–{self.cfg.risk.entry_end_time} ET`"
             )
             self._sync_discord_webhook_profile()
+            bot_name = getattr(self.cfg.ibkr, "discord_bot_name", "NQ Quant Bot (v4.1)")
             self._send_discord_alert(
-                title=f"🤖 NQ Quant Bot v4.1 Online — {self.contract.localSymbol} ({self.mode.upper()})",
+                title=f"🤖 {bot_name} Online — {self.contract.localSymbol} ({self.mode.upper()})",
                 description=(
-                    f"**Version:** `v4.1 (Situation-Adaptive 3-Setup Engine)`\n"
-                    f"**Contract:** `{self.contract.localSymbol}` (Expiry `{self.contract.lastTradeDateOrContractMonth}`)\n"
+                    f"**Profile:** `{bot_name}`\n"
+                    f"**Contract:** `{self.contract.localSymbol}` (Expiry `{self.contract.lastTradeDateOrContractMonth}` | `${self.cfg.contract.point_value:.0f}/pt`)\n"
+                    f"**ATR Floor:** `RTH ≥ {self.cfg.strategy.min_atr_points:.0f} pts | Pre-Market ≥ {getattr(self.cfg.strategy, 'premarket_min_atr_points', self.cfg.strategy.min_atr_points):.0f} pts`\n"
+                    f"**Stop Rules:** `+1R → +{self.cfg.risk.breakeven_offset_points:.1f} pt BE | {self.cfg.risk.time_decay_bars}b → -{self.cfg.risk.time_decay_stop_r:.2f}R Decay`\n"
                     f"**Data Feed:** `{feed_label}`\n"
                     f"**Timeframe:** `{self.cfg.strategy.bar_size}` | **Contracts:** `{self.cfg.risk.fixed_contracts}`\n"
                     f"**Session Windows:** {window_desc}"

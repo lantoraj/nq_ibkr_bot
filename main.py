@@ -113,6 +113,17 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional Discord Webhook URL for live trade entry/exit notifications (or set DISCORD_WEBHOOK_URL env var)",
     )
+    parser.add_argument(
+        "--bot-name",
+        default="",
+        help="Optional custom Discord bot display name (e.g. 'NQ Quant Bot v4.1 (Combo E - MNQ)')",
+    )
+    parser.add_argument(
+        "--premarket-min-atr",
+        type=float,
+        default=-1.0,
+        help="Override premarket_min_atr_points (e.g. 16.0 for Combo D, 22.0 for Combo E)",
+    )
     return parser.parse_args()
 
 
@@ -132,6 +143,10 @@ def main() -> int:
     cfg.ibkr.client_id = args.client_id
     if args.discord_webhook:
         cfg.ibkr.discord_webhook_url = args.discord_webhook
+    if args.bot_name:
+        cfg.ibkr.discord_bot_name = args.bot_name
+    if args.premarket_min_atr > 0:
+        cfg.strategy.premarket_min_atr_points = args.premarket_min_atr
 
     if args.port > 0:
         if args.mode == "live":
