@@ -86,6 +86,8 @@ class IBKRNQBotRunner:
         self._trade_initial_sl: Optional[float] = None
         self._trade_initial_tp: Optional[float] = None
         self._pending_post_trade_chart: Optional[dict] = None
+        # Chronological history of the live server-side stop level (initial / re-anchor / breakeven / time_decay)
+        self._stop_history: list[dict] = []
         self._last_error_alert_ts: dict[int, float] = {}
 
         # Live-vs-Backtest reconciliation journal (append-only JSONL; never interrupts trading)
@@ -202,6 +204,19 @@ class IBKRNQBotRunner:
         else:
             threading.Thread(target=_post, daemon=True).start()
 
+    def _record_stop_level(self, price: Optional[float], kind: str, ts_utc: Optional[pd.Timestamp] = None) -> None:
+        """Append a live stop level change to the per-trade history (used for chart rendering)."""
+        if price is None:
+            return
+        try:
+            self._stop_history.append({
+                "ts": ts_utc if ts_utc is not None else pd.Timestamp.now(tz="UTC"),
+                "price": float(price),
+                "kind": kind,
+            })
+        except Exception:  # never interrupt trading for chart bookkeeping
+            pass
+
     def _generate_trade_chart(
         self,
         entry_price: float,
@@ -216,6 +231,7 @@ class IBKRNQBotRunner:
         title_prefix: Optional[str] = None,
         entry_ts_utc: Optional[pd.Timestamp] = None,
         exit_ts_utc: Optional[pd.Timestamp] = None,
+        stop_history: Optional[list] = None,
     ) -> Optional[bytes]:
         """Generate a clean dark-theme candlestick chart of the trade with surrounding context for Discord."""
         try:
@@ -273,14 +289,19 @@ class IBKRNQBotRunner:
             if "ema_trend" in chart_df.columns:
                 ax.plot(x, chart_df["ema_trend"], color="#00d2d3", linestyle="-.", linewidth=1.2, label="EMA(50)", alpha=0.9)
 
-            # Determine entry and exit x indices (matching exact fill timestamps if available)
-            if exit_ts_utc is not None and ts_utc_series.iloc[-1] >= exit_ts_utc - pd.Timedelta(minutes=2):
-                exit_idx = int((ts_utc_series - exit_ts_utc).abs().idxmin())
+            # Determine entry and exit x indices: the 2-min bar that CONTAINS the fill timestamp
+            def _containing_idx(ts_val) -> int:
+                t = pd.Timestamp(ts_val)
+                t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+                return int(max(0, min(len(chart_df) - 1, int(ts_utc_series.searchsorted(t, side="right")) - 1)))
+
+            if exit_ts_utc is not None and ts_utc_series.iloc[-1] >= pd.Timestamp(exit_ts_utc) - pd.Timedelta(minutes=2):
+                exit_idx = _containing_idx(exit_ts_utc)
             else:
                 exit_idx = max(0, len(chart_df) - 1 - post_exit_bars)
 
             if entry_ts_utc is not None and ts_utc_series.iloc[0] <= entry_ts_utc <= ts_utc_series.iloc[-1] + pd.Timedelta(minutes=2):
-                entry_idx = int((ts_utc_series - entry_ts_utc).abs().idxmin())
+                entry_idx = _containing_idx(entry_ts_utc)
             else:
                 entry_idx = max(0, exit_idx - max(1, entry_bar_offset))
 
@@ -290,54 +311,128 @@ class IBKRNQBotRunner:
             entry_time = time_strs[entry_idx]
             exit_time = time_strs[exit_idx]
 
-            # Horizontal Lines for Initial SL & TP (spanning from entry to exit + 4 bars or chart end)
-            span_end = min(len(chart_df) - 0.5, exit_idx + 6)
-            span_x = [entry_idx, span_end]
-            if sl_price is not None:
-                ax.hlines(sl_price, xmin=span_x[0], xmax=span_x[1], colors="#e74c3c", linestyles="--", linewidth=1.4, zorder=4)
-                ax.text(
-                    span_x[1], sl_price, f" Initial SL: {sl_price:.2f} [Set @ {entry_time} ET]",
-                    color="#e74c3c", fontsize=8, fontweight="bold", va="center", ha="left"
-                )
-
-            if tp_price is not None:
-                ax.hlines(tp_price, xmin=span_x[0], xmax=span_x[1], colors="#2ecc71", linestyles="--", linewidth=1.4, zorder=4)
-                ax.text(
-                    span_x[1], tp_price, f" Initial TP: {tp_price:.2f} [Set @ {entry_time} ET]",
-                    color="#2ecc71", fontsize=8, fontweight="bold", va="center", ha="left"
-                )
-
-            # Initial Entry reference guideline
-            ax.hlines(entry_price, xmin=span_x[0], xmax=span_x[1], colors="#787b86", linestyles=":", linewidth=1.0, zorder=4)
-
-            # Entry Annotation with exact time
-            entry_color = "#e74c3c" if direction == "SHORT" else "#2ecc71"
-            ax.annotate(
-                f"{direction} ENTRY [{entry_time} ET]\n{entry_price:.2f}",
-                xy=(entry_idx, entry_price),
-                xytext=(max(0, entry_idx - 3.5), entry_price + (26 if direction == "SHORT" else -26)),
-                arrowprops=dict(facecolor=entry_color, edgecolor=entry_color, shrink=0.08, width=2, headwidth=7),
-                fontsize=8.5,
-                fontweight="bold",
-                color="#ffffff",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor=entry_color, alpha=0.88, edgecolor="none"),
-                zorder=6,
-            )
-
-            # Exit Annotation with exact time
-            exit_color = "#2ecc71" if pnl >= 0 else "#e74c3c"
+            # ------------------------------------------------------------------
+            # Trade level rendering: Entry, TP, Initial SL, live SL moves, Exit
+            # ------------------------------------------------------------------
+            n_bars = len(chart_df)
             pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-            ax.annotate(
-                f"EXIT [{exit_time} ET] ({pnl_str})\n{exit_price:.2f}",
-                xy=(exit_idx, exit_price),
-                xytext=(max(0, exit_idx - 3.5), exit_price - 22 if pnl >= 0 else exit_price + 22),
-                arrowprops=dict(facecolor=exit_color, edgecolor=exit_color, shrink=0.08, width=2, headwidth=7),
-                fontsize=8.5,
-                fontweight="bold",
-                color="#ffffff",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor=exit_color, alpha=0.88, edgecolor="none"),
-                zorder=6,
+            is_long = direction != "SHORT"
+
+            def _ts_to_idx(ts) -> int:
+                """Index of the 2-min bar that contains timestamp ts (clamped to chart)."""
+                try:
+                    t = pd.Timestamp(ts)
+                    t = t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+                    pos = int(ts_utc_series.searchsorted(t, side="right")) - 1
+                    return int(min(max(pos, entry_idx), exit_idx))
+                except Exception:
+                    return entry_idx
+
+            # Build stop segments from the live stop history (fallback: single initial SL)
+            hist = sorted(
+                [h for h in (stop_history or []) if h.get("price") is not None],
+                key=lambda h: pd.Timestamp(h["ts"]),
             )
+            if not hist and sl_price is not None:
+                hist = [{"ts": entry_ts_utc, "price": float(sl_price), "kind": "initial"}]
+            initial_sl = float(hist[0]["price"]) if hist else sl_price
+
+            stop_style = {
+                "initial": ("#ff5252", "--", "Initial SL"),
+                "re_anchor": ("#ff5252", "--", "Re-anchored SL"),
+                "breakeven": ("#ffd600", "-", "BE SL"),
+                "time_decay": ("#ff9800", "-", "Time-Decay SL"),
+            }
+            seg_end_x = exit_idx + 0.45
+            for k, h in enumerate(hist):
+                x0 = entry_idx if k == 0 else _ts_to_idx(h["ts"]) + 0.5
+                x1 = (_ts_to_idx(hist[k + 1]["ts"]) + 0.5) if k + 1 < len(hist) else seg_end_x
+                color, ls, _ = stop_style.get(h["kind"], stop_style["initial"])
+                ax.hlines(h["price"], xmin=x0, xmax=max(x0 + 0.2, x1), colors=color, linestyles=ls,
+                          linewidth=2.0 if k > 0 else 1.5, zorder=4)
+                if k > 0:
+                    prev = hist[k - 1]["price"]
+                    ax.vlines(x0, min(prev, h["price"]), max(prev, h["price"]), colors=color,
+                              linestyles=":", linewidth=1.3, zorder=4)
+                    move_et = pd.Timestamp(h["ts"]).tz_convert(self.cfg.risk.timezone).strftime("%H:%M")
+                    lbl = "BE +lock" if h["kind"] == "breakeven" else (
+                        f"-{self.cfg.risk.time_decay_stop_r:.2f}R decay" if h["kind"] == "time_decay" else h["kind"])
+                    ax.annotate(
+                        f"SL moved {move_et}\n{prev:.2f} → {h['price']:.2f} ({lbl})",
+                        xy=(x0, h["price"]),
+                        xytext=(0, -26 if is_long else 26), textcoords="offset points",
+                        ha="center", va="top" if is_long else "bottom", fontsize=7.5, fontweight="bold",
+                        color="#131722", zorder=7, annotation_clip=False,
+                        bbox=dict(boxstyle="round,pad=0.25", facecolor=color, alpha=0.95, edgecolor="none"),
+                        arrowprops=dict(arrowstyle="-", color=color, lw=1.0),
+                    )
+
+            # Take-profit line
+            if tp_price is not None:
+                ax.hlines(tp_price, xmin=entry_idx, xmax=seg_end_x, colors="#00e676", linestyles="--",
+                          linewidth=1.5, zorder=4)
+
+            # Entry level: bold solid line during the trade + faint extension to the price axis
+            entry_line_color = "#2979ff"
+            ax.hlines(entry_price, xmin=entry_idx - 0.45, xmax=seg_end_x, colors=entry_line_color,
+                      linestyles="-", linewidth=2.4, zorder=5)
+            ax.hlines(entry_price, xmin=seg_end_x, xmax=n_bars - 0.5, colors=entry_line_color,
+                      linestyles=":", linewidth=1.0, alpha=0.7, zorder=4)
+            ax.scatter([entry_idx], [entry_price], marker="^" if is_long else "v", s=170,
+                       color=entry_line_color, edgecolors="white", linewidths=1.3, zorder=8)
+
+            # Exit marker
+            exit_color = "#00e676" if pnl >= 0 else "#ff5252"
+            ax.scatter([exit_idx], [exit_price], marker="X", s=150, color=exit_color,
+                       edgecolors="white", linewidths=1.2, zorder=8)
+
+            # Trade window shading
+            ax.axvspan(entry_idx - 0.5, exit_idx + 0.5, color="#2979ff", alpha=0.06, zorder=1)
+
+            # Y limits (include every level so nothing is clipped)
+            levels = [p for p in (tp_price, entry_price, exit_price, initial_sl) if p is not None]
+            levels += [h["price"] for h in hist]
+            y_lo = min(float(chart_df["low"].min()), min(levels))
+            y_hi = max(float(chart_df["high"].max()), max(levels))
+            pad = max(8.0, (y_hi - y_lo) * 0.08)
+            y_min, y_max = y_lo - pad, y_hi + pad
+            ax.set_ylim(y_min, y_max)
+
+            # Right-hand price tags (TradingView style) with collision avoidance
+            tags = []
+            if tp_price is not None:
+                tags.append((tp_price, f"TP  {tp_price:.2f}", "#00e676", "#131722"))
+            tags.append((entry_price, f"ENTRY {direction}  {entry_price:.2f}  @{entry_time}", entry_line_color, "#ffffff"))
+            if initial_sl is not None:
+                tags.append((initial_sl, f"INITIAL SL  {initial_sl:.2f}", "#ff5252", "#ffffff"))
+            if len(hist) > 1:
+                last = hist[-1]
+                c, _, name = stop_style.get(last["kind"], stop_style["initial"])
+                tags.append((last["price"], f"{name.upper()}  {last['price']:.2f}", c, "#131722"))
+            tags.append((exit_price, f"EXIT  {exit_price:.2f}  @{exit_time}  ({pnl_str})", exit_color,
+                         "#131722" if pnl >= 0 else "#ffffff"))
+
+            min_gap = (y_max - y_min) * 0.058
+            tags.sort(key=lambda t: t[0])
+            placed = []
+            for price, *_ in tags:
+                y = price if not placed else max(price, placed[-1] + min_gap)
+                placed.append(y)
+            overflow = placed[-1] - (y_max - min_gap * 0.5) if placed else 0
+            if overflow > 0:  # shift block down if it runs off the top
+                placed = [max(y - overflow, y_min + min_gap * 0.5) for y in placed]
+                for i in range(1, len(placed)):
+                    placed[i] = max(placed[i], placed[i - 1] + min_gap)
+
+            tag_x = n_bars + 0.2
+            for (price, text, bg, fg), y in zip(tags, placed):
+                ax.annotate(
+                    text, xy=(n_bars - 0.3, price), xytext=(tag_x, y), textcoords="data",
+                    ha="left", va="center", fontsize=8.3, fontweight="bold", color=fg, zorder=9,
+                    annotation_clip=False,
+                    bbox=dict(boxstyle="round,pad=0.28", facecolor=bg, alpha=0.97, edgecolor="none"),
+                    arrowprops=dict(arrowstyle="-", color=bg, lw=1.0, shrinkA=0, shrinkB=0),
+                )
 
             # Horizontal Axis: Exact time labels
             tick_step = max(1, len(chart_df) // 8)
@@ -363,14 +458,9 @@ class IBKRNQBotRunner:
             else:
                 full_title = f"{sym} (2 min) — {direction} Trade Closed [{entry_time} → {exit_time} ET] ({pnl_str} USD)"
             ax.set_title(full_title, color=title_color, fontsize=11, fontweight="bold", pad=10)
-            ax.legend(loc="upper right", framealpha=0.4, facecolor="#1e222d", edgecolor="none", fontsize=8)
+            ax.legend(loc="upper left", framealpha=0.4, facecolor="#1e222d", edgecolor="none", fontsize=8)
 
-            # Adjust limits for SL/TP and text labels
-            valid_targets = [p for p in (sl_price, tp_price, entry_price, exit_price) if p is not None]
-            y_min = min(chart_df["low"].min(), min(valid_targets)) - 10
-            y_max = max(chart_df["high"].max(), max(valid_targets)) + 12
-            ax.set_ylim(y_min, y_max)
-            ax.set_xlim(-1, len(chart_df) + 3.5)
+            ax.set_xlim(-1, n_bars - 0.3)
 
             plt.tight_layout()
             buf = io.BytesIO()
@@ -397,6 +487,7 @@ class IBKRNQBotRunner:
                 title_prefix=f"{task['direction']} Post-Trade Review (+10 Bars)",
                 entry_ts_utc=task.get("entry_ts_utc"),
                 exit_ts_utc=task.get("exit_ts_utc"),
+                stop_history=task.get("stop_history"),
             )
             sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
             pnl = task["pnl"]
@@ -653,6 +744,7 @@ class IBKRNQBotRunner:
         self._trade_direction = signal.direction
         self._trade_initial_sl = signal.stop_loss
         self._trade_initial_tp = signal.take_profit
+        self._stop_history = []
         self._signal_bar_ts = pd.Timestamp(signal.timestamp)
         self._signal_price_orig = float(signal.entry_price)
         self._signal_submitted_utc = pd.Timestamp.now(tz="UTC")
@@ -930,6 +1022,7 @@ class IBKRNQBotRunner:
                         self._active_stop_order.overridePercentageConstraints = True
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
+                        self._record_stop_level(new_sl, "breakeven")
                         self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="breakeven", direction="LONG", new_stop=new_sl, entry_price=sig.entry_price)
                         logger.info("Moved LONG StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
                         self._send_discord_alert(
@@ -945,6 +1038,7 @@ class IBKRNQBotRunner:
                         self._active_stop_order.overridePercentageConstraints = True
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
+                        self._record_stop_level(new_sl, "breakeven")
                         self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="breakeven", direction="SHORT", new_stop=new_sl, entry_price=sig.entry_price)
                         logger.info("Moved SHORT StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
                         self._send_discord_alert(
@@ -965,6 +1059,7 @@ class IBKRNQBotRunner:
                             self._active_stop_order.overridePercentageConstraints = True
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
+                            self._record_stop_level(dec_sl, "time_decay")
                             self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="LONG", new_stop=dec_sl, entry_price=sig.entry_price)
                             logger.info("Time-Decay Stop Tightening: Moved LONG StopOrder to -%.2fR (%.2f)", self.cfg.risk.time_decay_stop_r, dec_sl)
                             self._send_discord_alert(
@@ -980,6 +1075,7 @@ class IBKRNQBotRunner:
                             self._active_stop_order.overridePercentageConstraints = True
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
+                            self._record_stop_level(dec_sl, "time_decay")
                             self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="SHORT", new_stop=dec_sl, entry_price=sig.entry_price)
                             logger.info("Time-Decay Stop Tightening: Moved SHORT StopOrder to -%.2fR (%.2f)", self.cfg.risk.time_decay_stop_r, dec_sl)
                             self._send_discord_alert(
@@ -1125,6 +1221,7 @@ class IBKRNQBotRunner:
                 pre_entry_bars=15,
                 entry_ts_utc=self._trade_filled_ts_utc,
                 exit_ts_utc=self._trade_closed_ts_utc,
+                stop_history=list(self._stop_history),
             )
 
             self._send_discord_alert(
@@ -1153,6 +1250,7 @@ class IBKRNQBotRunner:
                 "target_bar_count": self.bar_count + 10 + delay_bars,
                 "entry_ts_utc": self._trade_filled_ts_utc,
                 "exit_ts_utc": self._trade_closed_ts_utc,
+                "stop_history": list(self._stop_history),
             }
 
             if self.risk.state.halted:
@@ -1211,6 +1309,13 @@ class IBKRNQBotRunner:
                 "Re-anchored bracket SL/TP to actual fill %.2f -> SL=%.2f | TP=%.2f",
                 fill_p, new_sl, new_tp,
             )
+
+        # Seed the stop history with the live stop actually resting at fill time
+        live_sl = None
+        if self._active_stop_order is not None and self._active_stop_order.auxPrice not in (None, UNSET_DOUBLE):
+            live_sl = float(self._active_stop_order.auxPrice)
+        self._stop_history = []
+        self._record_stop_level(live_sl if live_sl is not None else self._trade_initial_sl, "initial", self._trade_filled_ts_utc)
 
         logger.info("ENTRY FILLED: %s %s %s @ %.2f", e.side, e.shares, self.contract.localSymbol, e.price)
         sig_orig = self._signal_price_orig if self._signal_price_orig is not None else fill_p
@@ -1300,6 +1405,8 @@ class IBKRNQBotRunner:
         # If the stop is already at/through entry, Break-Even was already applied before the restart.
         self._be_moved = (direction == "LONG" and stop >= entry) or (direction == "SHORT" and stop <= entry)
         self._decay_moved = False
+        self._stop_history = []
+        self._record_stop_level(stop, "breakeven" if self._be_moved else "initial", self._trade_filled_ts_utc)
         logger.warning(
             "RECOVERED active %s %s position | entry=%.2f stop=%.2f tp=%.2f (BE already moved=%s)",
             direction, self.contract.localSymbol, entry, stop, tp, self._be_moved,
