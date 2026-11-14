@@ -104,12 +104,19 @@ class IBKRNQBotRunner:
             cache_path=str(journal_root / "ff_calendar_cache.json"),
             report_path=report_json,
             timezone_name=config.risk.timezone,
-            tier1_pre_mins=getattr(config.risk, "news_mega_pre_blackout_mins", 15),
-            tier1_post_mins=getattr(config.risk, "news_mega_post_blackout_mins", 30),
-            tier2_pre_mins=getattr(config.risk, "news_pre_blackout_mins", 10),
-            tier2_post_mins=getattr(config.risk, "news_post_blackout_mins", 15),
+            tier1_pre_mins=getattr(config.risk, "news_mega_pre_blackout_mins", 10),
+            tier1_post_mins=getattr(config.risk, "news_mega_post_blackout_mins", 10),
+            tier2_pre_mins=getattr(config.risk, "news_pre_blackout_mins", 5),
+            tier2_post_mins=getattr(config.risk, "news_post_blackout_mins", 5),
         )
         self.calendar.load_from_cache()
+        self._calendar_brief_state_file = journal_root / "last_calendar_brief_date.txt"
+        self._last_calendar_brief_date: Optional[str] = None
+        if self._calendar_brief_state_file.exists():
+            try:
+                self._last_calendar_brief_date = self._calendar_brief_state_file.read_text(encoding="utf-8").strip() or None
+            except Exception:
+                self._last_calendar_brief_date = None
         self.risk = RiskManager(config.risk, config.contract, calendar=self.calendar)
 
         self.contract: Optional[Contract] = None
@@ -261,6 +268,58 @@ class IBKRNQBotRunner:
             _post()
         else:
             threading.Thread(target=_post, daemon=True).start()
+
+    def _maybe_send_daily_calendar_briefing(self, now_utc: Optional[datetime] = None) -> bool:
+        """
+        Send the daily 09:00 AM Prague (Europe/Prague) ForexFactory economic calendar
+        briefing with table PNG once per trading day (Mon–Fri) from primary client_id=101.
+        """
+        if getattr(self.cfg.ibkr, "client_id", 101) != 101:
+            return False
+        if not getattr(self.cfg.risk, "use_news_calendar_filter", True):
+            return False
+
+        try:
+            ref_utc = now_utc or datetime.now(timezone.utc)
+            prague_now = ref_utc.astimezone(self.calendar.cet_tz)
+            if prague_now.weekday() >= 5:
+                return False
+
+            target_hhmm = getattr(self.cfg.risk, "daily_calendar_alert_time_cet", "09:00")
+            if prague_now.strftime("%H:%M") < target_hhmm:
+                return False
+
+            today_str = prague_now.strftime("%Y-%m-%d")
+            if self._last_calendar_brief_date == today_str:
+                return False
+
+            self.calendar.fetch_and_cache(force=True)
+            events = self.calendar.get_events_for_cet_date(prague_now.date())
+            title, desc = self.calendar.format_daily_discord_message(
+                prague_now.date(),
+                events,
+                pre_news_tighten_mins=int(getattr(self.cfg.risk, "pre_news_tighten_stop_mins", 4)),
+            )
+            img_bytes = self.calendar.render_daily_calendar_image(prague_now.date(), events)
+            color = 0xE74C3C if any(e.tier in (1, 2) for e in events) else 0x3498DB
+            self._send_discord_alert(
+                title=title,
+                description=desc,
+                color=color,
+                image_bytes=img_bytes,
+            )
+
+            self._last_calendar_brief_date = today_str
+            try:
+                self._calendar_brief_state_file.parent.mkdir(parents=True, exist_ok=True)
+                self._calendar_brief_state_file.write_text(today_str, encoding="utf-8")
+            except Exception as exc:
+                logger.debug("Could not persist daily calendar brief date: %s", exc)
+            logger.info("Sent daily 09:00 CET ForexFactory Discord briefing for %s (%d events).", today_str, len(events))
+            return True
+        except Exception as exc:
+            logger.warning("Failed sending daily calendar briefing: %s", exc)
+            return False
 
     def _record_stop_level(self, price: Optional[float], kind: str, ts_utc: Optional[pd.Timestamp] = None) -> None:
         """Append a live stop level change to the per-trade history (used for chart rendering)."""
@@ -1797,6 +1856,7 @@ class IBKRNQBotRunner:
             # Reconstruct today's intraday risk counters & re-attach any live position before processing closed bars
             self._restore_daily_risk_state()
             self._recover_active_trade()
+            self._maybe_send_daily_calendar_briefing()
             if self.bars is not None and len(self.bars) > 0:
                 self._on_bar_update(self.bars, has_new_bar=True)
 
@@ -1806,6 +1866,7 @@ class IBKRNQBotRunner:
                 self.ib.sleep(poll_interval)
                 try:
                     self.calendar.refresh_if_needed()
+                    self._maybe_send_daily_calendar_briefing()
                     fresh_bars = self._fetch_latest_bars()
                     if fresh_bars is not None and len(fresh_bars) > 0:
                         consecutive_empty_polls = 0

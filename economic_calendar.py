@@ -13,14 +13,15 @@ bot can:
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import pytz
@@ -35,6 +36,7 @@ FF_NEXT_WEEK_URL = "https://nfs.faireconomy.media/ff_calendar_nextweek.json"
 TIER1_KEYWORDS: Tuple[str, ...] = (
     "fomc",
     "federal funds rate",
+    "fed chair",
     "powell",
     "non-farm",
     "nonfarm",
@@ -93,10 +95,10 @@ class EconomicCalendar:
         cache_path: str = "/app/journal/ff_calendar_cache.json",
         report_path: Optional[str] = "/app/report/ff_calendar.json",
         timezone_name: str = "America/New_York",
-        tier1_pre_mins: int = 15,
-        tier1_post_mins: int = 30,
-        tier2_pre_mins: int = 10,
-        tier2_post_mins: int = 15,
+        tier1_pre_mins: int = 10,
+        tier1_post_mins: int = 10,
+        tier2_pre_mins: int = 5,
+        tier2_post_mins: int = 5,
         refresh_interval_hours: float = 4.0,
         blackout_countries: Tuple[str, ...] = ("USD",),
     ) -> None:
@@ -394,6 +396,234 @@ class EconomicCalendar:
             and (not allowed_c or ev.country.upper() in allowed_c)
             and (not allowed_i or ev.impact.lower() in allowed_i)
         ]
+
+    def get_events_for_cet_date(
+        self,
+        target_date: Any,
+        countries: Optional[Iterable[str]] = None,
+        impacts: Optional[Iterable[str]] = None,
+    ) -> List[EconomicEvent]:
+        """Return all calendar events falling on `target_date` in Europe/Prague (CET/CEST)."""
+        if not self.events:
+            return []
+        d_obj = target_date.date() if isinstance(target_date, datetime) else target_date
+        allowed_c = {c.upper() for c in countries} if countries else None
+        allowed_i = {i.lower() for i in impacts} if impacts else None
+
+        matched = [
+            ev
+            for ev in self.events
+            if ev.dt_utc.astimezone(self.cet_tz).date() == d_obj
+            and (allowed_c is None or ev.country.upper() in allowed_c)
+            and (allowed_i is None or ev.impact.lower() in allowed_i)
+        ]
+        matched.sort(key=lambda e: e.dt_utc)
+        return matched
+
+    def format_daily_discord_message(
+        self,
+        target_date: Any,
+        events: List[EconomicEvent],
+        pre_news_tighten_mins: int = 4,
+    ) -> Tuple[str, str]:
+        """Format daily 09:00 CET ForexFactory briefing (title, description) for Discord."""
+        d_obj = target_date.date() if isinstance(target_date, datetime) else target_date
+        title = f"📅 ForexFactory Economic Calendar — {d_obj.strftime('%a %b %d, %Y')} (09:00 CET)"
+
+        usd_high = [ev for ev in events if ev.tier in (1, 2)]
+        lines: List[str] = [
+            (
+                f"**Events Today:** `{len(events)}` total | **`{len(usd_high)}` USD High-Impact**\n"
+                f"**Bot Guards:** `Tier-1 (-{self.tier1_pre_mins}m/+{self.tier1_post_mins}m) | "
+                f"Tier-2 (-{self.tier2_pre_mins}m/+{self.tier2_post_mins}m) | "
+                f"Pre-News SL Tighten: {pre_news_tighten_mins}m prior`"
+            ),
+            "",
+            "**🚫 USD High-Impact Blackout Windows:**",
+        ]
+
+        if usd_high:
+            for ev in usd_high:
+                win = self.get_blackout_window(ev)
+                if win is None:
+                    continue
+                w_start, w_end, pre, post = win
+                s_cet = w_start.astimezone(self.cet_tz).strftime("%H:%M")
+                e_cet = w_end.astimezone(self.cet_tz).strftime("%H:%M")
+                s_et = w_start.astimezone(self.tz).strftime("%H:%M")
+                e_et = w_end.astimezone(self.tz).strftime("%H:%M")
+                lines.append(
+                    f"• `T{ev.tier} (-{pre}m/+{post}m)` **{ev.title}** — "
+                    f"`{s_cet}–{e_cet} CET` (`{s_et}–{e_et} ET`)"
+                )
+        else:
+            lines.append("• None today")
+
+        lines.append("")
+        lines.append("**📋 Full Day Schedule (CET / ET):**")
+        impact_icon = {"high": "🟥", "medium": "🟧", "low": "🟨", "holiday": "⬜"}
+
+        if not events:
+            lines.append("_No economic releases scheduled for today._")
+        else:
+            for ev in events:
+                dt_cet = ev.dt_utc.astimezone(self.cet_tz)
+                ico = impact_icon.get(ev.impact.lower(), "▫️")
+                fc_parts = []
+                if ev.forecast:
+                    fc_parts.append(f"Fc `{ev.forecast}`")
+                if ev.previous:
+                    fc_parts.append(f"Pv `{ev.previous}`")
+                fc_txt = f" ({', '.join(fc_parts)})" if fc_parts else ""
+                tier_txt = f" **[T{ev.tier} BLACKOUT]**" if ev.tier in (1, 2) else ""
+                entry_line = (
+                    f"{ico} `{dt_cet.strftime('%H:%M')} CET` (`{ev.dt_et.strftime('%H:%M')} ET`) "
+                    f"**{ev.country}** · {ev.title}{fc_txt}{tier_txt}"
+                )
+                if sum(len(x) + 1 for x in lines) + len(entry_line) > 3750:
+                    lines.append(f"_…and more rows shown in attached table image._")
+                    break
+                lines.append(entry_line)
+
+        return title, "\n".join(lines)
+
+    def render_daily_calendar_image(
+        self,
+        target_date: Any,
+        events: List[EconomicEvent],
+    ) -> Optional[bytes]:
+        """Render a clean ForexFactory-style daily calendar table as PNG bytes."""
+        try:
+            from matplotlib.backends.backend_agg import FigureCanvasAgg
+            from matplotlib.figure import Figure
+            from matplotlib.patches import FancyBboxPatch
+        except Exception as exc:
+            logger.warning("Matplotlib unavailable for calendar image rendering: %s", exc)
+            return None
+
+        d_obj: date = target_date.date() if isinstance(target_date, datetime) else target_date
+        rows = events[:28]  # Cap height cleanly for Discord embed legibility
+        n_rows = max(len(rows), 1)
+        fig_height = max(2.2, 1.15 + n_rows * 0.40)
+        fig = Figure(figsize=(12.2, fig_height), dpi=150, facecolor="#ffffff")
+        FigureCanvasAgg(fig)
+        ax = fig.add_axes([0.0, 0.0, 1.0, 1.0])
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.axis("off")
+
+        total_units = n_rows + 1.85
+        header_h = 1.05 / total_units
+        col_hdr_h = 0.80 / total_units
+        row_h = 1.0 / total_units
+
+        # Top title banner
+        ax.add_patch(FancyBboxPatch((0.0, 1.0 - header_h), 1.0, header_h, boxstyle="square,pad=0", fc="#1e293b", ec="none"))
+        ax.text(
+            0.015,
+            1.0 - header_h * 0.50,
+            f"ForexFactory Economic Calendar  |  {d_obj.strftime('%a %b %d, %Y')}  |  09:00 CET Daily Briefing",
+            color="#ffffff",
+            fontsize=11,
+            fontweight="bold",
+            va="center",
+            ha="left",
+        )
+        ax.text(
+            0.985,
+            1.0 - header_h * 0.50,
+            f"Guards: T1 -{self.tier1_pre_mins}m/+{self.tier1_post_mins}m  |  T2 -{self.tier2_pre_mins}m/+{self.tier2_post_mins}m",
+            color="#93c5fd",
+            fontsize=9,
+            fontweight="bold",
+            va="center",
+            ha="right",
+        )
+
+        # Column headers
+        y_col = 1.0 - header_h - col_hdr_h
+        ax.add_patch(FancyBboxPatch((0.0, y_col), 1.0, col_hdr_h, boxstyle="square,pad=0", fc="#e2e8f0", ec="#cbd5e1", lw=0.8))
+        cols = [
+            (0.012, "Date", "left"),
+            (0.095, "Time (CET / ET)", "left"),
+            (0.245, "Ccy", "center"),
+            (0.295, "Imp", "center"),
+            (0.335, "Event", "left"),
+            (0.715, "Forecast", "right"),
+            (0.815, "Previous", "right"),
+            (0.985, "Bot Guard", "right"),
+        ]
+        for x, text, ha in cols:
+            ax.text(x, y_col + col_hdr_h * 0.50, text, color="#334155", fontsize=8.5, fontweight="bold", va="center", ha=ha)
+
+        imp_colors = {
+            "high": ("#d93025", "H"),
+            "medium": ("#f29900", "M"),
+            "low": ("#eab308", "L"),
+            "holiday": ("#94a3b8", "·"),
+        }
+
+        if not rows:
+            y_r = y_col - row_h
+            ax.add_patch(FancyBboxPatch((0.0, y_r), 1.0, row_h, boxstyle="square,pad=0", fc="#f8fafc", ec="#e2e8f0", lw=0.6))
+            ax.text(0.50, y_r + row_h * 0.50, "No economic events scheduled on ForexFactory for this date.", color="#475569", fontsize=9.5, va="center", ha="center")
+        else:
+            date_lbl = d_obj.strftime("%a\n%b %d")
+            for idx, ev in enumerate(rows):
+                y_r = y_col - (idx + 1) * row_h
+                if ev.tier == 1:
+                    row_bg = "#fdecec"
+                elif ev.tier == 2:
+                    row_bg = "#fff6e0"
+                else:
+                    row_bg = "#f8fafc" if idx % 2 else "#ffffff"
+
+                ax.add_patch(FancyBboxPatch((0.0, y_r), 1.0, row_h, boxstyle="square,pad=0", fc=row_bg, ec="#e2e8f0", lw=0.6))
+                ymid = y_r + row_h * 0.50
+
+                if idx == 0:
+                    ax.text(0.012, ymid, date_lbl.replace("\n", " "), color="#0f172a", fontsize=8.3, fontweight="bold", va="center", ha="left")
+
+                dt_cet = ev.dt_utc.astimezone(self.cet_tz)
+                time_txt = f"{dt_cet.strftime('%H:%M')} CET ({ev.dt_et.strftime('%H:%M')} ET)"
+                ax.text(0.095, ymid, time_txt, color="#1e293b", fontsize=8.3, va="center", ha="left")
+                ax.text(0.245, ymid, ev.country, color="#0f172a", fontsize=8.5, fontweight="bold", va="center", ha="center")
+
+                # ForexFactory-style colored folder/badge icon
+                badge_col, badge_ch = imp_colors.get(ev.impact.lower(), ("#cbd5e1", "·"))
+                bw = 0.022
+                bh = row_h * 0.58
+                ax.add_patch(
+                    FancyBboxPatch(
+                        (0.295 - bw / 2, ymid - bh / 2),
+                        bw,
+                        bh,
+                        boxstyle="round,pad=0.002,rounding_size=0.004",
+                        fc=badge_col,
+                        ec="none",
+                    )
+                )
+                ax.text(0.295, ymid, badge_ch, color="#ffffff", fontsize=7.5, fontweight="bold", va="center", ha="center")
+
+                title_disp = ev.title if len(ev.title) <= 44 else ev.title[:42] + "…"
+                title_wt = "bold" if ev.tier in (1, 2) else "normal"
+                ax.text(0.335, ymid, title_disp, color="#0f172a", fontsize=8.5, fontweight=title_wt, va="center", ha="left")
+
+                ax.text(0.715, ymid, ev.forecast or "—", color="#1e293b", fontsize=8.3, va="center", ha="right")
+                ax.text(0.815, ymid, ev.previous or "—", color="#64748b", fontsize=8.3, va="center", ha="right")
+
+                if ev.tier == 1:
+                    guard_txt, g_col = f"T1: -{self.tier1_pre_mins}m/+{self.tier1_post_mins}m", "#b91c1c"
+                elif ev.tier == 2:
+                    guard_txt, g_col = f"T2: -{self.tier2_pre_mins}m/+{self.tier2_post_mins}m", "#b45309"
+                else:
+                    guard_txt, g_col = "—", "#94a3b8"
+                ax.text(0.985, ymid, guard_txt, color=g_col, fontsize=8.2, fontweight="bold" if ev.tier in (1, 2) else "normal", va="center", ha="right")
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150)
+        buf.seek(0)
+        return buf.read()
 
     @staticmethod
     def format_events_summary(events: List[EconomicEvent]) -> str:

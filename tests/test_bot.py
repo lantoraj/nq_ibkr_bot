@@ -516,17 +516,17 @@ def test_trade_journal_and_reconcile(tmp_path) -> None:
 
 
 def test_economic_calendar_tier_classification_and_blackouts(tmp_path):
+    from datetime import date
     import pandas as pd
     from economic_calendar import EconomicCalendar
 
     cal = EconomicCalendar(
         cache_path=str(tmp_path / "ff_cache.json"),
         report_path=str(tmp_path / "ff_report.json"),
-        tier1_pre_mins=15,
-        tier1_post_mins=30,
-        tier2_pre_mins=10,
-        tier2_post_mins=15,
     )
+    assert (cal.tier1_pre_mins, cal.tier1_post_mins) == (10, 10)
+    assert (cal.tier2_pre_mins, cal.tier2_post_mins) == (5, 5)
+
     count = cal.load_events_from_list(
         [
             {
@@ -541,6 +541,14 @@ def test_economic_calendar_tier_classification_and_blackouts(tmp_path):
                 "title": "FOMC Statement",
                 "country": "USD",
                 "date": "2026-11-11T14:00:00-05:00",
+                "impact": "High",
+                "forecast": "",
+                "previous": "",
+            },
+            {
+                "title": "Fed Chairman Warsh Speaks",
+                "country": "USD",
+                "date": "2026-11-13T14:00:00-05:00",
                 "impact": "High",
                 "forecast": "",
                 "previous": "",
@@ -563,35 +571,52 @@ def test_economic_calendar_tier_classification_and_blackouts(tmp_path):
             },
         ]
     )
-    assert count == 4
+    assert count == 5
     tiers = {ev.title: ev.tier for ev in cal.events}
     assert tiers["CPI m/m"] == 1
     assert tiers["FOMC Statement"] == 1
+    assert tiers["Fed Chairman Warsh Speaks"] == 1
     assert tiers["Prelim UoM Consumer Sentiment"] == 2
     assert tiers["ECB President Lagarde Speaks"] == 0
 
-    # Tier-1 FOMC window: 13:45 - 14:30 ET
-    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-11 13:44:00-05:00")) == (False, "")
-    in_b, reason = cal.is_in_news_blackout(pd.Timestamp("2026-11-11 13:45:00-05:00"))
+    # Tier-1 FOMC window: 13:50 - 14:10 ET (-10m / +10m)
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-11 13:49:00-05:00")) == (False, "")
+    in_b, reason = cal.is_in_news_blackout(pd.Timestamp("2026-11-11 13:50:00-05:00"))
     assert in_b and "Tier-1" in reason and "FOMC Statement" in reason
-    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-11 14:30:00-05:00"))[0] is True
-    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-11 14:31:00-05:00")) == (False, "")
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-11 14:10:00-05:00"))[0] is True
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-11 14:11:00-05:00")) == (False, "")
 
-    # Tier-2 window: 10:20 - 10:45 ET
-    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:19:00-05:00"))[0] is False
-    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:20:00-05:00"))[0] is True
-    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:45:00-05:00"))[0] is True
-    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:46:00-05:00"))[0] is False
+    # Tier-2 window: 10:25 - 10:35 ET (-5m / +5m)
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:24:00-05:00"))[0] is False
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:25:00-05:00"))[0] is True
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:35:00-05:00"))[0] is True
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:36:00-05:00"))[0] is False
 
     # Non-USD Medium does not block
     assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:15:00-05:00"))[0] is False
+
+    # Daily CET schedule, Discord formatter, and ForexFactory-style PNG table renderer
+    nov13_events = cal.get_events_for_cet_date(date(2026, 11, 13))
+    assert len(nov13_events) == 3
+    title, desc = cal.format_daily_discord_message(date(2026, 11, 13), nov13_events)
+    assert "09:00 CET" in title
+    assert "Prelim UoM Consumer Sentiment" in desc
+    assert "Fed Chairman Warsh Speaks" in desc
+    img_bytes = cal.render_daily_calendar_image(date(2026, 11, 13), nov13_events)
+    assert img_bytes is not None and img_bytes.startswith(b"\x89PNG")
 
     # Report export verification
     import json
     report_file = tmp_path / "ff_report.json"
     cal.export_report_json(str(report_file))
     exported = json.loads(report_file.read_text(encoding="utf-8"))
-    assert len(exported["events"]) == 4
+    assert len(exported["events"]) == 5
+    assert exported["rules"] == {
+        "tier1_pre_mins": 10,
+        "tier1_post_mins": 10,
+        "tier2_pre_mins": 5,
+        "tier2_post_mins": 5,
+    }
     assert exported["events"][0]["time_et"] == "08:30"
     assert exported["events"][0]["time_cet"] == "14:30"
 
