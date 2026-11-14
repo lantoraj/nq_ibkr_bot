@@ -166,6 +166,17 @@ class Backtester:
                 exit_reason = ""
                 one_r = active_signal.stop_distance_points
                 bars_held = i - active_entry_idx
+                sig_et = pd.Timestamp(active_signal.timestamp)
+                sig_et = (
+                    sig_et.tz_localize(self.cfg.risk.timezone)
+                    if sig_et.tzinfo is None
+                    else sig_et.tz_convert(self.cfg.risk.timezone)
+                )
+                be_r = (
+                    getattr(self.cfg.risk, "premarket_breakeven_r", 1.0)
+                    if sig_et.strftime("%H:%M") < "09:30"
+                    else 1.0
+                )
 
                 if active_signal.direction == "LONG":
                     if low_p <= active_stop_loss:
@@ -184,13 +195,12 @@ class Backtester:
                     elif (
                         self.cfg.risk.breakeven_at_1r
                         and not be_moved
-                        and high_p >= active_entry_price + one_r
+                        and high_p >= active_entry_price + be_r * one_r
                     ):
-                        active_stop_loss = max(
-                            active_stop_loss,
-                            round_to_tick(active_entry_price + self.cfg.risk.breakeven_offset_points),
-                        )
-                        be_moved = True
+                        new_sl = round_to_tick(active_entry_price + self.cfg.risk.breakeven_offset_points)
+                        if close_p > new_sl:
+                            active_stop_loss = max(active_stop_loss, new_sl)
+                            be_moved = True
                     elif (
                         self.cfg.risk.time_decay_bars > 0
                         and not be_moved
@@ -200,7 +210,7 @@ class Backtester:
                         decayed_stop = round_to_tick(
                             active_entry_price - self.cfg.risk.time_decay_stop_r * one_r
                         )
-                        if low_p > decayed_stop and decayed_stop > active_stop_loss:
+                        if low_p > decayed_stop and close_p > decayed_stop and decayed_stop > active_stop_loss:
                             active_stop_loss = decayed_stop
                             decay_moved = True
                 else:  # SHORT
@@ -220,13 +230,12 @@ class Backtester:
                     elif (
                         self.cfg.risk.breakeven_at_1r
                         and not be_moved
-                        and low_p <= active_entry_price - one_r
+                        and low_p <= active_entry_price - be_r * one_r
                     ):
-                        active_stop_loss = min(
-                            active_stop_loss,
-                            round_to_tick(active_entry_price - self.cfg.risk.breakeven_offset_points),
-                        )
-                        be_moved = True
+                        new_sl = round_to_tick(active_entry_price - self.cfg.risk.breakeven_offset_points)
+                        if close_p < new_sl:
+                            active_stop_loss = min(active_stop_loss, new_sl)
+                            be_moved = True
                     elif (
                         self.cfg.risk.time_decay_bars > 0
                         and not be_moved
@@ -236,7 +245,7 @@ class Backtester:
                         decayed_stop = round_to_tick(
                             active_entry_price + self.cfg.risk.time_decay_stop_r * one_r
                         )
-                        if high_p < decayed_stop and decayed_stop < active_stop_loss:
+                        if high_p < decayed_stop and close_p < decayed_stop and decayed_stop < active_stop_loss:
                             active_stop_loss = decayed_stop
                             decay_moved = True
 

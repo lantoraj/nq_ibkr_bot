@@ -286,7 +286,11 @@ class NQIntradayStrategy:
         if signal_dir is None:
             return None
 
-        meta_prob = 1.0
+        meta_prob = self.compute_meta_probability(
+            signal_dir, kalman_vel_atr, hurst, body_ratio, vwap_z
+        )
+        if getattr(self.s_cfg, "use_quant_meta_filter", False) and meta_prob < self.s_cfg.min_meta_probability:
+            return None
 
         # 5. Calculate Stop Loss & Take Profit levels rounded to NQ 0.25 tick increments
         raw_stop_dist = (
@@ -294,10 +298,14 @@ class NQIntradayStrategy:
             if self.r_cfg.stop_mode == "atr"
             else self.r_cfg.fixed_stop_points
         )
-        stop_dist = max(self.r_cfg.min_stop_points, min(self.r_cfg.max_stop_points, round_to_tick(raw_stop_dist)))
-        tp_dist = round_to_tick(stop_dist * self.r_cfg.reward_risk_ratio)
-
         tick = self.c_cfg.tick_size
+        stop_dist = max(self.r_cfg.min_stop_points, min(self.r_cfg.max_stop_points, round_to_tick(raw_stop_dist, tick)))
+        rr_ratio = (
+            getattr(self.r_cfg, "premarket_reward_risk_ratio", self.r_cfg.reward_risk_ratio)
+            if hm < "09:30"
+            else self.r_cfg.reward_risk_ratio
+        )
+        tp_dist = round_to_tick(stop_dist * rr_ratio, tick)
         entry_price = round_to_tick(close_p, tick)
 
         if signal_dir == "LONG":

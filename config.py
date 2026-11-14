@@ -8,7 +8,7 @@ of real IBKR Continuous MNQ futures data (July 27 - Oct 27, 2026), achieving:
 """
 from dataclasses import dataclass, field
 import os
-from typing import Literal
+from typing import Literal, Tuple
 
 
 @dataclass
@@ -123,7 +123,9 @@ class RiskConfig:
     min_stop_points: float = 8.0          # Floor on stop distance (32 ticks)
     max_stop_points: float = 40.0         # Cap on stop distance (160 ticks)
     reward_risk_ratio: float = 3.0        # Take Profit distance = 3.0 * Stop distance
-    breakeven_at_1r: bool = True          # Automatically move Stop Loss to Entry + 2.0 pts once +1R is reached
+    premarket_reward_risk_ratio: float = 2.0  # +2.0R Take Profit for Pre-Market (< 09:30 ET)
+    breakeven_at_1r: bool = True          # Automatically move Stop Loss to Entry + 2.0 pts once BE trigger is reached
+    premarket_breakeven_r: float = 0.80   # Lock +2.0 pt Break-Even at +0.80R in Pre-Market (< 09:30 ET)
     breakeven_offset_points: float = 2.0  # Points locked in when break-even triggers (covers commission + slippage + $2.26 net on MNQ)
 
     # v4 Time-Decay Stop Tightening (Ornstein-Uhlenbeck Stagnation Decay)
@@ -138,17 +140,21 @@ class RiskConfig:
 
     # Trading session window (America/New_York - US Eastern Time)
     # Dual-Session Mode:
-    #   1) European Pre-Market Session: 04:00 - 06:00 ET (Trend + V-Reversal), 06:00 - 08:20 ET (V-Reversal only)
-    #   2) US Regular Trading Hours (RTH): 09:45 - 15:30 ET (VWAP re-anchored at 09:30 ET Cash Open)
+    #   1) European Pre-Market Session: 04:00 - 05:00 ET (London Open 1st-Hour Scalp, 2.0R TP, 0.8R BE)
+    #   2) US Regular Trading Hours (RTH): 09:45 - 14:58 ET (excluding 10:00-10:14 macro & 11:30-11:58 EU close chop)
     timezone: str = "America/New_York"
     rth_only: bool = False                # False = stream ETH+RTH bars and set outsideRth=True on orders
     use_premarket_session: bool = True    # Enable European Pre-Market trading window
     premarket_start_time: str = "04:00"   # 10:00 CET (European Cash Open)
-    premarket_trend_end_time: str = "06:00"  # 12:00 CET (End of standard trend entries before EU lunch chop; 06:00-08:20 ET = V-Reversal only)
+    premarket_trend_end_time: str = "05:00"  # 11:00 CET (1st hour of EU Cash Open before chop; 05:00-08:20 ET = V-Reversal only)
     premarket_end_time: str = "08:20"     # 14:20 CET (Stop 10m before 08:30 ET US macro news releases)
     premarket_max_trades: int = 2         # Dedicated Pre-Market trade cap (does not reduce RTH trade cap)
     entry_start_time: str = "09:45"       # Enter US RTH after 15-min Opening Range settles (15:45 CET)
-    entry_end_time: str = "15:30"         # Extended RTH entry window to 15:30 ET (21:30 CET)
+    entry_end_time: str = "14:58"         # End RTH entries before toxic 15:00-15:30 ET MOC chop
+    rth_blackout_windows: Tuple[Tuple[str, str], ...] = (
+        ("10:00", "10:14"),               # US 10:00 ET macro data release whipsaw
+        ("11:30", "11:58"),               # European Cash Close liquidity drain whipsaw
+    )
     flatten_eod_time: str = "15:55"       # Force flatten all open positions and cancel orders (21:55 CET)
 
 

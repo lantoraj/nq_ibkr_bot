@@ -24,6 +24,8 @@ class DailyRiskState:
     """Tracks live or simulated intraday risk metrics for a single trading session (Pre-Market + RTH)."""
     session_date: Optional[date] = None
     realized_pnl_usd: float = 0.0
+    premarket_realized_pnl_usd: float = 0.0
+    rth_realized_pnl_usd: float = 0.0
     trades_taken: int = 0
     premarket_trades_taken: int = 0
     premarket_vrev_trades_taken: int = 0
@@ -54,6 +56,8 @@ class RiskManager:
         self._entry_start = self._parse_hhmm(self.r_cfg.entry_start_time)
         self._entry_end = self._parse_hhmm(self.r_cfg.entry_end_time)
         self._flatten_time = self._parse_hhmm(self.r_cfg.flatten_eod_time)
+        blackouts = getattr(self.r_cfg, "rth_blackout_windows", ())
+        self._rth_blackouts = [(self._parse_hhmm(s), self._parse_hhmm(e)) for s, e in blackouts]
 
     @staticmethod
     def _parse_hhmm(hhmm: str) -> time:
@@ -86,9 +90,9 @@ class RiskManager:
             if not self.state.rth_reset_done and t >= time(9, 30):
                 self.state.rth_reset_done = True
                 self.state.consecutive_losses = 0
-                if self.state.halted and self.state.realized_pnl_usd > -abs(self.r_cfg.max_daily_loss_usd):
-                    self.state.halted = False
-                    self.state.halt_reason = ""
+                # Unconditionally clear any Pre-Market halt so RTH starts with its own isolated daily loss budget
+                self.state.halted = False
+                self.state.halt_reason = ""
 
     def should_flatten_eod(self, ts: pd.Timestamp) -> bool:
         """Return True if current time is at Pre-Market close (09:24-09:29 ET) or EOD flatten time (15:55-17:00 ET)."""
@@ -127,21 +131,35 @@ class RiskManager:
         if not self.is_within_entry_window(ts):
             return False, "Outside allowed RTH / Premarket entry time window"
 
-        if self.state.realized_pnl_usd <= -abs(self.r_cfg.max_daily_loss_usd):
+        if not self.state.in_premarket_phase:
+            local_t = self._to_session_dt(ts).time()
+            for b_start, b_end in self._rth_blackouts:
+                if b_start <= local_t <= b_end:
+                    return (
+                        False,
+                        f"Inside RTH volatility blackout window ({b_start.strftime('%H:%M')}–{b_end.strftime('%H:%M')} ET)",
+                    )
+
+        active_session_pnl = (
+            self.state.premarket_realized_pnl_usd
+            if self.state.in_premarket_phase
+            else self.state.rth_realized_pnl_usd
+        )
+        if active_session_pnl <= -abs(self.r_cfg.max_daily_loss_usd):
+            session_label = "Pre-Market" if self.state.in_premarket_phase else "RTH"
             self.state.halted = True
             self.state.halt_reason = (
-                f"Max daily loss reached (${self.state.realized_pnl_usd:.2f} <= -${self.r_cfg.max_daily_loss_usd:.2f})"
+                f"Max {session_label} daily loss reached (${active_session_pnl:.2f} <= -${self.r_cfg.max_daily_loss_usd:.2f})"
             )
             return False, self.state.halt_reason
 
         if self.state.in_premarket_phase:
-            if self.state.in_vrev_phase:
-                if self.state.premarket_vrev_trades_taken >= 1:
-                    return False, "Max pre-market V-Reversal trades reached (1/1)"
-            else:
-                pm_max = getattr(self.r_cfg, "premarket_max_trades", 2)
-                if self.state.premarket_trades_taken >= pm_max:
-                    return False, f"Max pre-market trades reached ({self.state.premarket_trades_taken}/{pm_max})"
+            pm_max = getattr(self.r_cfg, "premarket_max_trades", 2)
+            total_pm = self.state.premarket_trades_taken + self.state.premarket_vrev_trades_taken
+            if total_pm >= pm_max:
+                return False, f"Max pre-market trades reached ({total_pm}/{pm_max})"
+            if self.state.in_vrev_phase and self.state.premarket_vrev_trades_taken >= 1:
+                return False, "Max pre-market V-Reversal trades reached (1/1)"
         else:
             if self.state.rth_trades_taken >= self.r_cfg.max_daily_trades:
                 return False, f"Max daily trades reached ({self.state.rth_trades_taken}/{self.r_cfg.max_daily_trades})"
@@ -181,8 +199,10 @@ class RiskManager:
                 self.state.premarket_vrev_trades_taken += 1
             else:
                 self.state.premarket_trades_taken += 1
+            self.state.premarket_realized_pnl_usd += net_pnl_usd
         else:
             self.state.rth_trades_taken += 1
+            self.state.rth_realized_pnl_usd += net_pnl_usd
         self.state.realized_pnl_usd += net_pnl_usd
         self.state.last_exit_bar_index = exit_bar_index
 
@@ -193,10 +213,16 @@ class RiskManager:
             self.state.wins += 1
             self.state.consecutive_losses = 0
 
-        if self.state.realized_pnl_usd <= -abs(self.r_cfg.max_daily_loss_usd):
+        active_session_pnl = (
+            self.state.premarket_realized_pnl_usd
+            if self.state.in_premarket_phase
+            else self.state.rth_realized_pnl_usd
+        )
+        if active_session_pnl <= -abs(self.r_cfg.max_daily_loss_usd):
+            session_label = "Pre-Market" if self.state.in_premarket_phase else "RTH"
             self.state.halted = True
             self.state.halt_reason = (
-                f"Max daily loss breached (${self.state.realized_pnl_usd:.2f})"
+                f"Max {session_label} daily loss breached (${active_session_pnl:.2f})"
             )
         elif self.state.consecutive_losses >= self.r_cfg.max_consecutive_losses:
             self.state.halted = True

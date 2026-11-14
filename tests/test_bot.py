@@ -336,7 +336,7 @@ def test_tradingview_hybrid_feed_and_dataframe_bars() -> None:
 
 
 def test_v41_adaptive_volatility_gate_and_premarket_cutoff() -> None:
-    """Verify simplified v4.1 2-setup engine (enable_v_reversal=False, min_atr=22.0 RTH / 16.0 PM, BE=+2.0pt, decay=-0.40R) and premarket_trend_end_time='06:00'."""
+    """Verify v4.2 2-setup engine defaults, London Open PM scalp settings, and RTH blackout windows."""
     cfg = BotConfig()
     assert cfg.strategy.max_crossover_atr == 0.0
     assert cfg.strategy.use_quant_meta_filter is False
@@ -345,7 +345,147 @@ def test_v41_adaptive_volatility_gate_and_premarket_cutoff() -> None:
     assert cfg.strategy.premarket_min_atr_points == 16.0
     assert cfg.risk.breakeven_offset_points == 2.0
     assert cfg.risk.time_decay_stop_r == 0.40
-    assert cfg.risk.premarket_trend_end_time == "06:00"
+    assert cfg.risk.premarket_trend_end_time == "05:00"
+    assert cfg.risk.premarket_reward_risk_ratio == 2.0
+    assert cfg.risk.premarket_breakeven_r == 0.80
+    assert cfg.risk.entry_end_time == "14:58"
+    assert cfg.risk.rth_blackout_windows == (("10:00", "10:14"), ("11:30", "11:58"))
+
+
+def test_v42_blackouts_session_risk_isolation_and_marketable_be_guard(tmp_path) -> None:
+    """Verify v4.2 blackouts, PM/RTH loss isolation, marketable BE stop guard, stale bar guard, and journal recovery."""
+    from types import SimpleNamespace
+    from ib_async import BarData, Future, StopOrder
+    from ibkr_execution import IBKRNQBotRunner
+    from strategy import TradeSignal
+    from trade_journal import TradeJournal
+
+    cfg = BotConfig()
+    cfg.risk.max_daily_loss_usd = 250.0
+    rm = RiskManager(cfg.risk, cfg.contract)
+
+    # 1. RTH Blackout windows & 14:58 cutoff
+    allowed_macro, reason_macro = rm.can_open_trade(pd.Timestamp("2026-11-13 10:05:00", tz="America/New_York"), 10)
+    assert not allowed_macro and "blackout" in reason_macro.lower()
+    allowed_eu, reason_eu = rm.can_open_trade(pd.Timestamp("2026-11-13 11:50:00", tz="America/New_York"), 15)
+    assert not allowed_eu and "blackout" in reason_eu.lower()
+    allowed_moc, _ = rm.can_open_trade(pd.Timestamp("2026-11-13 15:00:00", tz="America/New_York"), 20)
+    assert not allowed_moc
+    allowed_ok, _ = rm.can_open_trade(pd.Timestamp("2026-11-13 10:30:00", tz="America/New_York"), 25)
+    assert allowed_ok
+
+    # 2. Pre-Market losses do NOT eat into RTH daily loss budget or keep RTH halted after 09:30 ET
+    rm_iso = RiskManager(cfg.risk, cfg.contract)
+    rm_iso.can_open_trade(pd.Timestamp("2026-11-13 04:20:00", tz="America/New_York"), 5)
+    rm_iso.record_trade_closed(-260.0, exit_bar_index=6)
+    assert rm_iso.state.halted
+    allowed_rth_fresh, _ = rm_iso.can_open_trade(pd.Timestamp("2026-11-13 09:46:00", tz="America/New_York"), 50)
+    assert allowed_rth_fresh
+    assert not rm_iso.state.halted
+    assert rm_iso.state.rth_realized_pnl_usd == 0.0
+    assert rm_iso.state.premarket_realized_pnl_usd == -260.0
+
+    # 3. Bug #1 fix: Intra-bar +1R touch followed by reversal past BE stop must NOT submit marketable BUY STOP
+    runner = IBKRNQBotRunner(cfg, mode="paper")
+    runner.journal = TradeJournal(base_dir=str(tmp_path / "j"), timezone="America/New_York")
+    runner.contract = Future(conId=815824267, symbol="MNQ", localSymbol="MNQZ6", multiplier="2", exchange="CME", currency="USD")
+    runner.strategy.prepare_dataframe = lambda d: pd.DataFrame(
+        {
+            "timestamp": d["timestamp"],
+            "open": d["open"],
+            "high": d["high"],
+            "low": d["low"],
+            "close": d["close"],
+            "volume": d["volume"],
+            "vwap": d["close"],
+            "ema_fast": d["close"],
+            "ema_slow": d["close"],
+            "ema_trend": d["close"],
+            "vwap_z": 0.5,
+            "hurst": 0.5,
+            "kalman_vel_atr": 0.0,
+            "atr": 25.0,
+            "rsi": 50.0,
+            "vol_ratio": 1.0,
+            "ema_spread_atr": 0.2,
+            "slow_slope_atr": 0.05,
+            "body_ratio": 0.5,
+            "upper_wick_ratio": 0.1,
+            "lower_wick_ratio": 0.1,
+            "prev_3_high": d["high"],
+            "prev_3_low": d["low"],
+            "orb_high": float("nan"),
+            "orb_low": float("nan"),
+            "pdh": float("nan"),
+            "pdl": float("nan"),
+            "roll_vwap_z_max": 0.5,
+            "roll_vwap_z_min": 0.5,
+        }
+    )
+
+    placed = []
+    runner.ib.placeOrder = lambda contract, order: placed.append(order) or SimpleNamespace(order=order)
+    runner.ib.positions = lambda: [SimpleNamespace(contract=runner.contract, position=-1.0)]
+    stp = StopOrder(action="BUY", totalQuantity=1, stopPrice=27776.25)
+    runner.ib.openTrades = lambda: [
+        SimpleNamespace(contract=runner.contract, order=stp, orderStatus=SimpleNamespace(status="Submitted"))
+    ]
+    runner._active_stop_order = stp
+    runner._trade_entry_price = 27736.00
+    runner._trade_direction = "SHORT"
+    runner._trade_initial_sl = 27776.25
+    runner._trade_filled_ts_utc = pd.Timestamp("2026-11-13 16:14:00", tz="UTC")
+    runner._active_signal = TradeSignal(
+        timestamp=pd.Timestamp("2026-11-13 16:14:00", tz="UTC"),
+        direction="SHORT",
+        reason="Bearish Pullback",
+        entry_price=27736.00,
+        stop_loss=27776.25,
+        take_profit=27616.25,
+        stop_distance_points=40.0,
+        atr=35.0,
+        rsi=45.0,
+        vwap=27750.0,
+        ema_fast=27740.0,
+        ema_slow=27750.0,
+    )
+
+    # Wicked to 27695.75 (+1R touched) but closed at 27760.25 (> BE stop 27734.00) -> must defer BE!
+    bar_df = pd.DataFrame(
+        {
+            "timestamp": [
+                pd.Timestamp("2026-11-13 16:20:00", tz="UTC"),
+                pd.Timestamp("2026-11-13 16:22:00", tz="UTC"),
+            ],
+            "open": [27735.0, 27720.0],
+            "high": [27740.0, 27762.0],
+            "low": [27718.0, 27695.75],
+            "close": [27720.0, 27760.25],
+            "volume": [1000, 1500],
+        }
+    )
+    # Note: _bars_to_dataframe treats DataFrame rows with ts + 2m <= now as closed (16:22 UTC is in the past)
+    runner._on_bar_update(bar_df, has_new_bar=True)
+    assert not runner._be_moved
+    assert stp.auxPrice == 27776.25
+    assert len(placed) == 0
+
+    # Stale out-of-order bar check (older timestamp must be ignored)
+    prev_count = runner.bar_count
+    stale_df = bar_df.iloc[:1].copy()
+    runner._on_bar_update(stale_df, has_new_bar=True)
+    assert runner.bar_count == prev_count
+
+    # 4. Journal state recovery across container restart
+    now_utc = pd.Timestamp.now(tz="UTC")
+    j_recover = TradeJournal(base_dir=str(tmp_path / "j_rec"), timezone="America/New_York")
+    j_recover.log("trade_closed", bar_ts=now_utc, direction="LONG", net_pnl_usd=-120.0)
+    runner2 = IBKRNQBotRunner(cfg, mode="paper")
+    runner2.journal = j_recover
+    runner2._restore_daily_risk_state()
+    assert runner2.risk.state.trades_taken == 1
+    assert runner2.risk.state.realized_pnl_usd == -120.0
+    assert runner2.risk.state.consecutive_losses == 1
 
 
 def test_trade_journal_and_reconcile(tmp_path) -> None:

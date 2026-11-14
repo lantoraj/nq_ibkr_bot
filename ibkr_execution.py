@@ -38,7 +38,7 @@ from ib_async.objects import UNSET_DOUBLE
 from config import BotConfig
 from risk_manager import RiskManager
 from strategy import NQIntradayStrategy, TradeSignal
-from trade_journal import TradeJournal
+from trade_journal import TradeJournal, load_journal
 from tv_data_feed import TradingViewDataFeed
 
 logger = logging.getLogger("nq_ibkr_bot")
@@ -775,13 +775,20 @@ class IBKRNQBotRunner:
         )
         icon = "🟢 LONG ORDER SUBMITTED" if signal.direction == "LONG" else "🔴 SHORT ORDER SUBMITTED"
         color = 0x2ECC71 if signal.direction == "LONG" else 0xE74C3C
+        sig_et = pd.Timestamp(signal.timestamp)
+        sig_et = sig_et.tz_localize(self.cfg.risk.timezone) if sig_et.tzinfo is None else sig_et.tz_convert(self.cfg.risk.timezone)
+        rr_disp = (
+            getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+            if sig_et.strftime("%H:%M") < "09:30"
+            else self.cfg.risk.reward_risk_ratio
+        )
         self._send_discord_alert(
             title=f"{icon} — {action} {quantity} {self.contract.localSymbol} @ {signal.entry_price:.2f}",
             description=(
                 f"**Mode:** `{self.mode.upper()}`\n"
                 f"**Entry Price:** `{signal.entry_price:.2f}`\n"
                 f"**Stop Loss (`-1R`):** `{signal.stop_loss:.2f}`\n"
-                f"**Take Profit (`+3R`):** `{signal.take_profit:.2f}`\n"
+                f"**Take Profit (`+{rr_disp:.2g}R`):** `{signal.take_profit:.2f}`\n"
                 f"**Signal Setup:** {signal.reason}\n"
                 f"_Stop-Limit collar order working — a separate ✅ FILLED alert follows if executed, "
                 f"or ⚪ CANCELLED after {self.cfg.risk.cancel_unfilled_entry_bars} bars._"
@@ -828,7 +835,7 @@ class IBKRNQBotRunner:
             return
 
         latest_closed_ts = pd.Timestamp(df.iloc[-1]["timestamp"])
-        if self._last_processed_bar_time == latest_closed_ts:
+        if self._last_processed_bar_time is not None and latest_closed_ts <= self._last_processed_bar_time:
             return
         self._last_processed_bar_time = latest_closed_ts
         self.bar_count += 1
@@ -1012,38 +1019,64 @@ class IBKRNQBotRunner:
                 high_p = float(latest_bar["high"])
                 low_p = float(latest_bar["low"])
                 sig = self._active_signal
+                entry_ref = float(self._trade_entry_price or sig.entry_price)
                 one_r = sig.stop_distance_points
+                sig_et = pd.Timestamp(sig.timestamp)
+                sig_et = (
+                    sig_et.tz_localize(self.cfg.risk.timezone)
+                    if sig_et.tzinfo is None
+                    else sig_et.tz_convert(self.cfg.risk.timezone)
+                )
+                be_r = (
+                    getattr(self.cfg.risk, "premarket_breakeven_r", 1.0)
+                    if sig_et.strftime("%H:%M") < "09:30"
+                    else 1.0
+                )
 
-                if sig.direction == "LONG" and high_p >= sig.entry_price + one_r:
-                    new_sl = round_to_tick(sig.entry_price + self.cfg.risk.breakeven_offset_points)
-                    if new_sl > self._active_stop_order.auxPrice:
+                if sig.direction == "LONG" and high_p >= entry_ref + be_r * one_r:
+                    new_sl = round_to_tick(entry_ref + self.cfg.risk.breakeven_offset_points)
+                    if close_p <= new_sl + 0.50:
+                        logger.warning(
+                            "BE trigger reached (+%.2fR) intra-bar for LONG, but close %.2f <= BE stop %.2f + 0.50; deferring stop move to avoid instant marketable loss order.",
+                            be_r,
+                            close_p,
+                            new_sl,
+                        )
+                    elif new_sl > self._active_stop_order.auxPrice:
                         self._active_stop_order.auxPrice = new_sl
                         self._active_stop_order.cashQty = UNSET_DOUBLE
                         self._active_stop_order.overridePercentageConstraints = True
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
                         self._record_stop_level(new_sl, "breakeven")
-                        self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="breakeven", direction="LONG", new_stop=new_sl, entry_price=sig.entry_price)
-                        logger.info("Moved LONG StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
+                        self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="breakeven", direction="LONG", new_stop=new_sl, entry_price=entry_ref)
+                        logger.info("Moved LONG StopOrder to Break-Even+ (%.2f) after reaching +%.2fR", new_sl, be_r)
                         self._send_discord_alert(
-                            title=f"🛡️ BREAK-EVEN (+1R) LOCKED — {self.contract.localSymbol} LONG",
-                            description=f"Moved Stop Loss up to **`{new_sl:.2f}`** (`+{self.cfg.risk.breakeven_offset_points:.1f} pts` above entry `{sig.entry_price:.2f}`).",
+                            title=f"🛡️ BREAK-EVEN (+{be_r:.2g}R) LOCKED — {self.contract.localSymbol} LONG",
+                            description=f"Moved Stop Loss up to **`{new_sl:.2f}`** (`+{self.cfg.risk.breakeven_offset_points:.1f} pts` above entry `{entry_ref:.2f}`).",
                             color=0xF1C40F,
                         )
-                elif sig.direction == "SHORT" and low_p <= sig.entry_price - one_r:
-                    new_sl = round_to_tick(sig.entry_price - self.cfg.risk.breakeven_offset_points)
-                    if new_sl < self._active_stop_order.auxPrice:
+                elif sig.direction == "SHORT" and low_p <= entry_ref - be_r * one_r:
+                    new_sl = round_to_tick(entry_ref - self.cfg.risk.breakeven_offset_points)
+                    if close_p >= new_sl - 0.50:
+                        logger.warning(
+                            "BE trigger reached (+%.2fR) intra-bar for SHORT, but close %.2f >= BE stop %.2f - 0.50; deferring stop move to avoid instant marketable loss order.",
+                            be_r,
+                            close_p,
+                            new_sl,
+                        )
+                    elif new_sl < self._active_stop_order.auxPrice:
                         self._active_stop_order.auxPrice = new_sl
                         self._active_stop_order.cashQty = UNSET_DOUBLE
                         self._active_stop_order.overridePercentageConstraints = True
                         self.ib.placeOrder(self.contract, self._active_stop_order)
                         self._be_moved = True
                         self._record_stop_level(new_sl, "breakeven")
-                        self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="breakeven", direction="SHORT", new_stop=new_sl, entry_price=sig.entry_price)
-                        logger.info("Moved SHORT StopOrder to Break-Even+ (%.2f) after reaching +1R", new_sl)
+                        self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="breakeven", direction="SHORT", new_stop=new_sl, entry_price=entry_ref)
+                        logger.info("Moved SHORT StopOrder to Break-Even+ (%.2f) after reaching +%.2fR", new_sl, be_r)
                         self._send_discord_alert(
-                            title=f"🛡️ BREAK-EVEN (+1R) LOCKED — {self.contract.localSymbol} SHORT",
-                            description=f"Moved Stop Loss down to **`{new_sl:.2f}`** (`-{self.cfg.risk.breakeven_offset_points:.1f} pts` below entry `{sig.entry_price:.2f}`).",
+                            title=f"🛡️ BREAK-EVEN (+{be_r:.2g}R) LOCKED — {self.contract.localSymbol} SHORT",
+                            description=f"Moved Stop Loss down to **`{new_sl:.2f}`** (`-{self.cfg.risk.breakeven_offset_points:.1f} pts` below entry `{entry_ref:.2f}`).",
                             color=0xF1C40F,
                         )
                 elif (
@@ -1052,35 +1085,35 @@ class IBKRNQBotRunner:
                     and self._post_fill_bars >= self.cfg.risk.time_decay_bars
                 ):
                     if sig.direction == "LONG":
-                        dec_sl = round_to_tick(sig.entry_price - self.cfg.risk.time_decay_stop_r * one_r)
-                        if low_p > dec_sl and dec_sl > self._active_stop_order.auxPrice:
+                        dec_sl = round_to_tick(entry_ref - self.cfg.risk.time_decay_stop_r * one_r)
+                        if low_p > dec_sl and close_p > dec_sl + 0.50 and dec_sl > self._active_stop_order.auxPrice:
                             self._active_stop_order.auxPrice = dec_sl
                             self._active_stop_order.cashQty = UNSET_DOUBLE
                             self._active_stop_order.overridePercentageConstraints = True
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
                             self._record_stop_level(dec_sl, "time_decay")
-                            self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="LONG", new_stop=dec_sl, entry_price=sig.entry_price)
+                            self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="LONG", new_stop=dec_sl, entry_price=entry_ref)
                             logger.info("Time-Decay Stop Tightening: Moved LONG StopOrder to -%.2fR (%.2f)", self.cfg.risk.time_decay_stop_r, dec_sl)
                             self._send_discord_alert(
                                 title=f"⏳ TIME-DECAY STOP (-{self.cfg.risk.time_decay_stop_r:.2f}R) — {self.contract.localSymbol} LONG",
-                                description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after `{self.cfg.risk.time_decay_bars}` post-entry bars without reaching `+1R`.",
+                                description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after `{self.cfg.risk.time_decay_bars}` post-entry bars without reaching Break-Even trigger.",
                                 color=0xE67E22,
                             )
                     else:
-                        dec_sl = round_to_tick(sig.entry_price + self.cfg.risk.time_decay_stop_r * one_r)
-                        if high_p < dec_sl and dec_sl < self._active_stop_order.auxPrice:
+                        dec_sl = round_to_tick(entry_ref + self.cfg.risk.time_decay_stop_r * one_r)
+                        if high_p < dec_sl and close_p < dec_sl - 0.50 and dec_sl < self._active_stop_order.auxPrice:
                             self._active_stop_order.auxPrice = dec_sl
                             self._active_stop_order.cashQty = UNSET_DOUBLE
                             self._active_stop_order.overridePercentageConstraints = True
                             self.ib.placeOrder(self.contract, self._active_stop_order)
                             self._decay_moved = True
                             self._record_stop_level(dec_sl, "time_decay")
-                            self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="SHORT", new_stop=dec_sl, entry_price=sig.entry_price)
+                            self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="SHORT", new_stop=dec_sl, entry_price=entry_ref)
                             logger.info("Time-Decay Stop Tightening: Moved SHORT StopOrder to -%.2fR (%.2f)", self.cfg.risk.time_decay_stop_r, dec_sl)
                             self._send_discord_alert(
                                 title=f"⏳ TIME-DECAY STOP (-{self.cfg.risk.time_decay_stop_r:.2f}R) — {self.contract.localSymbol} SHORT",
-                                description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after `{self.cfg.risk.time_decay_bars}` post-entry bars without reaching `+1R`.",
+                                description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after `{self.cfg.risk.time_decay_bars}` post-entry bars without reaching Break-Even trigger.",
                                 color=0xE67E22,
                             )
             return
@@ -1278,10 +1311,21 @@ class IBKRNQBotRunner:
             else pd.Timestamp.now(tz="UTC")
         )
 
-        # If actual fill price differs from signal entry price by >= 0.50 pts, dynamically re-anchor SL and TP
-        if sig is not None and abs(fill_p - sig.entry_price) >= 0.50:
+        # If actual fill price differs from signal entry price by >= 0.25 pts (1 tick), dynamically re-anchor SL and TP
+        if sig is not None and abs(fill_p - sig.entry_price) >= 0.25:
             one_r = sig.stop_distance_points
-            three_r = round_to_tick(one_r * self.cfg.risk.reward_risk_ratio, self.cfg.contract.tick_size)
+            sig_et = pd.Timestamp(sig.timestamp)
+            sig_et = (
+                sig_et.tz_localize(self.cfg.risk.timezone)
+                if sig_et.tzinfo is None
+                else sig_et.tz_convert(self.cfg.risk.timezone)
+            )
+            rr_ratio = (
+                getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+                if sig_et.strftime("%H:%M") < "09:30"
+                else self.cfg.risk.reward_risk_ratio
+            )
+            three_r = round_to_tick(one_r * rr_ratio, self.cfg.contract.tick_size)
             if self._trade_direction == "LONG":
                 new_sl = round_to_tick(fill_p - one_r, self.cfg.contract.tick_size)
                 new_tp = round_to_tick(fill_p + three_r, self.cfg.contract.tick_size)
@@ -1346,6 +1390,48 @@ class IBKRNQBotRunner:
             description=desc,
             color=0x2ECC71 if e.side == "BOT" else 0xE74C3C,
         )
+
+    def _restore_daily_risk_state(self) -> None:
+        """Reconstruct today's DailyRiskState from the JSONL trade journal across container restarts."""
+        if not getattr(self.journal, "enabled", False):
+            return
+        try:
+            now_et = pd.Timestamp.now(tz=self.cfg.risk.timezone)
+            day_str = now_et.strftime("%Y-%m-%d")
+            events = load_journal(day_str, base_dir=str(self.journal.base_dir))
+            closed_events = [ev for ev in events if ev.get("event") == "trade_closed"]
+            self.risk.check_and_reset_session(now_et)
+            if not closed_events:
+                return
+            for ev in closed_events:
+                ts_raw = ev.get("exit_filled_utc") or ev.get("bar_ts") or ev.get("logged_at")
+                if not ts_raw:
+                    continue
+                ev_ts = pd.Timestamp(ts_raw)
+                ev_ts = ev_ts.tz_localize("UTC") if ev_ts.tzinfo is None else ev_ts.tz_convert("UTC")
+                self.risk.check_and_reset_session(ev_ts)
+                net_pnl = float(ev.get("net_pnl_usd", 0.0) or 0.0)
+                self.risk.record_trade_closed(
+                    net_pnl,
+                    exit_bar_index=-self.cfg.risk.cooldown_bars_after_exit,
+                )
+            # Refresh current session phase / RTH transition after replaying history
+            self.risk.check_and_reset_session(now_et)
+            st = self.risk.state
+            logger.info(
+                "Restored DailyRiskState from %s journal: trades=%d (PM=%d, RTH=%d) | PnL=$%+.2f (PM=$%+.2f, RTH=$%+.2f) | ConsecLosses=%d | Halted=%s",
+                day_str,
+                st.trades_taken,
+                st.premarket_trades_taken + st.premarket_vrev_trades_taken,
+                st.rth_trades_taken,
+                st.realized_pnl_usd,
+                st.premarket_realized_pnl_usd,
+                st.rth_realized_pnl_usd,
+                st.consecutive_losses,
+                st.halted,
+            )
+        except Exception as exc:
+            logger.warning("Failed to restore DailyRiskState from journal: %s", exc)
 
     def _recover_active_trade(self) -> None:
         """
@@ -1563,20 +1649,23 @@ class IBKRNQBotRunner:
             )
             self._sync_discord_webhook_profile()
             bot_name = getattr(self.cfg.ibkr, "discord_bot_name", "NQ Quant Bot (v4.1)")
+            pm_be = getattr(self.cfg.risk, "premarket_breakeven_r", 1.0)
+            pm_rr = getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
             self._send_discord_alert(
                 title=f"🤖 {bot_name} Online — {self.contract.localSymbol} ({self.mode.upper()})",
                 description=(
                     f"**Profile:** `{bot_name}`\n"
                     f"**Contract:** `{self.contract.localSymbol}` (Expiry `{self.contract.lastTradeDateOrContractMonth}` | `${self.cfg.contract.point_value:.0f}/pt`)\n"
                     f"**ATR Floor:** `RTH ≥ {self.cfg.strategy.min_atr_points:.0f} pts | Pre-Market ≥ {getattr(self.cfg.strategy, 'premarket_min_atr_points', self.cfg.strategy.min_atr_points):.0f} pts`\n"
-                    f"**Stop Rules:** `+1R → +{self.cfg.risk.breakeven_offset_points:.1f} pt BE | {self.cfg.risk.time_decay_bars}b → -{self.cfg.risk.time_decay_stop_r:.2f}R Decay`\n"
+                    f"**Stop & TP Rules:** `RTH: +1R → +{self.cfg.risk.breakeven_offset_points:.1f}pt BE / {self.cfg.risk.reward_risk_ratio:.1f}R TP | PM: +{pm_be:.2g}R BE / {pm_rr:.1f}R TP | {self.cfg.risk.time_decay_bars}b → -{self.cfg.risk.time_decay_stop_r:.2f}R Decay`\n"
                     f"**Data Feed:** `{feed_label}`\n"
                     f"**Timeframe:** `{self.cfg.strategy.bar_size}` | **Contracts:** `{self.cfg.risk.fixed_contracts}`\n"
                     f"**Session Windows:** {window_desc}"
                 ),
                 color=0x3498DB,
             )
-            # Process the latest closed historical bar immediately on startup
+            # Reconstruct today's intraday risk counters & re-attach any live position before processing closed bars
+            self._restore_daily_risk_state()
             self._recover_active_trade()
             if self.bars is not None and len(self.bars) > 0:
                 self._on_bar_update(self.bars, has_new_bar=True)
