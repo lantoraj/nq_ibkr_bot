@@ -459,32 +459,6 @@ class EconomicCalendar:
         else:
             lines.append("• None today")
 
-        lines.append("")
-        lines.append("**📋 Full Day Schedule (CET / ET):**")
-        impact_icon = {"high": "🟥", "medium": "🟧", "low": "🟨", "holiday": "⬜"}
-
-        if not events:
-            lines.append("_No economic releases scheduled for today._")
-        else:
-            for ev in events:
-                dt_cet = ev.dt_utc.astimezone(self.cet_tz)
-                ico = impact_icon.get(ev.impact.lower(), "▫️")
-                fc_parts = []
-                if ev.forecast:
-                    fc_parts.append(f"Fc `{ev.forecast}`")
-                if ev.previous:
-                    fc_parts.append(f"Pv `{ev.previous}`")
-                fc_txt = f" ({', '.join(fc_parts)})" if fc_parts else ""
-                tier_txt = f" **[T{ev.tier} BLACKOUT]**" if ev.tier in (1, 2) else ""
-                entry_line = (
-                    f"{ico} `{dt_cet.strftime('%H:%M')} CET` (`{ev.dt_et.strftime('%H:%M')} ET`) "
-                    f"**{ev.country}** · {ev.title}{fc_txt}{tier_txt}"
-                )
-                if sum(len(x) + 1 for x in lines) + len(entry_line) > 3750:
-                    lines.append(f"_…and more rows shown in attached table image._")
-                    break
-                lines.append(entry_line)
-
         return title, "\n".join(lines)
 
     def render_daily_calendar_image(

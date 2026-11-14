@@ -602,6 +602,8 @@ def test_economic_calendar_tier_classification_and_blackouts(tmp_path):
     assert "09:00 CET" in title
     assert "Prelim UoM Consumer Sentiment" in desc
     assert "Fed Chairman Warsh Speaks" in desc
+    assert "Full Day Schedule" not in desc
+    assert "ECB President Lagarde Speaks" not in desc
     img_bytes = cal.render_daily_calendar_image(date(2026, 11, 13), nov13_events)
     assert img_bytes is not None and img_bytes.startswith(b"\x89PNG")
 
