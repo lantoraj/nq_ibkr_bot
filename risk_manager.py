@@ -44,9 +44,10 @@ class DailyRiskState:
 class RiskManager:
     """Validates whether new signals are allowed and calculates contract size."""
 
-    def __init__(self, risk_cfg: RiskConfig, contract_cfg: ContractConfig) -> None:
+    def __init__(self, risk_cfg: RiskConfig, contract_cfg: ContractConfig, calendar=None) -> None:
         self.r_cfg = risk_cfg
         self.c_cfg = contract_cfg
+        self.calendar = calendar
         self.tz = pytz.timezone(self.r_cfg.timezone)
         self.state = DailyRiskState()
 
@@ -139,6 +140,11 @@ class RiskManager:
                         False,
                         f"Inside RTH volatility blackout window ({b_start.strftime('%H:%M')}–{b_end.strftime('%H:%M')} ET)",
                     )
+
+        if self.calendar is not None and getattr(self.r_cfg, "use_news_calendar_filter", True):
+            in_news, news_reason = self.calendar.is_in_news_blackout(ts)
+            if in_news:
+                return False, news_reason
 
         active_session_pnl = (
             self.state.premarket_realized_pnl_usd

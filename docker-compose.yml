@@ -31,6 +31,7 @@ services:
       DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
     volumes:
       - ./journal/combo_e_mnq:/app/journal
+      - ./report:/app/report
     command: >
       python -u main.py
       --mode ${TRADING_MODE:-paper}

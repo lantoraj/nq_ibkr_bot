@@ -513,3 +513,170 @@ def test_trade_journal_and_reconcile(tmp_path) -> None:
 
 
 
+
+
+def test_economic_calendar_tier_classification_and_blackouts(tmp_path):
+    import pandas as pd
+    from economic_calendar import EconomicCalendar
+
+    cal = EconomicCalendar(
+        cache_path=str(tmp_path / "ff_cache.json"),
+        report_path=str(tmp_path / "ff_report.json"),
+        tier1_pre_mins=15,
+        tier1_post_mins=30,
+        tier2_pre_mins=10,
+        tier2_post_mins=15,
+    )
+    count = cal.load_events_from_list(
+        [
+            {
+                "title": "CPI m/m",
+                "country": "USD",
+                "date": "2026-11-10T08:30:00-05:00",
+                "impact": "High",
+                "forecast": "0.3%",
+                "previous": "0.2%",
+            },
+            {
+                "title": "FOMC Statement",
+                "country": "USD",
+                "date": "2026-11-11T14:00:00-05:00",
+                "impact": "High",
+                "forecast": "",
+                "previous": "",
+            },
+            {
+                "title": "Prelim UoM Consumer Sentiment",
+                "country": "USD",
+                "date": "2026-11-13T10:30:00-05:00",
+                "impact": "High",
+                "forecast": "71.0",
+                "previous": "70.5",
+            },
+            {
+                "title": "ECB President Lagarde Speaks",
+                "country": "EUR",
+                "date": "2026-11-13T10:15:00-05:00",
+                "impact": "Medium",
+                "forecast": "",
+                "previous": "",
+            },
+        ]
+    )
+    assert count == 4
+    tiers = {ev.title: ev.tier for ev in cal.events}
+    assert tiers["CPI m/m"] == 1
+    assert tiers["FOMC Statement"] == 1
+    assert tiers["Prelim UoM Consumer Sentiment"] == 2
+    assert tiers["ECB President Lagarde Speaks"] == 0
+
+    # Tier-1 FOMC window: 13:45 - 14:30 ET
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-11 13:44:00-05:00")) == (False, "")
+    in_b, reason = cal.is_in_news_blackout(pd.Timestamp("2026-11-11 13:45:00-05:00"))
+    assert in_b and "Tier-1" in reason and "FOMC Statement" in reason
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-11 14:30:00-05:00"))[0] is True
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-11 14:31:00-05:00")) == (False, "")
+
+    # Tier-2 window: 10:20 - 10:45 ET
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:19:00-05:00"))[0] is False
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:20:00-05:00"))[0] is True
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:45:00-05:00"))[0] is True
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:46:00-05:00"))[0] is False
+
+    # Non-USD Medium does not block
+    assert cal.is_in_news_blackout(pd.Timestamp("2026-11-13 10:15:00-05:00"))[0] is False
+
+    # Report export verification
+    import json
+    report_file = tmp_path / "ff_report.json"
+    cal.export_report_json(str(report_file))
+    exported = json.loads(report_file.read_text(encoding="utf-8"))
+    assert len(exported["events"]) == 4
+    assert exported["events"][0]["time_et"] == "08:30"
+    assert exported["events"][0]["time_cet"] == "14:30"
+
+
+def test_risk_manager_blocks_during_news_blackout(tmp_path):
+    import pandas as pd
+    from config import BotConfig
+    from economic_calendar import EconomicCalendar
+    from risk_manager import RiskManager
+
+    cal = EconomicCalendar(cache_path=str(tmp_path / "ff_cache.json"), report_path=None)
+    cal.load_events_from_list(
+        [
+            {
+                "title": "FOMC Statement",
+                "country": "USD",
+                "date": "2026-11-11T14:00:00-05:00",
+                "impact": "High",
+            }
+        ]
+    )
+    cfg = BotConfig()
+    rm = RiskManager(cfg.risk, cfg.contract, calendar=cal)
+
+    ok_block, reason_block = rm.can_open_trade(pd.Timestamp("2026-11-11 14:05:00-05:00"), 100)
+    assert ok_block is False
+    assert "FOMC Statement" in reason_block
+
+    ok_after, _ = rm.can_open_trade(pd.Timestamp("2026-11-11 14:35:00-05:00"), 115)
+    assert ok_after is True
+
+    # Filter toggle disables news blocking cleanly
+    cfg.risk.use_news_calendar_filter = False
+    ok_disabled, _ = rm.can_open_trade(pd.Timestamp("2026-11-11 14:05:00-05:00"), 100)
+    assert ok_disabled is True
+
+
+def test_upcoming_event_within_and_pre_news_stop_tightening(tmp_path):
+    import pandas as pd
+    from economic_calendar import EconomicCalendar
+    from ibkr_execution import compute_pre_news_tightened_stop
+
+    cal = EconomicCalendar(cache_path=str(tmp_path / "ff_cache.json"), report_path=None)
+    cal.load_events_from_list(
+        [
+            {
+                "title": "FOMC Statement",
+                "country": "USD",
+                "date": "2026-11-11T14:00:00-05:00",
+                "impact": "High",
+            }
+        ]
+    )
+    assert cal.upcoming_event_within(pd.Timestamp("2026-11-11 13:55:00-05:00"), minutes=4) is None
+    ev = cal.upcoming_event_within(pd.Timestamp("2026-11-11 13:56:00-05:00"), minutes=4)
+    assert ev is not None and ev.title == "FOMC Statement"
+    assert cal.upcoming_event_within(pd.Timestamp("2026-11-11 14:01:00-05:00"), minutes=4) is None
+
+    # LONG >= +0.30R moves SL to BE (+1.5 pts)
+    sl_be, kind_be = compute_pre_news_tightened_stop(
+        direction="LONG",
+        entry_ref=25000.0,
+        one_r=20.0,
+        current_sl=24980.0,
+        close_p=25008.0,
+        be_offset_pts=1.5,
+        decay_stop_r=0.40,
+    )
+    assert (sl_be, kind_be) == (25001.5, "pre_news_be")
+
+    # LONG < +0.30R tightens SL to -0.40R (24992.0)
+    sl_dec, kind_dec = compute_pre_news_tightened_stop(
+        direction="LONG",
+        entry_ref=25000.0,
+        one_r=20.0,
+        current_sl=24980.0,
+        close_p=25002.0,
+        be_offset_pts=1.5,
+        decay_stop_r=0.40,
+    )
+    assert (sl_dec, kind_dec) == (24992.0, "pre_news_tighten")
+
+    # Existing tighter stop is not loosened
+    assert compute_pre_news_tightened_stop("LONG", 25000.0, 20.0, 25005.0, 25008.0, 1.5, 0.40) == (None, "")
+
+    # SHORT cases
+    assert compute_pre_news_tightened_stop("SHORT", 25000.0, 20.0, 25020.0, 24993.0, 1.5, 0.40) == (24998.5, "pre_news_be")
+    assert compute_pre_news_tightened_stop("SHORT", 25000.0, 20.0, 25020.0, 25002.0, 1.5, 0.40) == (25008.0, "pre_news_tighten")

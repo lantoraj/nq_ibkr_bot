@@ -15,8 +15,9 @@ import logging
 import threading
 import urllib.request
 import uuid
-from datetime import date, datetime
-from typing import List, Optional
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -36,12 +37,57 @@ from ib_async import (
 from ib_async.objects import UNSET_DOUBLE
 
 from config import BotConfig
+from economic_calendar import EconomicCalendar
 from risk_manager import RiskManager
 from strategy import NQIntradayStrategy, TradeSignal
 from trade_journal import TradeJournal, load_journal
 from tv_data_feed import TradingViewDataFeed
 
 logger = logging.getLogger("nq_ibkr_bot")
+
+
+def compute_pre_news_tightened_stop(
+    direction: str,
+    entry_ref: float,
+    one_r: float,
+    current_sl: float,
+    close_p: float,
+    be_offset_pts: float,
+    decay_stop_r: float,
+    round_fn=None,
+) -> tuple[Optional[float], str]:
+    """
+    Compute tighter pre-news Stop Loss ahead of imminent USD High-Impact releases:
+      - If current close profit >= +0.30R: move SL to Break-Even (+be_offset_pts).
+      - Otherwise: tighten SL to -decay_stop_r (default -0.40R).
+    Includes the +/-0.50 pt close-price safety guard against marketable fills.
+    """
+    if one_r <= 0:
+        return None, ""
+    r_round = round_fn if round_fn is not None else (lambda x: round(x * 4.0) / 4.0)
+
+    if direction == "LONG":
+        curr_r = (close_p - entry_ref) / one_r
+        if curr_r >= 0.30:
+            target = r_round(entry_ref + be_offset_pts)
+            kind = "pre_news_be"
+        else:
+            target = r_round(entry_ref - decay_stop_r * one_r)
+            kind = "pre_news_tighten"
+        if close_p > target + 0.50 and target > current_sl:
+            return float(target), kind
+        return None, ""
+
+    curr_r = (entry_ref - close_p) / one_r
+    if curr_r >= 0.30:
+        target = r_round(entry_ref - be_offset_pts)
+        kind = "pre_news_be"
+    else:
+        target = r_round(entry_ref + decay_stop_r * one_r)
+        kind = "pre_news_tighten"
+    if close_p < target - 0.50 and target < current_sl:
+        return float(target), kind
+    return None, ""
 
 
 class IBKRNQBotRunner:
@@ -52,7 +98,19 @@ class IBKRNQBotRunner:
         self.mode = mode.lower()
         self.ib = IB()
         self.strategy = NQIntradayStrategy(config.strategy, config.risk, config.contract)
-        self.risk = RiskManager(config.risk, config.contract)
+        journal_root = Path("/app/journal") if Path("/app/journal").exists() else Path("journal")
+        report_json = "/app/report/ff_calendar.json" if Path("/app/report").is_dir() else None
+        self.calendar = EconomicCalendar(
+            cache_path=str(journal_root / "ff_calendar_cache.json"),
+            report_path=report_json,
+            timezone_name=config.risk.timezone,
+            tier1_pre_mins=getattr(config.risk, "news_mega_pre_blackout_mins", 15),
+            tier1_post_mins=getattr(config.risk, "news_mega_post_blackout_mins", 30),
+            tier2_pre_mins=getattr(config.risk, "news_pre_blackout_mins", 10),
+            tier2_post_mins=getattr(config.risk, "news_post_blackout_mins", 15),
+        )
+        self.calendar.load_from_cache()
+        self.risk = RiskManager(config.risk, config.contract, calendar=self.calendar)
 
         self.contract: Optional[Contract] = None
         self.bars: Optional[BarDataList | pd.DataFrame] = None
@@ -1116,6 +1174,69 @@ class IBKRNQBotRunner:
                                 description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after `{self.cfg.risk.time_decay_bars}` post-entry bars without reaching Break-Even trigger.",
                                 color=0xE67E22,
                             )
+            if (
+                has_pos
+                and is_post_fill_bar
+                and not self._be_moved
+                and self._active_signal is not None
+                and self._active_stop_order is not None
+                and getattr(self.cfg.risk, "use_news_calendar_filter", True)
+            ):
+                pre_news_mins = int(getattr(self.cfg.risk, "pre_news_tighten_stop_mins", 4))
+                imminent_ev = self.calendar.upcoming_event_within(
+                    datetime.now(timezone.utc), minutes=pre_news_mins
+                )
+                if imminent_ev is not None:
+                    from indicators import round_to_tick
+
+                    sig = self._active_signal
+                    entry_ref = float(self._trade_entry_price or sig.entry_price)
+                    one_r = sig.stop_distance_points
+                    news_sl, news_kind = compute_pre_news_tightened_stop(
+                        direction=sig.direction,
+                        entry_ref=entry_ref,
+                        one_r=one_r,
+                        current_sl=float(self._active_stop_order.auxPrice),
+                        close_p=close_p,
+                        be_offset_pts=self.cfg.risk.breakeven_offset_points,
+                        decay_stop_r=self.cfg.risk.time_decay_stop_r,
+                        round_fn=round_to_tick,
+                    )
+                    if news_sl is not None:
+                        self._active_stop_order.auxPrice = news_sl
+                        self._active_stop_order.cashQty = UNSET_DOUBLE
+                        self._active_stop_order.overridePercentageConstraints = True
+                        self.ib.placeOrder(self.contract, self._active_stop_order)
+                        if news_kind == "pre_news_be":
+                            self._be_moved = True
+                        else:
+                            self._decay_moved = True
+                        self._record_stop_level(news_sl, news_kind)
+                        self.journal.log(
+                            "stop_moved",
+                            bar_ts=latest_closed_ts,
+                            kind=news_kind,
+                            direction=sig.direction,
+                            new_stop=news_sl,
+                            entry_price=entry_ref,
+                            event=imminent_ev.title,
+                        )
+                        logger.info(
+                            "Pre-News Stop Tightening (%s before %s): moved %s SL to %.2f",
+                            news_kind,
+                            imminent_ev.title,
+                            sig.direction,
+                            news_sl,
+                        )
+                        sym_lbl = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+                        self._send_discord_alert(
+                            title=f"📰 PRE-NEWS STOP TIGHTENED — {sym_lbl} {sig.direction}",
+                            description=(
+                                f"Imminent Tier-{imminent_ev.tier} USD release **`{imminent_ev.title}`** (`{imminent_ev.dt_et.strftime('%H:%M')} ET`).\n"
+                                f"Moved Stop Loss to **`{news_sl:.2f}`** (`{news_kind}`)."
+                            ),
+                            color=0xE67E22,
+                        )
             return
 
         # 4. Check intraday risk guardrails
@@ -1648,6 +1769,13 @@ class IBKRNQBotRunner:
                 else f"`{self.cfg.risk.entry_start_time}–{self.cfg.risk.entry_end_time} ET`"
             )
             self._sync_discord_webhook_profile()
+            try:
+                self.calendar.fetch_and_cache()
+                today_news = self.calendar.get_today_events()
+                news_summary = self.calendar.format_events_summary(today_news)
+            except Exception as exc:
+                logger.warning("EconomicCalendar startup fetch error: %s", exc)
+                news_summary = "Unavailable"
             bot_name = getattr(self.cfg.ibkr, "discord_bot_name", "NQ Quant Bot (v4.1)")
             pm_be = getattr(self.cfg.risk, "premarket_breakeven_r", 1.0)
             pm_rr = getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
@@ -1660,7 +1788,9 @@ class IBKRNQBotRunner:
                     f"**Stop & TP Rules:** `RTH: +1R → +{self.cfg.risk.breakeven_offset_points:.1f}pt BE / {self.cfg.risk.reward_risk_ratio:.1f}R TP | PM: +{pm_be:.2g}R BE / {pm_rr:.1f}R TP | {self.cfg.risk.time_decay_bars}b → -{self.cfg.risk.time_decay_stop_r:.2f}R Decay`\n"
                     f"**Data Feed:** `{feed_label}`\n"
                     f"**Timeframe:** `{self.cfg.strategy.bar_size}` | **Contracts:** `{self.cfg.risk.fixed_contracts}`\n"
-                    f"**Session Windows:** {window_desc}"
+                    f"**Session Windows:** {window_desc}\n"
+                    f"**Today's USD High-Impact News:** `{news_summary}`\n"
+                    f"**News Blackout Guard:** `T1 (-{self.cfg.risk.news_mega_pre_blackout_mins}m/+{self.cfg.risk.news_mega_post_blackout_mins}m) | T2 (-{self.cfg.risk.news_pre_blackout_mins}m/+{self.cfg.risk.news_post_blackout_mins}m) | Tighten {self.cfg.risk.pre_news_tighten_stop_mins}m prior`"
                 ),
                 color=0x3498DB,
             )
@@ -1675,6 +1805,7 @@ class IBKRNQBotRunner:
             while self.ib.isConnected():
                 self.ib.sleep(poll_interval)
                 try:
+                    self.calendar.refresh_if_needed()
                     fresh_bars = self._fetch_latest_bars()
                     if fresh_bars is not None and len(fresh_bars) > 0:
                         consecutive_empty_polls = 0

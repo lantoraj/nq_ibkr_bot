@@ -157,6 +157,14 @@ class RiskConfig:
     )
     flatten_eod_time: str = "15:55"       # Force flatten all open positions and cancel orders (21:55 CET)
 
+    # ForexFactory Economic Calendar & Macro News Protection
+    use_news_calendar_filter: bool = True
+    news_pre_blackout_mins: int = 10      # Tier-2 USD High-Impact pre-release blackout (minutes)
+    news_post_blackout_mins: int = 15     # Tier-2 USD High-Impact post-release blackout (minutes)
+    news_mega_pre_blackout_mins: int = 15 # Tier-1 Mega Shock (CPI/FOMC/NFP/PPI/GDP/ISM) pre-release
+    news_mega_post_blackout_mins: int = 30 # Tier-1 Mega Shock post-release settle blackout
+    pre_news_tighten_stop_mins: int = 4   # Tighten SL on open positions N mins ahead of USD High news
+
 
 @dataclass
 class BotConfig:
