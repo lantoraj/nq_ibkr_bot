@@ -133,11 +133,22 @@ class IBKRNQBotRunner:
             else None
         )
 
-        # Active bracket order tracking for +1R Break-Even, Time-Decay Stop & Unfilled Entry Timeout
+        # Active bracket order tracking for +1R Break-Even, Time-Decay Stop, 2-Ct Scale-Out & Unfilled Timeout
         self._active_signal: Optional[TradeSignal] = None
         self._active_parent_order: Optional[Order] = None
         self._active_tp_order: Optional[Order] = None
         self._active_stop_order: Optional[Order] = None
+        self._active_parent_orders: List[Order] = []
+        self._active_tp_orders: List[Order] = []
+        self._active_stop_orders: List[Order] = []
+        self._active_tp1_order: Optional[Order] = None
+        self._trade_initial_tp1: Optional[float] = None
+        self._tp1_filled: bool = False
+        self._entry_fill_handled: bool = False
+        self._current_trade_filled_qty: int = 0
+        self._current_trade_closed_qty: int = 0
+        self._current_trade_realized_pnl: float = 0.0
+        self._current_trade_commissions: float = 0.0
         self._entry_submitted_bar: int = -1
         self._trade_filled_bar: int = -1
         self._post_fill_bars: int = 0
@@ -349,6 +360,7 @@ class IBKRNQBotRunner:
         entry_ts_utc: Optional[pd.Timestamp] = None,
         exit_ts_utc: Optional[pd.Timestamp] = None,
         stop_history: Optional[list] = None,
+        tp1_price: Optional[float] = None,
     ) -> Optional[bytes]:
         """Generate a clean dark-theme candlestick chart of the trade with surrounding context for Discord."""
         try:
@@ -484,7 +496,10 @@ class IBKRNQBotRunner:
                         arrowprops=dict(arrowstyle="-", color=color, lw=1.0),
                     )
 
-            # Take-profit line
+            # Take-profit line(s)
+            if tp1_price is not None:
+                ax.hlines(tp1_price, xmin=entry_idx, xmax=seg_end_x, colors="#26c6da", linestyles="--",
+                          linewidth=1.35, zorder=4)
             if tp_price is not None:
                 ax.hlines(tp_price, xmin=entry_idx, xmax=seg_end_x, colors="#00e676", linestyles="--",
                           linewidth=1.5, zorder=4)
@@ -507,7 +522,7 @@ class IBKRNQBotRunner:
             ax.axvspan(entry_idx - 0.5, exit_idx + 0.5, color="#2979ff", alpha=0.06, zorder=1)
 
             # Y limits (include every level so nothing is clipped)
-            levels = [p for p in (tp_price, entry_price, exit_price, initial_sl) if p is not None]
+            levels = [p for p in (tp_price, tp1_price, entry_price, exit_price, initial_sl) if p is not None]
             levels += [h["price"] for h in hist]
             y_lo = min(float(chart_df["low"].min()), min(levels))
             y_hi = max(float(chart_df["high"].max()), max(levels))
@@ -517,8 +532,11 @@ class IBKRNQBotRunner:
 
             # Right-hand price tags (TradingView style) with collision avoidance
             tags = []
+            if tp1_price is not None:
+                tags.append((tp1_price, f"TP1  {tp1_price:.2f}", "#26c6da", "#131722"))
             if tp_price is not None:
-                tags.append((tp_price, f"TP  {tp_price:.2f}", "#00e676", "#131722"))
+                tp_lbl = "TP2  " if tp1_price is not None else "TP  "
+                tags.append((tp_price, f"{tp_lbl}{tp_price:.2f}", "#00e676", "#131722"))
             tags.append((entry_price, f"ENTRY {direction}  {entry_price:.2f}  @{entry_time}", entry_line_color, "#ffffff"))
             if initial_sl is not None:
                 tags.append((initial_sl, f"INITIAL SL  {initial_sl:.2f}", "#ff5252", "#ffffff"))
@@ -605,6 +623,7 @@ class IBKRNQBotRunner:
                 entry_ts_utc=task.get("entry_ts_utc"),
                 exit_ts_utc=task.get("exit_ts_utc"),
                 stop_history=task.get("stop_history"),
+                tp1_price=task.get("tp1_price"),
             )
             sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
             pnl = task["pnl"]
@@ -754,6 +773,28 @@ class IBKRNQBotRunner:
                 self.ib.placeOrder(self.contract, close_order)
                 logger.warning("Submitted %s %d %s MarketOrder to flatten position.", action, qty, self.contract.localSymbol)
 
+    def _modify_active_stop_orders(self, new_sl: float) -> None:
+        """Update stopPrice on every live stop order belonging to the current trade."""
+        targets = list(self._active_stop_orders) if self._active_stop_orders else (
+            [self._active_stop_order] if self._active_stop_order is not None else []
+        )
+        if not targets or self.contract is None:
+            return
+        dead_ids = {
+            t.order.orderId
+            for t in self.ib.openTrades()
+            if getattr(t.order, "orderId", 0)
+            and getattr(getattr(t, "orderStatus", None), "status", "") in ("Cancelled", "ApiCancelled", "Inactive", "Filled")
+        }
+        for stp in targets:
+            oid = getattr(stp, "orderId", 0)
+            if oid and oid in dead_ids:
+                continue
+            stp.auxPrice = new_sl
+            stp.cashQty = UNSET_DOUBLE
+            stp.overridePercentageConstraints = True
+            self.ib.placeOrder(self.contract, stp)
+
     def place_bracket_order(
         self,
         signal: TradeSignal,
@@ -761,95 +802,162 @@ class IBKRNQBotRunner:
         use_market_entry: bool = False,
     ) -> List[Trade]:
         """
-        Submit an atomic Server-Side Bracket Order to IBKR:
-        - Parent Order: StopLimitOrder collar (or Limit / Market) entry
-        - Child 1: Take Profit LimitOrder
-        - Child 2: Stop Loss StopOrder
+        Submit atomic Server-Side Bracket Order(s) to IBKR.
+        When quantity >= 2 and enable_partial_tp is True, splits into 2 independent brackets:
+        - Bracket 1 (leg1_qty): TP1 (+2.0R RTH / +1.4R PM)
+        - Bracket 2 (leg2_qty): Runner TP2 (+5.0R RTH / +2.0R PM)
         """
         if self.contract is None:
             raise RuntimeError("Contract is not resolved.")
 
+        from indicators import round_to_tick
+
         action = "BUY" if signal.direction == "LONG" else "SELL"
         reverse_action = "SELL" if action == "BUY" else "BUY"
+        tick_size = self.cfg.contract.tick_size
 
-        parent_id = self.ib.client.getReqId()
+        sig_et = pd.Timestamp(signal.timestamp)
+        sig_et = (
+            sig_et.tz_localize(self.cfg.risk.timezone)
+            if sig_et.tzinfo is None
+            else sig_et.tz_convert(self.cfg.risk.timezone)
+        )
+        is_pm = sig_et.strftime("%H:%M") < "09:30"
+        use_scale_out = quantity >= 2 and getattr(self.cfg.risk, "enable_partial_tp", True)
 
-        if use_market_entry:
-            parent: Order = MarketOrder(
-                action=action,
-                totalQuantity=quantity,
-                orderId=parent_id,
-                transmit=False,
-                outsideRth=not self.cfg.risk.rth_only,
-                tif="DAY",
-            )
-        else:
-            from indicators import round_to_tick
-
-            slip_pts = self.cfg.risk.entry_limit_slippage_ticks * self.cfg.contract.tick_size
-            lmt_price = (
-                round_to_tick(signal.entry_price + slip_pts, self.cfg.contract.tick_size)
-                if action == "BUY"
-                else round_to_tick(signal.entry_price - slip_pts, self.cfg.contract.tick_size)
-            )
-            collar_pts = float(getattr(self.cfg.risk, "entry_collar_points", 0.0) or 0.0)
-            if collar_pts > 0.0:
-                stp_trigger = (
-                    round_to_tick(signal.entry_price - collar_pts, self.cfg.contract.tick_size)
-                    if action == "BUY"
-                    else round_to_tick(signal.entry_price + collar_pts, self.cfg.contract.tick_size)
-                )
-                parent = StopLimitOrder(
+        def _build_bracket(qty: int, tp_price: float) -> tuple[Order, LimitOrder, StopOrder]:
+            parent_id = self.ib.client.getReqId()
+            if use_market_entry:
+                parent: Order = MarketOrder(
                     action=action,
-                    totalQuantity=quantity,
-                    lmtPrice=lmt_price,
-                    stopPrice=stp_trigger,
+                    totalQuantity=qty,
                     orderId=parent_id,
                     transmit=False,
                     outsideRth=not self.cfg.risk.rth_only,
                     tif="DAY",
                 )
             else:
-                parent = LimitOrder(
-                    action=action,
-                    totalQuantity=quantity,
-                    lmtPrice=lmt_price,
-                    orderId=parent_id,
-                    transmit=False,
-                    outsideRth=not self.cfg.risk.rth_only,
-                    tif="DAY",
+                slip_pts = self.cfg.risk.entry_limit_slippage_ticks * tick_size
+                lmt_price = (
+                    round_to_tick(signal.entry_price + slip_pts, tick_size)
+                    if action == "BUY"
+                    else round_to_tick(signal.entry_price - slip_pts, tick_size)
                 )
+                collar_pts = float(getattr(self.cfg.risk, "entry_collar_points", 0.0) or 0.0)
+                if collar_pts > 0.0:
+                    stp_trigger = (
+                        round_to_tick(signal.entry_price - collar_pts, tick_size)
+                        if action == "BUY"
+                        else round_to_tick(signal.entry_price + collar_pts, tick_size)
+                    )
+                    parent = StopLimitOrder(
+                        action=action,
+                        totalQuantity=qty,
+                        lmtPrice=lmt_price,
+                        stopPrice=stp_trigger,
+                        orderId=parent_id,
+                        transmit=False,
+                        outsideRth=not self.cfg.risk.rth_only,
+                        tif="DAY",
+                    )
+                else:
+                    parent = LimitOrder(
+                        action=action,
+                        totalQuantity=qty,
+                        lmtPrice=lmt_price,
+                        orderId=parent_id,
+                        transmit=False,
+                        outsideRth=not self.cfg.risk.rth_only,
+                        tif="DAY",
+                    )
 
-        take_profit = LimitOrder(
-            action=reverse_action,
-            totalQuantity=quantity,
-            lmtPrice=signal.take_profit,
-            parentId=parent_id,
-            transmit=False,
-            outsideRth=not self.cfg.risk.rth_only,
-            tif="DAY",
-        )
-        take_profit.orderId = self.ib.client.getReqId()
+            take_profit = LimitOrder(
+                action=reverse_action,
+                totalQuantity=qty,
+                lmtPrice=tp_price,
+                parentId=parent_id,
+                transmit=False,
+                outsideRth=not self.cfg.risk.rth_only,
+                tif="DAY",
+            )
+            take_profit.orderId = self.ib.client.getReqId()
 
-        stop_loss = StopOrder(
-            action=reverse_action,
-            totalQuantity=quantity,
-            stopPrice=signal.stop_loss,
-            parentId=parent_id,
-            transmit=True,  # Final child order transmits the entire bracket atomically
-            outsideRth=not self.cfg.risk.rth_only,
-            tif="DAY",
-        )
-        stop_loss.orderId = self.ib.client.getReqId()
+            stop_loss = StopOrder(
+                action=reverse_action,
+                totalQuantity=qty,
+                stopPrice=signal.stop_loss,
+                parentId=parent_id,
+                transmit=True,  # Final child order transmits this bracket atomically
+                outsideRth=not self.cfg.risk.rth_only,
+                tif="DAY",
+            )
+            stop_loss.orderId = self.ib.client.getReqId()
+            return parent, take_profit, stop_loss
+
+        parent_orders: List[Order] = []
+        tp_orders: List[Order] = []
+        stop_orders: List[Order] = []
+        tp1_order: Optional[Order] = None
+        tp1_price: Optional[float] = None
+
+        if use_scale_out:
+            leg1_qty = quantity // 2
+            leg2_qty = quantity - leg1_qty
+            tp1_r = (
+                getattr(self.cfg.risk, "premarket_partial_tp1_r", 1.4)
+                if is_pm
+                else getattr(self.cfg.risk, "partial_tp1_r", 2.0)
+            )
+            tp2_r = (
+                getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+                if is_pm
+                else getattr(self.cfg.risk, "runner_reward_risk_ratio", 5.0)
+            )
+            tp1_dist = round_to_tick(signal.stop_distance_points * tp1_r, tick_size)
+            tp2_dist = round_to_tick(signal.stop_distance_points * tp2_r, tick_size)
+            tp1_price = (
+                round_to_tick(signal.entry_price + tp1_dist, tick_size)
+                if signal.direction == "LONG"
+                else round_to_tick(signal.entry_price - tp1_dist, tick_size)
+            )
+            tp2_price = (
+                round_to_tick(signal.entry_price + tp2_dist, tick_size)
+                if signal.direction == "LONG"
+                else round_to_tick(signal.entry_price - tp2_dist, tick_size)
+            )
+            signal.take_profit = tp2_price
+
+            p1, tp1, sl1 = _build_bracket(leg1_qty, tp1_price)
+            p2, tp2, sl2 = _build_bracket(leg2_qty, tp2_price)
+            orders_to_place: tuple[Order, ...] = (p1, tp1, sl1, p2, tp2, sl2)
+            parent_orders = [p1, p2]
+            tp_orders = [tp1, tp2]
+            stop_orders = [sl1, sl2]
+            tp1_order = tp1
+        else:
+            tp2_r = (
+                getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+                if is_pm
+                else self.cfg.risk.reward_risk_ratio
+            )
+            p1, tp1, sl1 = _build_bracket(quantity, signal.take_profit)
+            orders_to_place = (p1, tp1, sl1)
+            parent_orders = [p1]
+            tp_orders = [tp1]
+            stop_orders = [sl1]
 
         trades: List[Trade] = []
-        for o in (parent, take_profit, stop_loss):
+        for o in orders_to_place:
             trades.append(self.ib.placeOrder(self.contract, o))
 
         self._active_signal = signal
-        self._active_parent_order = parent
-        self._active_tp_order = take_profit
-        self._active_stop_order = stop_loss
+        self._active_parent_orders = parent_orders
+        self._active_tp_orders = tp_orders
+        self._active_stop_orders = stop_orders
+        self._active_parent_order = parent_orders[0]
+        self._active_tp1_order = tp1_order
+        self._active_tp_order = tp_orders[-1]
+        self._active_stop_order = stop_orders[-1]
         self._entry_submitted_bar = self.bar_count
         self._trade_filled_bar = -1
         self._post_fill_bars = 0
@@ -857,9 +965,16 @@ class IBKRNQBotRunner:
         self._trade_closed_ts_utc = None
         self._be_moved = False
         self._decay_moved = False
+        self._tp1_filled = False
+        self._entry_fill_handled = False
+        self._current_trade_filled_qty = 0
+        self._current_trade_closed_qty = 0
+        self._current_trade_realized_pnl = 0.0
+        self._current_trade_commissions = 0.0
         self._trade_entry_price = signal.entry_price
         self._trade_direction = signal.direction
         self._trade_initial_sl = signal.stop_loss
+        self._trade_initial_tp1 = tp1_price
         self._trade_initial_tp = signal.take_profit
         self._stop_history = []
         self._signal_bar_ts = pd.Timestamp(signal.timestamp)
@@ -871,41 +986,42 @@ class IBKRNQBotRunner:
             bar_ts=signal.timestamp,
             direction=signal.direction,
             quantity=quantity,
-            order_type=type(parent).__name__,
-            parent_order_id=parent_id,
-            limit_price=getattr(parent, "lmtPrice", None),
-            stop_trigger=getattr(parent, "auxPrice", None),
+            order_type=type(parent_orders[0]).__name__,
+            parent_order_id=parent_orders[0].orderId,
+            limit_price=getattr(parent_orders[0], "lmtPrice", None),
+            stop_trigger=getattr(parent_orders[0], "auxPrice", None),
             signal_price=signal.entry_price,
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit,
+            take_profit_1=tp1_price,
         )
         logger.info(
-            "BRACKET ORDER SUBMITTED [%s] %s %d %s @ %.2f | SL=%.2f | TP=%.2f | Reason: %s",
+            "BRACKET ORDER SUBMITTED [%s] %s %d %s @ %.2f | SL=%.2f | TP=%s | Reason: %s",
             signal.direction,
             action,
             quantity,
             self.contract.localSymbol,
             signal.entry_price,
             signal.stop_loss,
-            signal.take_profit,
+            f"TP1={tp1_price:.2f} / TP2={signal.take_profit:.2f}" if tp1_price is not None else f"{signal.take_profit:.2f}",
             signal.reason,
         )
         icon = "🟢 LONG ORDER SUBMITTED" if signal.direction == "LONG" else "🔴 SHORT ORDER SUBMITTED"
         color = 0x2ECC71 if signal.direction == "LONG" else 0xE74C3C
-        sig_et = pd.Timestamp(signal.timestamp)
-        sig_et = sig_et.tz_localize(self.cfg.risk.timezone) if sig_et.tzinfo is None else sig_et.tz_convert(self.cfg.risk.timezone)
-        rr_disp = (
-            getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
-            if sig_et.strftime("%H:%M") < "09:30"
-            else self.cfg.risk.reward_risk_ratio
-        )
+        if tp1_price is not None:
+            tp_desc = (
+                f"**TP1 (`+{tp1_r:.2g}R`, `1 ct`):** `{tp1_price:.2f}`\n"
+                f"**TP2 Runner (`+{tp2_r:.2g}R`, `1 ct`):** `{signal.take_profit:.2f}`"
+            )
+        else:
+            tp_desc = f"**Take Profit (`+{tp2_r:.2g}R`):** `{signal.take_profit:.2f}`"
         self._send_discord_alert(
             title=f"{icon} — {action} {quantity} {self.contract.localSymbol} @ {signal.entry_price:.2f}",
             description=(
                 f"**Mode:** `{self.mode.upper()}`\n"
                 f"**Entry Price:** `{signal.entry_price:.2f}`\n"
                 f"**Stop Loss (`-1R`):** `{signal.stop_loss:.2f}`\n"
-                f"**Take Profit (`+{rr_disp:.2g}R`):** `{signal.take_profit:.2f}`\n"
+                f"{tp_desc}\n"
                 f"**Signal Setup:** {signal.reason}\n"
                 f"_Stop-Limit collar order working — a separate ✅ FILLED alert follows if executed, "
                 f"or ⚪ CANCELLED after {self.cfg.risk.cancel_unfilled_entry_bars} bars._"
@@ -1043,6 +1159,12 @@ class IBKRNQBotRunner:
                 cancelled_sig = self._active_signal
                 self.flatten_all(reason=f"Unfilled Entry Order Timeout ({self.cfg.risk.cancel_unfilled_entry_bars} bars)")
                 self._active_parent_order = None
+                self._active_parent_orders = []
+                self._active_tp_orders = []
+                self._active_stop_orders = []
+                self._active_tp1_order = None
+                self._active_tp_order = None
+                self._active_stop_order = None
                 self._active_signal = None
                 if cancelled_sig is not None:
                     self.journal.log(
@@ -1063,6 +1185,26 @@ class IBKRNQBotRunner:
                         color=0x95A5A6,
                     )
                 return
+
+            if (
+                has_pos
+                and self._active_parent_orders
+                and self.cfg.risk.cancel_unfilled_entry_bars > 0
+                and (self.bar_count - self._entry_submitted_bar) >= self.cfg.risk.cancel_unfilled_entry_bars
+            ):
+                parent_ids = {getattr(p, "orderId", 0) for p in self._active_parent_orders if getattr(p, "orderId", 0)}
+                for ot in self.ib.openTrades():
+                    if (
+                        ot.contract.conId == self.contract.conId
+                        and ot.order.orderId in parent_ids
+                        and ot.orderStatus.status not in ("Cancelled", "ApiCancelled", "Inactive", "Filled")
+                    ):
+                        self.ib.cancelOrder(ot.order)
+                        logger.warning(
+                            "Cancelled residual unfilled parent order %s after %d bars while partial position is active.",
+                            ot.order.orderId,
+                            self.cfg.risk.cancel_unfilled_entry_bars,
+                        )
 
             if has_pos and self._active_stop_order is not None:
                 # Self-healing StopOrder check: ensure a working STP order is active on IBKR at all times
@@ -1108,6 +1250,7 @@ class IBKRNQBotRunner:
                         )
                         self.ib.placeOrder(self.contract, new_stp)
                         self._active_stop_order = new_stp
+                        self._active_stop_orders = [new_stp]
                         logger.warning(
                             "Self-healed missing StopOrder for open %s position: submitted %s %d STP @ %.2f",
                             self.contract.localSymbol, rev_action, qty, target_sl,
@@ -1160,14 +1303,11 @@ class IBKRNQBotRunner:
                             new_sl,
                         )
                     elif new_sl > self._active_stop_order.auxPrice:
-                        self._active_stop_order.auxPrice = new_sl
-                        self._active_stop_order.cashQty = UNSET_DOUBLE
-                        self._active_stop_order.overridePercentageConstraints = True
-                        self.ib.placeOrder(self.contract, self._active_stop_order)
+                        self._modify_active_stop_orders(new_sl)
                         self._be_moved = True
                         self._record_stop_level(new_sl, "breakeven")
                         self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="breakeven", direction="LONG", new_stop=new_sl, entry_price=entry_ref)
-                        logger.info("Moved LONG StopOrder to Break-Even+ (%.2f) after reaching +%.2fR", new_sl, be_r)
+                        logger.info("Moved LONG StopOrder(s) to Break-Even+ (%.2f) after reaching +%.2fR", new_sl, be_r)
                         self._send_discord_alert(
                             title=f"🛡️ BREAK-EVEN (+{be_r:.2g}R) LOCKED — {self.contract.localSymbol} LONG",
                             description=f"Moved Stop Loss up to **`{new_sl:.2f}`** (`+{self.cfg.risk.breakeven_offset_points:.1f} pts` above entry `{entry_ref:.2f}`).",
@@ -1183,14 +1323,11 @@ class IBKRNQBotRunner:
                             new_sl,
                         )
                     elif new_sl < self._active_stop_order.auxPrice:
-                        self._active_stop_order.auxPrice = new_sl
-                        self._active_stop_order.cashQty = UNSET_DOUBLE
-                        self._active_stop_order.overridePercentageConstraints = True
-                        self.ib.placeOrder(self.contract, self._active_stop_order)
+                        self._modify_active_stop_orders(new_sl)
                         self._be_moved = True
                         self._record_stop_level(new_sl, "breakeven")
                         self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="breakeven", direction="SHORT", new_stop=new_sl, entry_price=entry_ref)
-                        logger.info("Moved SHORT StopOrder to Break-Even+ (%.2f) after reaching +%.2fR", new_sl, be_r)
+                        logger.info("Moved SHORT StopOrder(s) to Break-Even+ (%.2f) after reaching +%.2fR", new_sl, be_r)
                         self._send_discord_alert(
                             title=f"🛡️ BREAK-EVEN (+{be_r:.2g}R) LOCKED — {self.contract.localSymbol} SHORT",
                             description=f"Moved Stop Loss down to **`{new_sl:.2f}`** (`-{self.cfg.risk.breakeven_offset_points:.1f} pts` below entry `{entry_ref:.2f}`).",
@@ -1204,14 +1341,11 @@ class IBKRNQBotRunner:
                     if sig.direction == "LONG":
                         dec_sl = round_to_tick(entry_ref - self.cfg.risk.time_decay_stop_r * one_r)
                         if low_p > dec_sl and close_p > dec_sl + 0.50 and dec_sl > self._active_stop_order.auxPrice:
-                            self._active_stop_order.auxPrice = dec_sl
-                            self._active_stop_order.cashQty = UNSET_DOUBLE
-                            self._active_stop_order.overridePercentageConstraints = True
-                            self.ib.placeOrder(self.contract, self._active_stop_order)
+                            self._modify_active_stop_orders(dec_sl)
                             self._decay_moved = True
                             self._record_stop_level(dec_sl, "time_decay")
                             self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="LONG", new_stop=dec_sl, entry_price=entry_ref)
-                            logger.info("Time-Decay Stop Tightening: Moved LONG StopOrder to -%.2fR (%.2f)", self.cfg.risk.time_decay_stop_r, dec_sl)
+                            logger.info("Time-Decay Stop Tightening: Moved LONG StopOrder(s) to -%.2fR (%.2f)", self.cfg.risk.time_decay_stop_r, dec_sl)
                             self._send_discord_alert(
                                 title=f"⏳ TIME-DECAY STOP (-{self.cfg.risk.time_decay_stop_r:.2f}R) — {self.contract.localSymbol} LONG",
                                 description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after `{self.cfg.risk.time_decay_bars}` post-entry bars without reaching Break-Even trigger.",
@@ -1220,14 +1354,11 @@ class IBKRNQBotRunner:
                     else:
                         dec_sl = round_to_tick(entry_ref + self.cfg.risk.time_decay_stop_r * one_r)
                         if high_p < dec_sl and close_p < dec_sl - 0.50 and dec_sl < self._active_stop_order.auxPrice:
-                            self._active_stop_order.auxPrice = dec_sl
-                            self._active_stop_order.cashQty = UNSET_DOUBLE
-                            self._active_stop_order.overridePercentageConstraints = True
-                            self.ib.placeOrder(self.contract, self._active_stop_order)
+                            self._modify_active_stop_orders(dec_sl)
                             self._decay_moved = True
                             self._record_stop_level(dec_sl, "time_decay")
                             self.journal.log("stop_moved", bar_ts=latest_closed_ts, kind="time_decay", direction="SHORT", new_stop=dec_sl, entry_price=entry_ref)
-                            logger.info("Time-Decay Stop Tightening: Moved SHORT StopOrder to -%.2fR (%.2f)", self.cfg.risk.time_decay_stop_r, dec_sl)
+                            logger.info("Time-Decay Stop Tightening: Moved SHORT StopOrder(s) to -%.2fR (%.2f)", self.cfg.risk.time_decay_stop_r, dec_sl)
                             self._send_discord_alert(
                                 title=f"⏳ TIME-DECAY STOP (-{self.cfg.risk.time_decay_stop_r:.2f}R) — {self.contract.localSymbol} SHORT",
                                 description=f"Tightened Stop Loss to **`{dec_sl:.2f}`** after `{self.cfg.risk.time_decay_bars}` post-entry bars without reaching Break-Even trigger.",
@@ -1262,10 +1393,7 @@ class IBKRNQBotRunner:
                         round_fn=round_to_tick,
                     )
                     if news_sl is not None:
-                        self._active_stop_order.auxPrice = news_sl
-                        self._active_stop_order.cashQty = UNSET_DOUBLE
-                        self._active_stop_order.overridePercentageConstraints = True
-                        self.ib.placeOrder(self.contract, self._active_stop_order)
+                        self._modify_active_stop_orders(news_sl)
                         if news_kind == "pre_news_be":
                             self._be_moved = True
                         else:
@@ -1367,9 +1495,86 @@ class IBKRNQBotRunner:
             )
 
     def _on_commission_report(self, trade: Trade, fill, report) -> None:
-        """Track realized PnL from IBKR commission reports as positions close."""
+        """Track realized PnL from IBKR commission reports as positions close (aggregating multi-leg scale-outs)."""
         if report.realizedPNL and report.realizedPNL != 0.0 and abs(report.realizedPNL) < 1e7:
-            net_pnl = float(report.realizedPNL)
+            leg_pnl = float(report.realizedPNL)
+            leg_comm = float(getattr(report, "commission", 0.0) or 0.0)
+            exec_obj = getattr(fill, "execution", None)
+            shares_closed = int(getattr(exec_obj, "shares", 1) or 1)
+            fill_price = float(getattr(exec_obj, "price", 0.0) or 0.0)
+            exec_time = getattr(exec_obj, "time", None)
+            sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+
+            self._current_trade_realized_pnl += leg_pnl
+            self._current_trade_commissions += leg_comm
+            self._current_trade_closed_qty += shares_closed
+
+            planned_qty = (
+                sum(int(getattr(p, "totalQuantity", 1) or 1) for p in self._active_parent_orders)
+                if self._active_parent_orders
+                else (
+                    int(getattr(self._active_parent_order, "totalQuantity", 1) or 1)
+                    if self._active_parent_order is not None
+                    else 1
+                )
+            )
+            expected_qty = max(1, self._current_trade_filled_qty or planned_qty)
+
+            is_tp1_commission = (
+                self._active_tp1_order is not None
+                and exec_obj is not None
+                and getattr(exec_obj, "orderId", None) == self._active_tp1_order.orderId
+                and self._current_trade_closed_qty < expected_qty
+            )
+            if is_tp1_commission:
+                self.journal.log(
+                    "partial_tp1_closed",
+                    bar_ts=self._signal_bar_ts or self._last_processed_bar_time,
+                    direction=self._trade_direction or (self._active_signal.direction if self._active_signal else "LONG"),
+                    fill_price=fill_price,
+                    shares=shares_closed,
+                    leg1_pnl_usd=round(leg_pnl, 2),
+                    commission=leg_comm,
+                    runner_tp2=self._trade_initial_tp,
+                    be_stop=float(self._active_stop_order.auxPrice) if self._active_stop_order is not None else None,
+                )
+                logger.info(
+                    "Partial TP1 filled (%d/%d closed) @ %.2f | Leg 1 PnL: $%+.2f | Runner open -> TP2=%.2f",
+                    self._current_trade_closed_qty,
+                    expected_qty,
+                    fill_price,
+                    leg_pnl,
+                    float(self._trade_initial_tp or 0.0),
+                )
+                be_sl_disp = (
+                    f"`{float(self._active_stop_order.auxPrice):.2f}`"
+                    if self._active_stop_order is not None
+                    else "Break-Even"
+                )
+                tp2_disp = f"`{self._trade_initial_tp:.2f}`" if self._trade_initial_tp is not None else "TP2"
+                self._send_discord_alert(
+                    title=f"🎯 PARTIAL TP1 LOCKED — {sym} (${leg_pnl:+.2f} USD)",
+                    description=(
+                        f"**Leg 1 Fill Price (`1 ct`):** `{fill_price:.2f}`\n"
+                        f"**Leg 1 Realized PnL:** **`${leg_pnl:+.2f} USD`**\n"
+                        f"**Remaining Runner (`{expected_qty - self._current_trade_closed_qty} ct`):** Targeting {tp2_disp} | Stop Loss @ {be_sl_disp}"
+                    ),
+                    color=0x1ABC9C,
+                )
+                return
+
+            if self._current_trade_closed_qty < expected_qty:
+                logger.info(
+                    "Partial closing leg filled (%d/%d closed, leg PnL $%+.2f @ %.2f); awaiting remaining leg before finalizing trade.",
+                    self._current_trade_closed_qty,
+                    expected_qty,
+                    leg_pnl,
+                    fill_price,
+                )
+                return
+
+            net_pnl = round(self._current_trade_realized_pnl, 2)
+            total_comm = self._current_trade_commissions
             self.risk.record_trade_closed(net_pnl, exit_bar_index=self.bar_count)
             logger.info(
                 "Trade closed | Realized PnL: $%.2f | Session PnL: $%.2f | Trades Today: %d",
@@ -1379,10 +1584,6 @@ class IBKRNQBotRunner:
             )
             win_str = "💰 TRADE CLOSED (PROFIT)" if net_pnl > 0 else "🛑 TRADE CLOSED (LOSS)"
             color = 0x2ECC71 if net_pnl > 0 else 0xE74C3C
-            sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
-            exec_obj = getattr(fill, "execution", None)
-            fill_price = getattr(exec_obj, "price", 0.0)
-            exec_time = getattr(exec_obj, "time", None)
             self._trade_closed_ts_utc = (
                 pd.Timestamp(exec_time).tz_convert("UTC")
                 if exec_time is not None
@@ -1391,6 +1592,7 @@ class IBKRNQBotRunner:
             entry_p = self._trade_entry_price or (self._active_signal.entry_price if self._active_signal else fill_price)
             direction = self._trade_direction or (self._active_signal.direction if self._active_signal else "LONG")
             sl_p = self._trade_initial_sl or (self._active_signal.stop_loss if self._active_signal else None)
+            tp1_p = self._trade_initial_tp1
             tp_p = self._trade_initial_tp or (self._active_signal.take_profit if self._active_signal else None)
 
             gross_pts = (fill_price - entry_p) if direction == "LONG" else (entry_p - fill_price)
@@ -1403,11 +1605,13 @@ class IBKRNQBotRunner:
                 exit_price=fill_price,
                 stop_loss=sl_p,
                 take_profit=tp_p,
+                take_profit_1=tp1_p,
+                partial_tp1_filled=self._tp1_filled,
                 be_moved=self._be_moved,
                 decay_moved=self._decay_moved,
                 gross_points=round(gross_pts, 2),
-                net_pnl_usd=round(net_pnl, 2),
-                commission=float(getattr(report, "commission", 0.0) or 0.0),
+                net_pnl_usd=net_pnl,
+                commission=total_comm,
                 entry_filled_utc=self._trade_filled_ts_utc,
                 exit_filled_utc=self._trade_closed_ts_utc,
             )
@@ -1435,12 +1639,18 @@ class IBKRNQBotRunner:
                 entry_ts_utc=self._trade_filled_ts_utc,
                 exit_ts_utc=self._trade_closed_ts_utc,
                 stop_history=list(self._stop_history),
+                tp1_price=tp1_p,
             )
 
+            leg_note = (
+                f"**Leg 1 (TP1):** Locked @ `{tp1_p:.2f}` | **Runner Exit:** `{fill_price:.2f}`\n"
+                if self._tp1_filled and tp1_p is not None
+                else f"**Exit Fill Price:** `{fill_price:.2f}`\n"
+            )
             self._send_discord_alert(
                 title=f"{win_str} — {sym} ({net_pnl:+.2f} USD)",
                 description=(
-                    f"**Exit Fill Price:** `{fill_price:.2f}`\n"
+                    f"{leg_note}"
                     f"**Trade Realized PnL:** **`${net_pnl:+.2f}`**\n"
                     f"**Daily Session PnL:** `${self.risk.state.realized_pnl_usd:+.2f}`\n"
                     f"**Trades Today:** `{self.risk.state.trades_taken}/{self.cfg.risk.max_daily_trades}`\n"
@@ -1456,6 +1666,7 @@ class IBKRNQBotRunner:
                 "exit_price": fill_price,
                 "sl_price": sl_p,
                 "tp_price": tp_p,
+                "tp1_price": tp1_p,
                 "direction": direction,
                 "pnl": net_pnl,
                 "trade_duration_bars": entry_offset,
@@ -1466,20 +1677,86 @@ class IBKRNQBotRunner:
                 "stop_history": list(self._stop_history),
             }
 
+            # Reset multi-leg tracking once full position has closed
+            self._current_trade_realized_pnl = 0.0
+            self._current_trade_commissions = 0.0
+            self._current_trade_closed_qty = 0
+            self._current_trade_filled_qty = 0
+            self._active_signal = None
+            self._active_parent_order = None
+            self._active_parent_orders = []
+            self._active_tp_orders = []
+            self._active_stop_orders = []
+            self._active_tp1_order = None
+            self._active_tp_order = None
+            self._active_stop_order = None
+            self._trade_initial_tp1 = None
+            self._tp1_filled = False
+            self._entry_fill_handled = False
+
             if self.risk.state.halted:
                 self.flatten_all(reason=self.risk.state.halt_reason)
 
     def _on_exec_details(self, trade: Trade, fill) -> None:
-        """Send a Discord alert when the bracket's parent ENTRY order actually fills and re-anchor SL/TP to actual fill price."""
-        parent = self._active_parent_order
-        if parent is None or self.contract is None:
-            return
-        if fill.contract.conId != self.contract.conId or fill.execution.orderId != parent.orderId:
+        """Handle parent ENTRY fills (with re-anchoring) and TP1 scale-out fills (moving runner SL to Break-Even)."""
+        if self.contract is None or fill.contract.conId != self.contract.conId:
             return
         from indicators import round_to_tick
 
-        sig = self._active_signal
         e = fill.execution
+        tick_size = self.cfg.contract.tick_size
+
+        # 1. Handle TP1 partial fill -> remove Leg 1 SL and move Runner SL immediately to Break-Even
+        if (
+            self._active_tp1_order is not None
+            and e.orderId == self._active_tp1_order.orderId
+            and not self._tp1_filled
+        ):
+            self._tp1_filled = True
+            tp1_parent_id = getattr(self._active_tp1_order, "parentId", None)
+            self._active_stop_orders = [
+                s for s in self._active_stop_orders
+                if getattr(s, "parentId", None) != tp1_parent_id
+            ]
+            if self._active_stop_orders:
+                self._active_stop_order = self._active_stop_orders[-1]
+
+            if self.cfg.risk.breakeven_at_1r and not self._be_moved and self._active_signal is not None:
+                entry_ref = float(self._trade_entry_price or self._active_signal.entry_price)
+                fill_px = float(e.price)
+                curr_sl = float(self._active_stop_order.auxPrice) if self._active_stop_order is not None else entry_ref
+                if self._active_signal.direction == "LONG":
+                    be_sl = round_to_tick(entry_ref + self.cfg.risk.breakeven_offset_points, tick_size)
+                    if fill_px > be_sl + 0.50 and be_sl > curr_sl:
+                        self._modify_active_stop_orders(be_sl)
+                        self._be_moved = True
+                        self._record_stop_level(be_sl, "breakeven")
+                        self.journal.log("stop_moved", bar_ts=pd.Timestamp.now(tz="UTC"), kind="breakeven", direction="LONG", new_stop=be_sl, entry_price=entry_ref, trigger="tp1_fill")
+                else:
+                    be_sl = round_to_tick(entry_ref - self.cfg.risk.breakeven_offset_points, tick_size)
+                    if fill_px < be_sl - 0.50 and be_sl < curr_sl:
+                        self._modify_active_stop_orders(be_sl)
+                        self._be_moved = True
+                        self._record_stop_level(be_sl, "breakeven")
+                        self.journal.log("stop_moved", bar_ts=pd.Timestamp.now(tz="UTC"), kind="breakeven", direction="SHORT", new_stop=be_sl, entry_price=entry_ref, trigger="tp1_fill")
+            return
+
+        # 2. Match parent entry fill(s)
+        parent_ids = {getattr(p, "orderId", 0) for p in self._active_parent_orders if getattr(p, "orderId", 0)}
+        if self._active_parent_order is not None and getattr(self._active_parent_order, "orderId", 0):
+            parent_ids.add(self._active_parent_order.orderId)
+        if parent_ids:
+            if e.orderId not in parent_ids:
+                return
+        elif self._active_parent_order is None or e.orderId != self._active_parent_order.orderId:
+            return
+
+        self._current_trade_filled_qty += int(e.shares)
+        if self._entry_fill_handled:
+            return
+        self._entry_fill_handled = True
+
+        sig = self._active_signal
         fill_p = float(e.price)
         self._trade_entry_price = fill_p
         self._trade_direction = "LONG" if e.side == "BOT" else "SHORT"
@@ -1491,7 +1768,7 @@ class IBKRNQBotRunner:
             else pd.Timestamp.now(tz="UTC")
         )
 
-        # If actual fill price differs from signal entry price by >= 0.25 pts (1 tick), dynamically re-anchor SL and TP
+        # If actual fill price differs from signal entry price by >= 0.25 pts (1 tick), dynamically re-anchor SL and TP(s)
         if sig is not None and abs(fill_p - sig.entry_price) >= 0.25:
             one_r = sig.stop_distance_points
             sig_et = pd.Timestamp(sig.timestamp)
@@ -1500,38 +1777,65 @@ class IBKRNQBotRunner:
                 if sig_et.tzinfo is None
                 else sig_et.tz_convert(self.cfg.risk.timezone)
             )
-            rr_ratio = (
-                getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
-                if sig_et.strftime("%H:%M") < "09:30"
-                else self.cfg.risk.reward_risk_ratio
-            )
-            three_r = round_to_tick(one_r * rr_ratio, self.cfg.contract.tick_size)
-            if self._trade_direction == "LONG":
-                new_sl = round_to_tick(fill_p - one_r, self.cfg.contract.tick_size)
-                new_tp = round_to_tick(fill_p + three_r, self.cfg.contract.tick_size)
+            is_pm = sig_et.strftime("%H:%M") < "09:30"
+            has_partial = self._active_tp1_order is not None
+            if has_partial:
+                tp1_r = (
+                    getattr(self.cfg.risk, "premarket_partial_tp1_r", 1.4)
+                    if is_pm
+                    else getattr(self.cfg.risk, "partial_tp1_r", 2.0)
+                )
+                rr_ratio = (
+                    getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+                    if is_pm
+                    else getattr(self.cfg.risk, "runner_reward_risk_ratio", 5.0)
+                )
+                tp1_dist = round_to_tick(one_r * tp1_r, tick_size)
+                new_tp1: Optional[float] = (
+                    round_to_tick(fill_p + tp1_dist, tick_size)
+                    if self._trade_direction == "LONG"
+                    else round_to_tick(fill_p - tp1_dist, tick_size)
+                )
             else:
-                new_sl = round_to_tick(fill_p + one_r, self.cfg.contract.tick_size)
-                new_tp = round_to_tick(fill_p - three_r, self.cfg.contract.tick_size)
+                rr_ratio = (
+                    getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+                    if is_pm
+                    else self.cfg.risk.reward_risk_ratio
+                )
+                new_tp1 = None
+
+            tp_dist = round_to_tick(one_r * rr_ratio, tick_size)
+            if self._trade_direction == "LONG":
+                new_sl = round_to_tick(fill_p - one_r, tick_size)
+                new_tp = round_to_tick(fill_p + tp_dist, tick_size)
+            else:
+                new_sl = round_to_tick(fill_p + one_r, tick_size)
+                new_tp = round_to_tick(fill_p - tp_dist, tick_size)
 
             sig.entry_price = fill_p
             sig.stop_loss = new_sl
             sig.take_profit = new_tp
             self._trade_initial_sl = new_sl
             self._trade_initial_tp = new_tp
+            if new_tp1 is not None:
+                self._trade_initial_tp1 = new_tp1
 
-            if self._active_stop_order is not None:
-                self._active_stop_order.auxPrice = new_sl
-                self._active_stop_order.cashQty = UNSET_DOUBLE
-                self._active_stop_order.overridePercentageConstraints = True
-                self.ib.placeOrder(self.contract, self._active_stop_order)
+            self._modify_active_stop_orders(new_sl)
+            if self._active_tp1_order is not None and new_tp1 is not None:
+                self._active_tp1_order.lmtPrice = new_tp1
+                self._active_tp1_order.cashQty = UNSET_DOUBLE
+                self._active_tp1_order.overridePercentageConstraints = True
+                self.ib.placeOrder(self.contract, self._active_tp1_order)
             if self._active_tp_order is not None:
                 self._active_tp_order.lmtPrice = new_tp
                 self._active_tp_order.cashQty = UNSET_DOUBLE
                 self._active_tp_order.overridePercentageConstraints = True
                 self.ib.placeOrder(self.contract, self._active_tp_order)
             logger.info(
-                "Re-anchored bracket SL/TP to actual fill %.2f -> SL=%.2f | TP=%.2f",
-                fill_p, new_sl, new_tp,
+                "Re-anchored bracket SL/TP to actual fill %.2f -> SL=%.2f | TP=%s",
+                fill_p,
+                new_sl,
+                f"TP1={new_tp1:.2f} / TP2={new_tp:.2f}" if new_tp1 is not None else f"{new_tp:.2f}",
             )
 
         # Seed the stop history with the live stop actually resting at fill time
@@ -1541,7 +1845,14 @@ class IBKRNQBotRunner:
         self._stop_history = []
         self._record_stop_level(live_sl if live_sl is not None else self._trade_initial_sl, "initial", self._trade_filled_ts_utc)
 
-        logger.info("ENTRY FILLED: %s %s %s @ %.2f", e.side, e.shares, self.contract.localSymbol, e.price)
+        intended_qty = (
+            sum(int(getattr(p, "totalQuantity", 1) or 1) for p in self._active_parent_orders)
+            if self._active_parent_orders
+            else int(e.shares)
+        )
+        disp_qty = max(int(e.shares), intended_qty)
+
+        logger.info("ENTRY FILLED: %s %s %s @ %.2f", e.side, disp_qty, self.contract.localSymbol, e.price)
         sig_orig = self._signal_price_orig if self._signal_price_orig is not None else fill_p
         slip_pts = (fill_p - sig_orig) if self._trade_direction == "LONG" else (sig_orig - fill_p)
         fill_delay_s = (
@@ -1553,20 +1864,24 @@ class IBKRNQBotRunner:
             "entry_filled",
             bar_ts=self._signal_bar_ts,
             direction=self._trade_direction,
-            quantity=int(e.shares),
+            quantity=disp_qty,
             signal_price=sig_orig,
             fill_price=fill_p,
             slippage_points=round(slip_pts, 2),
             stop_loss=sig.stop_loss if sig else self._trade_initial_sl,
             take_profit=sig.take_profit if sig else self._trade_initial_tp,
+            take_profit_1=self._trade_initial_tp1,
             fill_delay_sec=round(fill_delay_s, 2) if fill_delay_s is not None else None,
             filled_at_utc=self._trade_filled_ts_utc,
         )
-        desc = f"**Fill Price:** `{e.price:.2f}` | **Qty:** `{int(e.shares)}`\n"
+        desc = f"**Fill Price:** `{e.price:.2f}` | **Qty:** `{disp_qty}`\n"
         if sig is not None:
-            desc += f"**Stop Loss:** `{sig.stop_loss:.2f}` | **Take Profit:** `{sig.take_profit:.2f}`"
+            if self._trade_initial_tp1 is not None:
+                desc += f"**Stop Loss:** `{sig.stop_loss:.2f}` | **TP1:** `{self._trade_initial_tp1:.2f}` | **TP2 Runner:** `{sig.take_profit:.2f}`"
+            else:
+                desc += f"**Stop Loss:** `{sig.stop_loss:.2f}` | **Take Profit:** `{sig.take_profit:.2f}`"
         self._send_discord_alert(
-            title=f"✅ ENTRY FILLED — {'BUY' if e.side == 'BOT' else 'SELL'} {int(e.shares)} {self.contract.localSymbol} @ {e.price:.2f}",
+            title=f"✅ ENTRY FILLED — {'BUY' if e.side == 'BOT' else 'SELL'} {disp_qty} {self.contract.localSymbol} @ {e.price:.2f}",
             description=desc,
             color=0x2ECC71 if e.side == "BOT" else 0xE74C3C,
         )
@@ -1628,24 +1943,35 @@ class IBKRNQBotRunner:
             return
 
         open_trades = [t for t in self.ib.reqAllOpenOrders() if t.contract.conId == self.contract.conId]
-        stop_t = next((t for t in open_trades if t.order.orderType in ("STP", "STOP")), None)
-        tp_t = next((t for t in open_trades if t.order.orderType in ("LMT",) and t.order.parentId), None)
-        if stop_t is None:
+        stop_trades = [t for t in open_trades if t.order.orderType in ("STP", "STOP")]
+        tp_trades = [t for t in open_trades if t.order.orderType in ("LMT",) and t.order.parentId]
+        if not stop_trades:
             logger.warning("Recovered %s position (%s) but no working StopOrder found!", self.contract.localSymbol, pos.position)
             return
 
         direction = "LONG" if pos.position > 0 else "SHORT"
         mult = float(self.contract.multiplier or self.cfg.contract.point_value)
         entry = round(pos.avgCost / mult, 2)
+        stop_t = stop_trades[-1]
+        tp_trades_sorted = sorted(tp_trades, key=lambda t: abs(float(t.order.lmtPrice) - entry))
+        tp_t = tp_trades_sorted[-1] if tp_trades_sorted else None
+        tp1_t = tp_trades_sorted[0] if len(tp_trades_sorted) >= 2 else None
         stop = float(stop_t.order.auxPrice)
         tp = float(tp_t.order.lmtPrice) if tp_t else entry
         self._trade_entry_price = entry
         self._trade_direction = direction
         self._trade_initial_sl = stop
+        self._trade_initial_tp1 = float(tp1_t.order.lmtPrice) if tp1_t is not None else None
         self._trade_initial_tp = tp if tp_t else None
         self._trade_filled_bar = self.bar_count
         self._post_fill_bars = 0
         self._trade_filled_ts_utc = pd.Timestamp.now(tz="UTC")
+        self._entry_fill_handled = True
+        self._current_trade_filled_qty = abs(int(pos.position))
+        self._current_trade_closed_qty = 0
+        self._current_trade_realized_pnl = 0.0
+        self._current_trade_commissions = 0.0
+        self._tp1_filled = len(tp_trades_sorted) == 1 and self.cfg.risk.fixed_contracts >= 2
         self._active_signal = TradeSignal(
             timestamp=pd.Timestamp.now(tz="UTC"),
             direction=direction,
@@ -1660,13 +1986,19 @@ class IBKRNQBotRunner:
             ema_fast=entry,
             ema_slow=entry,
         )
-        stop_t.order.cashQty = UNSET_DOUBLE
-        stop_t.order.overridePercentageConstraints = True
-        self._active_stop_order = stop_t.order
-        if tp_t is not None:
-            tp_t.order.cashQty = UNSET_DOUBLE
-            tp_t.order.overridePercentageConstraints = True
-            self._active_tp_order = tp_t.order
+        self._active_stop_orders = []
+        for st in stop_trades:
+            st.order.cashQty = UNSET_DOUBLE
+            st.order.overridePercentageConstraints = True
+            self._active_stop_orders.append(st.order)
+        self._active_stop_order = self._active_stop_orders[-1]
+        self._active_tp_orders = []
+        for tpt in tp_trades_sorted:
+            tpt.order.cashQty = UNSET_DOUBLE
+            tpt.order.overridePercentageConstraints = True
+            self._active_tp_orders.append(tpt.order)
+        self._active_tp1_order = tp1_t.order if tp1_t is not None else None
+        self._active_tp_order = tp_t.order if tp_t is not None else None
         self._entry_submitted_bar = self.bar_count
         # If the stop is already at/through entry, Break-Even was already applied before the restart.
         self._be_moved = (direction == "LONG" and stop >= entry) or (direction == "SHORT" and stop <= entry)
@@ -1835,18 +2167,35 @@ class IBKRNQBotRunner:
             except Exception as exc:
                 logger.warning("EconomicCalendar startup fetch error: %s", exc)
                 news_summary = "Unavailable"
-            bot_name = getattr(self.cfg.ibkr, "discord_bot_name", "NQ Quant Bot (v4.1)")
+            bot_name = getattr(self.cfg.ibkr, "discord_bot_name", "NQ Quant Bot (v4.2)")
             pm_be = getattr(self.cfg.risk, "premarket_breakeven_r", 1.0)
             pm_rr = getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+            is_partial = (
+                self.cfg.risk.fixed_contracts >= 2
+                and getattr(self.cfg.risk, "enable_partial_tp", True)
+            )
+            if is_partial:
+                tp1_r = getattr(self.cfg.risk, "partial_tp1_r", 2.0)
+                tp2_r = getattr(self.cfg.risk, "runner_reward_risk_ratio", 5.0)
+                pm_tp1_r = getattr(self.cfg.risk, "premarket_partial_tp1_r", 1.4)
+                tp_rule_str = (
+                    f"RTH: +1R → +{self.cfg.risk.breakeven_offset_points:.1f}pt BE / TP1 +{tp1_r:.1f}R & Runner TP2 +{tp2_r:.1f}R | "
+                    f"PM: +{pm_be:.2g}R BE / TP1 +{pm_tp1_r:.1f}R & TP2 +{pm_rr:.1f}R"
+                )
+            else:
+                tp_rule_str = (
+                    f"RTH: +1R → +{self.cfg.risk.breakeven_offset_points:.1f}pt BE / {self.cfg.risk.reward_risk_ratio:.1f}R TP | "
+                    f"PM: +{pm_be:.2g}R BE / {pm_rr:.1f}R TP"
+                )
             self._send_discord_alert(
                 title=f"🤖 {bot_name} Online — {self.contract.localSymbol} ({self.mode.upper()})",
                 description=(
                     f"**Profile:** `{bot_name}`\n"
                     f"**Contract:** `{self.contract.localSymbol}` (Expiry `{self.contract.lastTradeDateOrContractMonth}` | `${self.cfg.contract.point_value:.0f}/pt`)\n"
                     f"**ATR Floor:** `RTH ≥ {self.cfg.strategy.min_atr_points:.0f} pts | Pre-Market ≥ {getattr(self.cfg.strategy, 'premarket_min_atr_points', self.cfg.strategy.min_atr_points):.0f} pts`\n"
-                    f"**Stop & TP Rules:** `RTH: +1R → +{self.cfg.risk.breakeven_offset_points:.1f}pt BE / {self.cfg.risk.reward_risk_ratio:.1f}R TP | PM: +{pm_be:.2g}R BE / {pm_rr:.1f}R TP | {self.cfg.risk.time_decay_bars}b → -{self.cfg.risk.time_decay_stop_r:.2f}R Decay`\n"
+                    f"**Stop & TP Rules:** `{tp_rule_str} | {self.cfg.risk.time_decay_bars}b → -{self.cfg.risk.time_decay_stop_r:.2f}R Decay`\n"
                     f"**Data Feed:** `{feed_label}`\n"
-                    f"**Timeframe:** `{self.cfg.strategy.bar_size}` | **Contracts:** `{self.cfg.risk.fixed_contracts}`\n"
+                    f"**Timeframe:** `{self.cfg.strategy.bar_size}` | **Contracts:** `{self.cfg.risk.fixed_contracts}` | **Max Daily Loss:** `${self.cfg.risk.max_daily_loss_usd:.0f}`\n"
                     f"**Session Windows:** {window_desc}\n"
                     f"**Today's USD High-Impact News:** `{news_summary}`\n"
                     f"**News Blackout Guard:** `T1 (-{self.cfg.risk.news_mega_pre_blackout_mins}m/+{self.cfg.risk.news_mega_post_blackout_mins}m) | T2 (-{self.cfg.risk.news_pre_blackout_mins}m/+{self.cfg.risk.news_post_blackout_mins}m) | Tighten {self.cfg.risk.pre_news_tighten_stop_mins}m prior`"

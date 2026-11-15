@@ -707,3 +707,208 @@ def test_upcoming_event_within_and_pre_news_stop_tightening(tmp_path):
     # SHORT cases
     assert compute_pre_news_tightened_stop("SHORT", 25000.0, 20.0, 25020.0, 24993.0, 1.5, 0.40) == (24998.5, "pre_news_be")
     assert compute_pre_news_tightened_stop("SHORT", 25000.0, 20.0, 25020.0, 25002.0, 1.5, 0.40) == (25008.0, "pre_news_tighten")
+
+
+def test_backtester_2ct_partial_scale_out_rth_and_pm() -> None:
+    """Verify 2-contract Backtester locks TP1 (+2R RTH / +1.4R PM), moves runner SL to BE (+2pt), and targets +5R / +2R."""
+    from backtest import Backtester
+    from strategy import TradeSignal
+
+    cfg = BotConfig()
+    cfg.risk.fixed_contracts = 2
+    cfg.risk.max_daily_loss_usd = 500.0
+    cfg.risk.enable_partial_tp = True
+    cfg.risk.partial_tp1_r = 2.0
+    cfg.risk.runner_reward_risk_ratio = 5.0
+    cfg.risk.premarket_partial_tp1_r = 1.4
+    cfg.risk.premarket_reward_risk_ratio = 2.0
+    cfg.risk.breakeven_offset_points = 2.0
+
+    # Construct 4 RTH 2-min bars on 2026-11-12 starting 10:20 ET (outside blackouts):
+    # Bar 0: signal fires @ 25000.0 (slippage fill 25000.25), 1R=20 -> SL=24980, TP1=25040.25, TP2=25100
+    # Bar 1: touches +2.0R (high=25042) and closes 25035 -> Leg 1 closes @ TP1 (+40 pts), SL moves to BE (25002.25)
+    # Bar 2: spikes to 25102 -> Runner Leg 2 closes @ TP2 (+99.75 pts from 25000.25)
+    ts = pd.date_range("2026-11-12 10:20:00", periods=3, freq="2min", tz="America/New_York").tz_convert("UTC")
+    df = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": [24998.0, 25001.0, 25035.0],
+            "high": [25002.0, 25042.0, 25102.0],
+            "low": [24995.0, 25000.0, 25030.0],
+            "close": [25000.0, 25035.0, 25098.0],
+            "volume": [1000, 1200, 1400],
+        }
+    )
+
+    bt = Backtester(cfg, commission_per_side_usd=0.62, slippage_ticks=1)
+    bt.strategy.prepare_dataframe = lambda d: d
+    bt.strategy.evaluate_bar = lambda d, idx=-1: (
+        TradeSignal(
+            timestamp=d.iloc[idx]["timestamp"],
+            direction="LONG",
+            reason="Test Scale-Out",
+            entry_price=25000.0,
+            stop_loss=24980.0,
+            take_profit=25060.0,
+            stop_distance_points=20.0,
+            atr=25.0,
+            rsi=55.0,
+            vwap=24995.0,
+            ema_fast=24998.0,
+            ema_slow=24992.0,
+        )
+        if idx == 0
+        else None
+    )
+
+    res = bt.run(df)
+    assert len(res["trades"]) == 1
+    t = res["trades"][0]
+    assert t.contracts == 2
+    assert t.take_profit == 25100.0  # +5.0R runner ceiling
+    assert t.exit_reason == "TP1 (+2.0R) + Take Profit"
+    # Leg 1: (25040.25 - 25000.25)*$2 - $1.24 = $80 - $1.24 = $78.76
+    # Leg 2: (25100.00 - 25000.25)*$2 - $1.24 = $199.50 - $1.24 = $198.26
+    assert abs(t.net_pnl_usd - 277.02) < 1e-2
+
+    # Second scenario: Leg 1 fills @ +2R, Runner pulls back on Bar 2 to Break-Even (25002.25 - 0.25 slip = 25002.0)
+    df_be = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": [24998.0, 25001.0, 25035.0],
+            "high": [25002.0, 25042.0, 25038.0],
+            "low": [24995.0, 25000.0, 25000.0],
+            "close": [25000.0, 25035.0, 25005.0],
+            "volume": [1000, 1200, 1400],
+        }
+    )
+    bt2 = Backtester(cfg, commission_per_side_usd=0.62, slippage_ticks=1)
+    bt2.strategy.prepare_dataframe = lambda d: d
+    bt2.strategy.evaluate_bar = bt.strategy.evaluate_bar
+    res_be = bt2.run(df_be)
+    assert len(res_be["trades"]) == 1
+    t_be = res_be["trades"][0]
+    assert t_be.exit_reason == "TP1 (+2.0R) + Break-Even Stop"
+    # Leg 1 = $78.76; Leg 2 = (25002.00 - 25000.25)*$2 - $1.24 = $3.50 - $1.24 = $2.26 -> Total $81.02
+    assert abs(t_be.net_pnl_usd - 81.02) < 1e-2
+
+
+def test_runner_2ct_scale_out_brackets_and_commission_aggregation(tmp_path) -> None:
+    """Verify IBKRNQBotRunner submits 2 independent brackets for 2 MNQ contracts and aggregates multi-leg PnL once."""
+    from types import SimpleNamespace
+    from ib_async import Future
+    from ibkr_execution import IBKRNQBotRunner
+    from strategy import TradeSignal
+    from trade_journal import TradeJournal
+
+    cfg = BotConfig()
+    cfg.risk.fixed_contracts = 2
+    cfg.risk.max_daily_loss_usd = 500.0
+    cfg.risk.enable_partial_tp = True
+    cfg.risk.partial_tp1_r = 2.0
+    cfg.risk.runner_reward_risk_ratio = 5.0
+
+    runner = IBKRNQBotRunner(cfg, mode="paper")
+    runner.journal = TradeJournal(base_dir=str(tmp_path / "j"), timezone="America/New_York")
+    runner.contract = Future(conId=815824267, symbol="MNQ", localSymbol="MNQZ6", multiplier="2", exchange="CME", currency="USD")
+    runner._send_discord_alert = lambda *a, **k: None
+
+    req_counter = iter(range(1000, 1050))
+    runner.ib.client = SimpleNamespace(getReqId=lambda: next(req_counter), isConnected=lambda: False)
+    placed_orders = []
+    runner.ib.placeOrder = lambda c, o: placed_orders.append(o) or SimpleNamespace(order=o)
+    runner.ib.openTrades = lambda: []
+
+    sig = TradeSignal(
+        timestamp=pd.Timestamp("2026-11-12 10:20:00-05:00"),
+        direction="LONG",
+        reason="Bullish Pullback",
+        entry_price=25000.0,
+        stop_loss=24980.0,
+        take_profit=25060.0,
+        stop_distance_points=20.0,
+        atr=25.0,
+        rsi=55.0,
+        vwap=24995.0,
+        ema_fast=24998.0,
+        ema_slow=24992.0,
+    )
+    runner.place_bracket_order(sig, quantity=2)
+
+    # Expect 6 orders: p1, tp1 (+2R = 25040), sl1, p2, tp2 (+5R = 25100), sl2
+    assert len(placed_orders) == 6
+    assert len(runner._active_parent_orders) == 2
+    assert runner._active_tp1_order.lmtPrice == 25040.0
+    assert runner._active_tp_order.lmtPrice == 25100.0
+    assert runner._active_tp1_order.totalQuantity == 1
+    assert runner._active_tp_order.totalQuantity == 1
+
+    # Simulate both parent entry legs filling @ 25000.25
+    p1, p2 = runner._active_parent_orders
+    fill_t = pd.Timestamp("2026-11-12 15:20:05", tz="UTC")
+    for p_ord, ex_id in [(p1, "E1"), (p2, "E2")]:
+        fill_obj = SimpleNamespace(
+            contract=runner.contract,
+            execution=SimpleNamespace(orderId=p_ord.orderId, execId=ex_id, side="BOT", shares=1, price=25000.25, time=fill_t),
+        )
+        runner._on_exec_details(SimpleNamespace(), fill_obj)
+
+    assert runner._current_trade_filled_qty == 2
+    # Both TPs & SLs re-anchored to fill 25000.25
+    assert runner._active_tp1_order.lmtPrice == 25040.25
+    assert runner._active_tp_order.lmtPrice == 25100.25
+    assert runner._active_stop_orders[0].auxPrice == 24980.25
+    assert runner._active_stop_orders[1].auxPrice == 24980.25
+
+    # Simulate TP1 fill -> moves remaining runner stop immediately to BE (25002.25) and waits before closing trade
+    tp1_exec = SimpleNamespace(orderId=runner._active_tp1_order.orderId, shares=1, price=25040.25, time=fill_t + pd.Timedelta(minutes=2))
+    runner._on_exec_details(SimpleNamespace(), SimpleNamespace(contract=runner.contract, execution=tp1_exec))
+    assert runner._tp1_filled is True
+    assert runner._be_moved is True
+    assert len(runner._active_stop_orders) == 1
+    assert runner._active_stop_orders[0].auxPrice == 25002.25
+
+    runner._on_commission_report(
+        SimpleNamespace(),
+        SimpleNamespace(execution=tp1_exec),
+        SimpleNamespace(realizedPNL=78.76, commission=1.24),
+    )
+    assert runner.risk.state.trades_taken == 0  # Still open with Runner leg
+    assert runner.risk.state.realized_pnl_usd == 0.0
+
+    # Runner exits @ 25100.25 (+$198.76) -> finalizes trade ONCE with total $277.52
+    tp2_exec = SimpleNamespace(orderId=runner._active_tp_order.orderId, shares=1, price=25100.25, time=fill_t + pd.Timedelta(minutes=6))
+    runner._on_commission_report(
+        SimpleNamespace(),
+        SimpleNamespace(execution=tp2_exec),
+        SimpleNamespace(realizedPNL=198.76, commission=1.24),
+    )
+    assert runner.risk.state.trades_taken == 1
+    assert abs(runner.risk.state.realized_pnl_usd - 277.52) < 1e-6
+
+    # Verify stop-out on both legs counts as 1 trade & 1 consecutive loss (not 2)
+    req_counter2 = iter(range(2000, 2050))
+    runner.ib.client = SimpleNamespace(getReqId=lambda: next(req_counter2), isConnected=lambda: False)
+    placed_orders.clear()
+    runner.place_bracket_order(sig, quantity=2)
+    p1b, p2b = runner._active_parent_orders
+    for p_ord in (p1b, p2b):
+        runner._on_exec_details(
+            SimpleNamespace(),
+            SimpleNamespace(contract=runner.contract, execution=SimpleNamespace(orderId=p_ord.orderId, side="BOT", shares=1, price=25000.0, time=fill_t)),
+        )
+    sl1, sl2 = runner._active_stop_orders
+    runner._on_commission_report(
+        SimpleNamespace(),
+        SimpleNamespace(execution=SimpleNamespace(orderId=sl1.orderId, shares=1, price=24980.0, time=fill_t)),
+        SimpleNamespace(realizedPNL=-41.24, commission=1.24),
+    )
+    assert runner.risk.state.trades_taken == 1  # Still waiting for sl2 commission report
+    runner._on_commission_report(
+        SimpleNamespace(),
+        SimpleNamespace(execution=SimpleNamespace(orderId=sl2.orderId, shares=1, price=24980.0, time=fill_t)),
+        SimpleNamespace(realizedPNL=-41.24, commission=1.24),
+    )
+    assert runner.risk.state.trades_taken == 2
+    assert runner.risk.state.consecutive_losses == 1  # 1 losing trade, NOT 2!
+    assert abs(runner.risk.state.realized_pnl_usd - (277.52 - 82.48)) < 1e-6

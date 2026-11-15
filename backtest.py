@@ -143,8 +143,16 @@ class Backtester:
 
         active_signal: Optional[TradeSignal] = None
         active_contracts: int = 0
+        rem_contracts: int = 0
         active_entry_price: float = 0.0
         active_stop_loss: float = 0.0
+        active_take_profit: float = 0.0
+        active_tp1_price: float = 0.0
+        active_tp1_r: float = 0.0
+        active_is_pm: bool = False
+        use_partial_tp: bool = False
+        tp1_done: bool = False
+        realized_leg1_pnl: float = 0.0
         active_entry_idx: int = 0
         be_moved: bool = False
         decay_moved: bool = False
@@ -166,15 +174,9 @@ class Backtester:
                 exit_reason = ""
                 one_r = active_signal.stop_distance_points
                 bars_held = i - active_entry_idx
-                sig_et = pd.Timestamp(active_signal.timestamp)
-                sig_et = (
-                    sig_et.tz_localize(self.cfg.risk.timezone)
-                    if sig_et.tzinfo is None
-                    else sig_et.tz_convert(self.cfg.risk.timezone)
-                )
                 be_r = (
                     getattr(self.cfg.risk, "premarket_breakeven_r", 1.0)
-                    if sig_et.strftime("%H:%M") < "09:30"
+                    if active_is_pm
                     else 1.0
                 )
 
@@ -184,70 +186,100 @@ class Backtester:
                         exit_reason = (
                             "Break-Even Stop"
                             if be_moved
-                            else ("Time-Decay Stop (-0.5R)" if decay_moved else "Stop Loss")
+                            else ("Time-Decay Stop (-0.4R)" if decay_moved else "Stop Loss")
                         )
-                    elif high_p >= active_signal.take_profit:
-                        exit_price = active_signal.take_profit
-                        exit_reason = "Take Profit"
-                    elif self.risk.should_flatten_eod(ts):
-                        exit_price = close_p - self.slippage_points
-                        exit_reason = "EOD Flatten"
-                    elif (
-                        self.cfg.risk.breakeven_at_1r
-                        and not be_moved
-                        and high_p >= active_entry_price + be_r * one_r
-                    ):
-                        new_sl = round_to_tick(active_entry_price + self.cfg.risk.breakeven_offset_points)
-                        if close_p > new_sl:
-                            active_stop_loss = max(active_stop_loss, new_sl)
-                            be_moved = True
-                    elif (
-                        self.cfg.risk.time_decay_bars > 0
-                        and not be_moved
-                        and not decay_moved
-                        and bars_held >= self.cfg.risk.time_decay_bars
-                    ):
-                        decayed_stop = round_to_tick(
-                            active_entry_price - self.cfg.risk.time_decay_stop_r * one_r
-                        )
-                        if low_p > decayed_stop and close_p > decayed_stop and decayed_stop > active_stop_loss:
-                            active_stop_loss = decayed_stop
-                            decay_moved = True
+                    else:
+                        if use_partial_tp and not tp1_done and rem_contracts >= 2 and high_p >= active_tp1_price:
+                            leg1_qty = rem_contracts // 2
+                            leg1_gross = active_tp1_price - active_entry_price
+                            realized_leg1_pnl += (leg1_gross * point_val * leg1_qty) - (
+                                2.0 * self.commission_per_side * leg1_qty
+                            )
+                            rem_contracts -= leg1_qty
+                            tp1_done = True
+                            if self.cfg.risk.breakeven_at_1r and not be_moved:
+                                be_sl = round_to_tick(active_entry_price + self.cfg.risk.breakeven_offset_points)
+                                if close_p > be_sl:
+                                    active_stop_loss = max(active_stop_loss, be_sl)
+                                    be_moved = True
+
+                        if high_p >= active_take_profit:
+                            exit_price = active_take_profit
+                            exit_reason = "Take Profit"
+                        elif self.risk.should_flatten_eod(ts):
+                            exit_price = close_p - self.slippage_points
+                            exit_reason = "EOD Flatten"
+                        elif (
+                            self.cfg.risk.breakeven_at_1r
+                            and not be_moved
+                            and high_p >= active_entry_price + be_r * one_r
+                        ):
+                            new_sl = round_to_tick(active_entry_price + self.cfg.risk.breakeven_offset_points)
+                            if close_p > new_sl:
+                                active_stop_loss = max(active_stop_loss, new_sl)
+                                be_moved = True
+                        elif (
+                            self.cfg.risk.time_decay_bars > 0
+                            and not be_moved
+                            and not decay_moved
+                            and bars_held >= self.cfg.risk.time_decay_bars
+                        ):
+                            decayed_stop = round_to_tick(
+                                active_entry_price - self.cfg.risk.time_decay_stop_r * one_r
+                            )
+                            if low_p > decayed_stop and close_p > decayed_stop and decayed_stop > active_stop_loss:
+                                active_stop_loss = decayed_stop
+                                decay_moved = True
                 else:  # SHORT
                     if high_p >= active_stop_loss:
                         exit_price = active_stop_loss + self.slippage_points
                         exit_reason = (
                             "Break-Even Stop"
                             if be_moved
-                            else ("Time-Decay Stop (-0.5R)" if decay_moved else "Stop Loss")
+                            else ("Time-Decay Stop (-0.4R)" if decay_moved else "Stop Loss")
                         )
-                    elif low_p <= active_signal.take_profit:
-                        exit_price = active_signal.take_profit
-                        exit_reason = "Take Profit"
-                    elif self.risk.should_flatten_eod(ts):
-                        exit_price = close_p + self.slippage_points
-                        exit_reason = "EOD Flatten"
-                    elif (
-                        self.cfg.risk.breakeven_at_1r
-                        and not be_moved
-                        and low_p <= active_entry_price - be_r * one_r
-                    ):
-                        new_sl = round_to_tick(active_entry_price - self.cfg.risk.breakeven_offset_points)
-                        if close_p < new_sl:
-                            active_stop_loss = min(active_stop_loss, new_sl)
-                            be_moved = True
-                    elif (
-                        self.cfg.risk.time_decay_bars > 0
-                        and not be_moved
-                        and not decay_moved
-                        and bars_held >= self.cfg.risk.time_decay_bars
-                    ):
-                        decayed_stop = round_to_tick(
-                            active_entry_price + self.cfg.risk.time_decay_stop_r * one_r
-                        )
-                        if high_p < decayed_stop and close_p < decayed_stop and decayed_stop < active_stop_loss:
-                            active_stop_loss = decayed_stop
-                            decay_moved = True
+                    else:
+                        if use_partial_tp and not tp1_done and rem_contracts >= 2 and low_p <= active_tp1_price:
+                            leg1_qty = rem_contracts // 2
+                            leg1_gross = active_entry_price - active_tp1_price
+                            realized_leg1_pnl += (leg1_gross * point_val * leg1_qty) - (
+                                2.0 * self.commission_per_side * leg1_qty
+                            )
+                            rem_contracts -= leg1_qty
+                            tp1_done = True
+                            if self.cfg.risk.breakeven_at_1r and not be_moved:
+                                be_sl = round_to_tick(active_entry_price - self.cfg.risk.breakeven_offset_points)
+                                if close_p < be_sl:
+                                    active_stop_loss = min(active_stop_loss, be_sl)
+                                    be_moved = True
+
+                        if low_p <= active_take_profit:
+                            exit_price = active_take_profit
+                            exit_reason = "Take Profit"
+                        elif self.risk.should_flatten_eod(ts):
+                            exit_price = close_p + self.slippage_points
+                            exit_reason = "EOD Flatten"
+                        elif (
+                            self.cfg.risk.breakeven_at_1r
+                            and not be_moved
+                            and low_p <= active_entry_price - be_r * one_r
+                        ):
+                            new_sl = round_to_tick(active_entry_price - self.cfg.risk.breakeven_offset_points)
+                            if close_p < new_sl:
+                                active_stop_loss = min(active_stop_loss, new_sl)
+                                be_moved = True
+                        elif (
+                            self.cfg.risk.time_decay_bars > 0
+                            and not be_moved
+                            and not decay_moved
+                            and bars_held >= self.cfg.risk.time_decay_bars
+                        ):
+                            decayed_stop = round_to_tick(
+                                active_entry_price + self.cfg.risk.time_decay_stop_r * one_r
+                            )
+                            if high_p < decayed_stop and close_p < decayed_stop and decayed_stop < active_stop_loss:
+                                active_stop_loss = decayed_stop
+                                decay_moved = True
 
                 if exit_price is not None:
                     gross_pts = (
@@ -255,8 +287,10 @@ class Backtester:
                         if active_signal.direction == "LONG"
                         else (active_entry_price - exit_price)
                     )
-                    round_turn_comm = 2.0 * self.commission_per_side * active_contracts
-                    net_pnl = (gross_pts * point_val * active_contracts) - round_turn_comm
+                    round_turn_comm = 2.0 * self.commission_per_side * rem_contracts
+                    leg2_pnl = (gross_pts * point_val * rem_contracts) - round_turn_comm
+                    net_pnl = realized_leg1_pnl + leg2_pnl
+                    full_reason = f"TP1 (+{active_tp1_r:.1f}R) + {exit_reason}" if tp1_done else exit_reason
 
                     trades.append(
                         SimulatedTrade(
@@ -268,8 +302,8 @@ class Backtester:
                             entry_price=round(active_entry_price, 2),
                             exit_price=round(exit_price, 2),
                             stop_loss=active_stop_loss,
-                            take_profit=active_signal.take_profit,
-                            exit_reason=exit_reason,
+                            take_profit=active_take_profit,
+                            exit_reason=full_reason,
                             gross_points=round(gross_pts, 2),
                             net_pnl_usd=round(net_pnl, 2),
                         )
@@ -277,6 +311,9 @@ class Backtester:
                     self.risk.record_trade_closed(net_pnl, exit_bar_index=i)
                     active_signal = None
                     active_contracts = 0
+                    rem_contracts = 0
+                    realized_leg1_pnl = 0.0
+                    tp1_done = False
                 continue
 
             # 2. Check if new trade is allowed when flat
@@ -288,15 +325,56 @@ class Backtester:
             if signal is not None:
                 active_signal = signal
                 active_contracts = self.risk.calculate_contracts(signal.stop_distance_points)
+                rem_contracts = active_contracts
                 active_entry_price = (
                     signal.entry_price + self.slippage_points
                     if signal.direction == "LONG"
                     else signal.entry_price - self.slippage_points
                 )
                 active_stop_loss = signal.stop_loss
+                sig_et = pd.Timestamp(signal.timestamp)
+                sig_et = (
+                    sig_et.tz_localize(self.cfg.risk.timezone)
+                    if sig_et.tzinfo is None
+                    else sig_et.tz_convert(self.cfg.risk.timezone)
+                )
+                active_is_pm = sig_et.strftime("%H:%M") < "09:30"
+                use_partial_tp = (
+                    active_contracts >= 2
+                    and getattr(self.cfg.risk, "enable_partial_tp", True)
+                )
+                if use_partial_tp:
+                    active_tp1_r = (
+                        getattr(self.cfg.risk, "premarket_partial_tp1_r", 1.4)
+                        if active_is_pm
+                        else getattr(self.cfg.risk, "partial_tp1_r", 2.0)
+                    )
+                    runner_r = (
+                        getattr(self.cfg.risk, "premarket_reward_risk_ratio", 2.0)
+                        if active_is_pm
+                        else getattr(self.cfg.risk, "runner_reward_risk_ratio", 5.0)
+                    )
+                    one_r = signal.stop_distance_points
+                    active_tp1_price = (
+                        round_to_tick(active_entry_price + active_tp1_r * one_r)
+                        if signal.direction == "LONG"
+                        else round_to_tick(active_entry_price - active_tp1_r * one_r)
+                    )
+                    runner_dist = round_to_tick(one_r * runner_r)
+                    active_take_profit = (
+                        round_to_tick(signal.entry_price + runner_dist)
+                        if signal.direction == "LONG"
+                        else round_to_tick(signal.entry_price - runner_dist)
+                    )
+                else:
+                    active_tp1_r = 0.0
+                    active_tp1_price = 0.0
+                    active_take_profit = signal.take_profit
                 active_entry_idx = i
                 be_moved = False
                 decay_moved = False
+                tp1_done = False
+                realized_leg1_pnl = 0.0
 
         metrics = self._compute_metrics(trades)
         return {

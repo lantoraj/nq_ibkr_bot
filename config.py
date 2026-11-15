@@ -122,8 +122,12 @@ class RiskConfig:
     fixed_stop_points: float = 15.0       # Used when stop_mode == "fixed_points"
     min_stop_points: float = 8.0          # Floor on stop distance (32 ticks)
     max_stop_points: float = 40.0         # Cap on stop distance (160 ticks)
-    reward_risk_ratio: float = 3.0        # Take Profit distance = 3.0 * Stop distance
+    reward_risk_ratio: float = 3.0        # Take Profit distance = 3.0 * Stop distance (1-contract baseline)
     premarket_reward_risk_ratio: float = 2.0  # +2.0R Take Profit for Pre-Market (< 09:30 ET)
+    enable_partial_tp: bool = True        # Scale out 1st contract at TP1 and let runner target extended TP2 when contracts >= 2
+    partial_tp1_r: float = 2.0            # Leg 1 partial Take Profit multiple in RTH (+2.0R)
+    runner_reward_risk_ratio: float = 5.0 # Leg 2 Runner Take Profit multiple in RTH (+5.0R)
+    premarket_partial_tp1_r: float = 1.4  # Leg 1 partial Take Profit multiple in Pre-Market (+1.4R)
     breakeven_at_1r: bool = True          # Automatically move Stop Loss to Entry + 2.0 pts once BE trigger is reached
     premarket_breakeven_r: float = 0.80   # Lock +2.0 pt Break-Even at +0.80R in Pre-Market (< 09:30 ET)
     breakeven_offset_points: float = 2.0  # Points locked in when break-even triggers (covers commission + slippage + $2.26 net on MNQ)

@@ -37,10 +37,10 @@ services:
       --mode ${TRADING_MODE:-paper}
       --symbol MNQ
       --bar-size "${BOT_BAR_SIZE:-2 mins}"
-      --contracts ${BOT_CONTRACTS:-1}
-      --max-daily-loss ${BOT_MAX_DAILY_LOSS:-250.0}
+      --contracts ${BOT_CONTRACTS:-2}
+      --max-daily-loss ${BOT_MAX_DAILY_LOSS:-500.0}
       --premarket-min-atr 22.0
-      --bot-name "NQ Quant Bot v4.1 (Combo E · MNQ)"
+      --bot-name "NQ Quant Bot v4.2 (Combo E · 2 MNQ)"
       --host 127.0.0.1
       --port ${IB_GATEWAY_PORT:-4002}
       --client-id 101
@@ -61,10 +61,10 @@ services:
       --mode ${TRADING_MODE:-paper}
       --symbol NQ
       --bar-size "${BOT_BAR_SIZE:-2 mins}"
-      --contracts ${BOT_CONTRACTS:-1}
+      --contracts 1
       --max-daily-loss 2500.0
       --premarket-min-atr 16.0
-      --bot-name "NQ Quant Bot v4.1 (Combo D · NQ)"
+      --bot-name "NQ Quant Bot v4.2 (Combo D · 1 NQ)"
       --host 127.0.0.1
       --port ${IB_GATEWAY_PORT:-4002}
       --client-id 102

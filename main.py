@@ -124,6 +124,23 @@ def parse_args() -> argparse.Namespace:
         default=-1.0,
         help="Override premarket_min_atr_points (e.g. 16.0 for Combo D, 22.0 for Combo E)",
     )
+    parser.add_argument(
+        "--no-partial-tp",
+        action="store_true",
+        help="Disable 2-contract partial take-profit scale-out even when --contracts >= 2",
+    )
+    parser.add_argument(
+        "--partial-tp1-r",
+        type=float,
+        default=2.0,
+        help="Partial TP1 R-multiple for Leg 1 in RTH when contracts >= 2 (default: 2.0)",
+    )
+    parser.add_argument(
+        "--runner-rr",
+        type=float,
+        default=5.0,
+        help="Runner TP2 R-multiple for Leg 2 in RTH when contracts >= 2 (default: 5.0)",
+    )
     return parser.parse_args()
 
 
@@ -139,6 +156,9 @@ def main() -> int:
     cfg.strategy.entry_mode = args.entry_mode
     cfg.risk.fixed_contracts = args.contracts
     cfg.risk.max_daily_loss_usd = args.max_daily_loss
+    cfg.risk.enable_partial_tp = not args.no_partial_tp
+    cfg.risk.partial_tp1_r = args.partial_tp1_r
+    cfg.risk.runner_reward_risk_ratio = args.runner_rr
     cfg.ibkr.host = args.host
     cfg.ibkr.client_id = args.client_id
     if args.discord_webhook:
