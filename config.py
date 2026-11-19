@@ -148,7 +148,7 @@ class RiskConfig:
     #   2) US Regular Trading Hours (RTH): 09:45 - 14:58 ET (excluding 10:00-10:14 macro & 11:30-11:58 EU close chop)
     timezone: str = "America/New_York"
     rth_only: bool = False                # False = stream ETH+RTH bars and set outsideRth=True on orders
-    use_premarket_session: bool = True    # Enable European Pre-Market trading window
+    use_premarket_session: bool = False   # False = RTH-only entries (09:45-14:58 ET); stream ETH+RTH bars for warmup
     premarket_start_time: str = "04:00"   # 10:00 CET (European Cash Open)
     premarket_trend_end_time: str = "05:00"  # 11:00 CET (1st hour of EU Cash Open before chop; 05:00-08:20 ET = V-Reversal only)
     premarket_end_time: str = "08:20"     # 14:20 CET (Stop 10m before 08:30 ET US macro news releases)

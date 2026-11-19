@@ -186,16 +186,23 @@ def test_dual_session_vwap_reanchoring_and_premarket_risk() -> None:
     # At 09:30 ET Cash Open, VWAP must re-anchor strictly to the RTH opening bar (28400.0)
     assert vwap.iloc[2] == 28400.0
 
-    # 2. Verify Dual-Session RiskManager entry windows and independent Pre-Market / RTH trade budgets
+    # 2. Verify RTH-only default blocks Pre-Market, and opt-in Dual-Session enables isolated Pre-Market / RTH budgets
+    default_cfg = BotConfig()
+    assert default_cfg.risk.use_premarket_session is False
+    rm_default = RiskManager(default_cfg.risk, default_cfg.contract)
+    ts_pm = pd.Timestamp("2026-11-04 04:30:00", tz="America/New_York")
+    allowed_pm_default, _ = rm_default.can_open_trade(ts_pm, 5)
+    assert not allowed_pm_default
+
     cfg = BotConfig()
+    cfg.risk.use_premarket_session = True
     rm = RiskManager(cfg.risk, cfg.contract)
 
     # 03:30 ET (Asian session) -> blocked
     allowed_asia, _ = rm.can_open_trade(pd.Timestamp("2026-11-04 03:30:00", tz="America/New_York"), 1)
     assert not allowed_asia
 
-    # 04:30 ET (European Pre-Market) -> allowed
-    ts_pm = pd.Timestamp("2026-11-04 04:30:00", tz="America/New_York")
+    # 04:30 ET (European Pre-Market, opt-in enabled) -> allowed
     allowed_pm, _ = rm.can_open_trade(ts_pm, 5)
     assert allowed_pm
 
@@ -374,7 +381,9 @@ def test_v42_blackouts_session_risk_isolation_and_marketable_be_guard(tmp_path) 
     allowed_ok, _ = rm.can_open_trade(pd.Timestamp("2026-11-13 10:30:00", tz="America/New_York"), 25)
     assert allowed_ok
 
-    # 2. Pre-Market losses do NOT eat into RTH daily loss budget or keep RTH halted after 09:30 ET
+    # 2. Default config blocks 04:20 ET pre-market; when PM is enabled, PM losses do NOT halt RTH after 09:30 ET
+    assert not RiskManager(cfg.risk, cfg.contract).can_open_trade(pd.Timestamp("2026-11-13 04:20:00", tz="America/New_York"), 5)[0]
+    cfg.risk.use_premarket_session = True
     rm_iso = RiskManager(cfg.risk, cfg.contract)
     rm_iso.can_open_trade(pd.Timestamp("2026-11-13 04:20:00", tz="America/New_York"), 5)
     rm_iso.record_trade_closed(-260.0, exit_bar_index=6)

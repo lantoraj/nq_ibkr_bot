@@ -97,8 +97,6 @@ class RiskManager:
 
     def should_flatten_eod(self, ts: pd.Timestamp) -> bool:
         """Return True if current time is at Pre-Market close (09:24-09:29 ET) or EOD flatten time (15:55-17:00 ET)."""
-        if not self.r_cfg.rth_only and not getattr(self.r_cfg, "use_premarket_session", False):
-            return False
         local_dt = self._to_session_dt(ts)
         t = local_dt.time()
         if getattr(self.r_cfg, "use_premarket_session", False) and (time(9, 24) <= t < time(9, 30)):
@@ -106,9 +104,7 @@ class RiskManager:
         return self._flatten_time <= t <= time(17, 0)
 
     def is_within_entry_window(self, ts: pd.Timestamp) -> bool:
-        """Return True if current timestamp falls within allowed Pre-Market or RTH entry hours."""
-        if not self.r_cfg.rth_only and not getattr(self.r_cfg, "use_premarket_session", False):
-            return True
+        """Return True if current timestamp falls within allowed Pre-Market (when enabled) or RTH entry hours."""
         local_dt = self._to_session_dt(ts)
         t = local_dt.time()
         in_rth = self._entry_start <= t <= self._entry_end
