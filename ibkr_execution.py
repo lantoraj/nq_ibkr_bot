@@ -147,6 +147,8 @@ class IBKRNQBotRunner:
         self._entry_fill_handled: bool = False
         self._current_trade_filled_qty: int = 0
         self._current_trade_closed_qty: int = 0
+        self._closing_exec_qty: int = 0
+        self._last_exit_exec_utc: Optional[pd.Timestamp] = None
         self._current_trade_realized_pnl: float = 0.0
         self._current_trade_commissions: float = 0.0
         self._entry_submitted_bar: int = -1
@@ -761,7 +763,11 @@ class IBKRNQBotRunner:
 
         # 1. Cancel open orders on this contract
         for trade in self.ib.openTrades():
-            if trade.contract.conId == self.contract.conId:
+            if (
+                trade.contract.conId == self.contract.conId
+                and getattr(getattr(trade, "orderStatus", None), "status", "")
+                not in ("Cancelled", "ApiCancelled", "Filled", "Inactive")
+            ):
                 self.ib.cancelOrder(trade.order)
 
         # 2. Close net position if non-zero
@@ -773,6 +779,25 @@ class IBKRNQBotRunner:
                 self.ib.placeOrder(self.contract, close_order)
                 logger.warning("Submitted %s %d %s MarketOrder to flatten position.", action, qty, self.contract.localSymbol)
 
+    def _get_dead_order_ids(self) -> set[int]:
+        """Collect order IDs already in terminal IBKR states across both trades() and openTrades()."""
+        dead: set[int] = set()
+        terminal = ("Cancelled", "ApiCancelled", "Inactive", "Filled")
+        for getter_name in ("trades", "openTrades"):
+            getter = getattr(self.ib, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                items = getter()
+            except Exception:
+                items = ()
+            for t in items or ():
+                oid = getattr(getattr(t, "order", None), "orderId", 0)
+                st = getattr(getattr(t, "orderStatus", None), "status", "")
+                if oid and st in terminal:
+                    dead.add(int(oid))
+        return dead
+
     def _modify_active_stop_orders(self, new_sl: float) -> None:
         """Update stopPrice on every live stop order belonging to the current trade."""
         targets = list(self._active_stop_orders) if self._active_stop_orders else (
@@ -780,19 +805,15 @@ class IBKRNQBotRunner:
         )
         if not targets or self.contract is None:
             return
-        dead_ids = {
-            t.order.orderId
-            for t in self.ib.openTrades()
-            if getattr(t.order, "orderId", 0)
-            and getattr(getattr(t, "orderStatus", None), "status", "") in ("Cancelled", "ApiCancelled", "Inactive", "Filled")
-        }
+        dead_ids = self._get_dead_order_ids()
         for stp in targets:
             oid = getattr(stp, "orderId", 0)
-            if oid and oid in dead_ids:
+            if oid and int(oid) in dead_ids:
                 continue
             stp.auxPrice = new_sl
             stp.cashQty = UNSET_DOUBLE
             stp.overridePercentageConstraints = True
+            stp.transmit = True
             self.ib.placeOrder(self.contract, stp)
 
     def place_bracket_order(
@@ -947,8 +968,15 @@ class IBKRNQBotRunner:
             stop_orders = [sl1]
 
         trades: List[Trade] = []
-        for o in orders_to_place:
+        try:
+            is_conn = bool(self.ib.isConnected())
+        except Exception:
+            is_conn = False
+        pace = is_conn and hasattr(self.ib, "sleep")
+        for idx_ord, o in enumerate(orders_to_place):
             trades.append(self.ib.placeOrder(self.contract, o))
+            if pace and use_scale_out and idx_ord in (0, 2, 3):
+                self.ib.sleep(0.05)
 
         self._active_signal = signal
         self._active_parent_orders = parent_orders
@@ -969,6 +997,8 @@ class IBKRNQBotRunner:
         self._entry_fill_handled = False
         self._current_trade_filled_qty = 0
         self._current_trade_closed_qty = 0
+        self._closing_exec_qty = 0
+        self._last_exit_exec_utc = None
         self._current_trade_realized_pnl = 0.0
         self._current_trade_commissions = 0.0
         self._trade_entry_price = signal.entry_price
@@ -1206,55 +1236,73 @@ class IBKRNQBotRunner:
                             self.cfg.risk.cancel_unfilled_entry_bars,
                         )
 
-            if has_pos and self._active_stop_order is not None:
-                # Self-healing StopOrder check: ensure a working STP order is active on IBKR at all times
-                open_stp = [
-                    t for t in self.ib.openTrades()
-                    if t.contract.conId == self.contract.conId
-                    and t.order.orderType in ("STP", "STOP")
-                    and t.orderStatus.status not in ("Cancelled", "ApiCancelled", "Inactive", "Filled")
-                ]
-                if not open_stp:
-                    pos_obj = next(
-                        (p for p in self.ib.positions() if p.contract.conId == self.contract.conId and p.position != 0),
-                        None,
-                    )
-                    if pos_obj is not None:
-                        rev_action = "SELL" if pos_obj.position > 0 else "BUY"
-                        qty = abs(int(pos_obj.position))
-                        target_sl = float(self._active_stop_order.auxPrice or self._trade_initial_sl or close_p)
-                        tp_trade = next(
-                            (
-                                t for t in self.ib.openTrades()
-                                if t.contract.conId == self.contract.conId
-                                and t.order.orderType == "LMT"
-                                and t.orderStatus.status not in ("Cancelled", "ApiCancelled", "Inactive", "Filled")
-                            ),
+            if has_pos and self._active_stop_order is not None and self._active_signal is not None:
+                closed_so_far = max(
+                    self._current_trade_closed_qty,
+                    int(getattr(self, "_closing_exec_qty", 0) or 0),
+                )
+                expected_open_qty = (
+                    (self._current_trade_filled_qty - closed_so_far)
+                    if self._current_trade_filled_qty > 0
+                    else 1
+                )
+                last_exit_utc = getattr(self, "_last_exit_exec_utc", None)
+                recent_exit = (
+                    last_exit_utc is not None
+                    and (pd.Timestamp.now(tz="UTC") - last_exit_utc).total_seconds() <= 15.0
+                )
+                if expected_open_qty > 0 and not recent_exit:
+                    # Self-healing StopOrder check: ensure a working STP order is active on IBKR at all times
+                    open_stp = [
+                        t for t in self.ib.openTrades()
+                        if t.contract.conId == self.contract.conId
+                        and t.order.orderType in ("STP", "STOP")
+                        and t.orderStatus.status not in ("Cancelled", "ApiCancelled", "Inactive", "Filled")
+                    ]
+                    if not open_stp:
+                        pos_obj = next(
+                            (p for p in self.ib.positions() if p.contract.conId == self.contract.conId and p.position != 0),
                             None,
                         )
-                        oca_grp = (
-                            tp_trade.order.ocaGroup
-                            if tp_trade and getattr(tp_trade.order, "ocaGroup", "")
-                            else f"RECOVERY_{self.ib.client.getReqId()}"
-                        )
-                        new_stp = StopOrder(
-                            action=rev_action,
-                            totalQuantity=qty,
-                            stopPrice=target_sl,
-                            outsideRth=not self.cfg.risk.rth_only,
-                            tif="DAY",
-                            ocaGroup=oca_grp,
-                            ocaType=3,
-                            overridePercentageConstraints=True,
-                            transmit=True,
-                        )
-                        self.ib.placeOrder(self.contract, new_stp)
-                        self._active_stop_order = new_stp
-                        self._active_stop_orders = [new_stp]
-                        logger.warning(
-                            "Self-healed missing StopOrder for open %s position: submitted %s %d STP @ %.2f",
-                            self.contract.localSymbol, rev_action, qty, target_sl,
-                        )
+                        if pos_obj is not None:
+                            rev_action = "SELL" if pos_obj.position > 0 else "BUY"
+                            qty = abs(int(pos_obj.position))
+                            if self._current_trade_filled_qty > 0:
+                                qty = min(qty, expected_open_qty)
+                            if qty > 0:
+                                target_sl = float(self._active_stop_order.auxPrice or self._trade_initial_sl or close_p)
+                                tp_trade = next(
+                                    (
+                                        t for t in self.ib.openTrades()
+                                        if t.contract.conId == self.contract.conId
+                                        and t.order.orderType == "LMT"
+                                        and t.orderStatus.status not in ("Cancelled", "ApiCancelled", "Inactive", "Filled")
+                                    ),
+                                    None,
+                                )
+                                oca_grp = (
+                                    tp_trade.order.ocaGroup
+                                    if tp_trade and getattr(tp_trade.order, "ocaGroup", "")
+                                    else f"RECOVERY_{self.ib.client.getReqId()}"
+                                )
+                                new_stp = StopOrder(
+                                    action=rev_action,
+                                    totalQuantity=qty,
+                                    stopPrice=target_sl,
+                                    outsideRth=not self.cfg.risk.rth_only,
+                                    tif="DAY",
+                                    ocaGroup=oca_grp,
+                                    ocaType=3,
+                                    overridePercentageConstraints=True,
+                                    transmit=True,
+                                )
+                                self.ib.placeOrder(self.contract, new_stp)
+                                self._active_stop_order = new_stp
+                                self._active_stop_orders = [new_stp]
+                                logger.warning(
+                                    "Self-healed missing StopOrder for open %s position: submitted %s %d STP @ %.2f",
+                                    self.contract.localSymbol, rev_action, qty, target_sl,
+                                )
 
             # Delay-aware check: only evaluate +1R Break-Even and 6-bar Time-Decay on bars that
             # closed AT OR AFTER the real-time entry fill timestamp (handles 10-min delayed Paper bars).
@@ -1677,11 +1725,23 @@ class IBKRNQBotRunner:
                 "stop_history": list(self._stop_history),
             }
 
+            # Cancel any lingering open orders for this contract upon full trade close
+            if self.contract is not None:
+                for ot in self.ib.openTrades():
+                    if (
+                        ot.contract.conId == self.contract.conId
+                        and getattr(getattr(ot, "orderStatus", None), "status", "")
+                        not in ("Cancelled", "ApiCancelled", "Filled", "Inactive")
+                    ):
+                        self.ib.cancelOrder(ot.order)
+
             # Reset multi-leg tracking once full position has closed
             self._current_trade_realized_pnl = 0.0
             self._current_trade_commissions = 0.0
             self._current_trade_closed_qty = 0
             self._current_trade_filled_qty = 0
+            self._closing_exec_qty = 0
+            self._last_exit_exec_utc = None
             self._active_signal = None
             self._active_parent_order = None
             self._active_parent_orders = []
@@ -1713,6 +1773,8 @@ class IBKRNQBotRunner:
             and not self._tp1_filled
         ):
             self._tp1_filled = True
+            self._closing_exec_qty += int(getattr(e, "shares", 1) or 1)
+            self._last_exit_exec_utc = pd.Timestamp.now(tz="UTC")
             tp1_parent_id = getattr(self._active_tp1_order, "parentId", None)
             self._active_stop_orders = [
                 s for s in self._active_stop_orders
@@ -1741,14 +1803,29 @@ class IBKRNQBotRunner:
                         self.journal.log("stop_moved", bar_ts=pd.Timestamp.now(tz="UTC"), kind="breakeven", direction="SHORT", new_stop=be_sl, entry_price=entry_ref, trigger="tp1_fill")
             return
 
-        # 2. Match parent entry fill(s)
+        # 2. Match parent entry fill(s); track closing executions early to prevent self-heal race conditions
         parent_ids = {getattr(p, "orderId", 0) for p in self._active_parent_orders if getattr(p, "orderId", 0)}
         if self._active_parent_order is not None and getattr(self._active_parent_order, "orderId", 0):
             parent_ids.add(self._active_parent_order.orderId)
-        if parent_ids:
-            if e.orderId not in parent_ids:
-                return
-        elif self._active_parent_order is None or e.orderId != self._active_parent_order.orderId:
+        is_parent = (
+            (e.orderId in parent_ids)
+            if parent_ids
+            else (self._active_parent_order is not None and e.orderId == self._active_parent_order.orderId)
+        )
+        if not is_parent:
+            is_closing_side = (
+                (self._trade_direction == "LONG" and getattr(e, "side", "") == "SLD")
+                or (self._trade_direction == "SHORT" and getattr(e, "side", "") == "BOT")
+            )
+            if self._trade_direction and is_closing_side:
+                self._closing_exec_qty += int(getattr(e, "shares", 1) or 1)
+                self._last_exit_exec_utc = pd.Timestamp.now(tz="UTC")
+                if self._current_trade_filled_qty > 0 and self._closing_exec_qty >= self._current_trade_filled_qty:
+                    self._active_stop_order = None
+                    self._active_stop_orders = []
+                    self._active_tp_order = None
+                    self._active_tp_orders = []
+                    self._active_tp1_order = None
             return
 
         self._current_trade_filled_qty += int(e.shares)
@@ -1820,17 +1897,27 @@ class IBKRNQBotRunner:
             if new_tp1 is not None:
                 self._trade_initial_tp1 = new_tp1
 
-            self._modify_active_stop_orders(new_sl)
-            if self._active_tp1_order is not None and new_tp1 is not None:
+            dead_ids = self._get_dead_order_ids()
+            if (
+                self._active_tp1_order is not None
+                and new_tp1 is not None
+                and getattr(self._active_tp1_order, "orderId", 0) not in dead_ids
+            ):
                 self._active_tp1_order.lmtPrice = new_tp1
                 self._active_tp1_order.cashQty = UNSET_DOUBLE
                 self._active_tp1_order.overridePercentageConstraints = True
+                self._active_tp1_order.transmit = True
                 self.ib.placeOrder(self.contract, self._active_tp1_order)
-            if self._active_tp_order is not None:
+            if (
+                self._active_tp_order is not None
+                and getattr(self._active_tp_order, "orderId", 0) not in dead_ids
+            ):
                 self._active_tp_order.lmtPrice = new_tp
                 self._active_tp_order.cashQty = UNSET_DOUBLE
                 self._active_tp_order.overridePercentageConstraints = True
+                self._active_tp_order.transmit = True
                 self.ib.placeOrder(self.contract, self._active_tp_order)
+            self._modify_active_stop_orders(new_sl)
             logger.info(
                 "Re-anchored bracket SL/TP to actual fill %.2f -> SL=%.2f | TP=%s",
                 fill_p,
@@ -1969,6 +2056,8 @@ class IBKRNQBotRunner:
         self._entry_fill_handled = True
         self._current_trade_filled_qty = abs(int(pos.position))
         self._current_trade_closed_qty = 0
+        self._closing_exec_qty = 0
+        self._last_exit_exec_utc = None
         self._current_trade_realized_pnl = 0.0
         self._current_trade_commissions = 0.0
         self._tp1_filled = len(tp_trades_sorted) == 1 and self.cfg.risk.fixed_contracts >= 2

@@ -912,3 +912,151 @@ def test_runner_2ct_scale_out_brackets_and_commission_aggregation(tmp_path) -> N
     assert runner.risk.state.trades_taken == 2
     assert runner.risk.state.consecutive_losses == 1  # 1 losing trade, NOT 2!
     assert abs(runner.risk.state.realized_pnl_usd - (277.52 - 82.48)) < 1e-6
+
+
+def test_v42_execution_bugfixes_self_heal_race_and_tp_reanchor_transmit(tmp_path) -> None:
+    """Verify max_atr_points=58.0, transmit=True & dead-order skipping on re-anchor, and TP fill self-heal race block."""
+    from types import SimpleNamespace
+    from ib_async import Future
+    from ibkr_execution import IBKRNQBotRunner
+    from strategy import TradeSignal
+    from trade_journal import TradeJournal
+
+    # 1. Config ATR cap lowered to 58.0 so 40-pt max SL always stays >= ~0.70x ATR
+    cfg = BotConfig()
+    assert cfg.strategy.max_atr_points == 58.0
+
+    # 2. Re-anchoring transmits TP orders (transmit=True) & skips terminal orders from ib.trades()
+    cfg2 = BotConfig()
+    cfg2.risk.fixed_contracts = 2
+    cfg2.risk.max_daily_loss_usd = 500.0
+    cfg2.risk.enable_partial_tp = True
+    runner = IBKRNQBotRunner(cfg2, mode="paper")
+    runner.journal = TradeJournal(base_dir=str(tmp_path / "j_reanchor"), timezone="America/New_York")
+    runner.contract = Future(conId=815824267, symbol="MNQ", localSymbol="MNQZ6", multiplier="2", exchange="CME", currency="USD")
+    runner._send_discord_alert = lambda *a, **k: None
+
+    req_counter = iter(range(3000, 3050))
+    runner.ib.client = SimpleNamespace(getReqId=lambda: next(req_counter), isConnected=lambda: False)
+    placed_orders = []
+    runner.ib.placeOrder = lambda c, o: placed_orders.append(o) or SimpleNamespace(order=o)
+    runner.ib.openTrades = lambda: []
+    runner.ib.trades = lambda: []
+
+    sig = TradeSignal(
+        timestamp=pd.Timestamp("2026-11-18 11:00:00-05:00"),
+        direction="LONG",
+        reason="Bullish Pullback",
+        entry_price=25000.0,
+        stop_loss=24980.0,
+        take_profit=25060.0,
+        stop_distance_points=20.0,
+        atr=30.0,
+        rsi=55.0,
+        vwap=24995.0,
+        ema_fast=24998.0,
+        ema_slow=24992.0,
+    )
+    runner.place_bracket_order(sig, quantity=2)
+    sl1, sl2 = runner._active_stop_orders
+    tp1 = runner._active_tp1_order
+    tp2 = runner._active_tp_order
+    p1 = runner._active_parent_orders[0]
+
+    # Simulate Leg 2 stop sl2 already cancelled in IBKR trades() (absent from openTrades())
+    runner.ib.trades = lambda: [
+        SimpleNamespace(contract=runner.contract, order=sl2, orderStatus=SimpleNamespace(status="Cancelled")),
+        SimpleNamespace(contract=runner.contract, order=sl1, orderStatus=SimpleNamespace(status="Submitted")),
+    ]
+    placed_orders.clear()
+    fill_t = pd.Timestamp("2026-11-18 16:00:05", tz="UTC")
+    runner._on_exec_details(
+        SimpleNamespace(),
+        SimpleNamespace(contract=runner.contract, execution=SimpleNamespace(orderId=p1.orderId, side="BOT", shares=1, price=25001.0, time=fill_t)),
+    )
+    assert tp1.transmit is True
+    assert tp2.transmit is True
+    assert sl1.transmit is True
+    assert tp1 in placed_orders and tp2 in placed_orders and sl1 in placed_orders
+    assert sl2.orderId not in [getattr(o, "orderId", None) for o in placed_orders]
+
+    # 3. TP closing fill blocks orphan self-healing StopOrder even if ib.positions() is briefly stale
+    cfg_d = BotConfig()
+    cfg_d.contract.symbol = "NQ"
+    cfg_d.risk.fixed_contracts = 1
+    cfg_d.risk.enable_partial_tp = False
+    cfg_d.risk.max_daily_loss_usd = 2500.0
+    runner_d = IBKRNQBotRunner(cfg_d, mode="paper")
+    runner_d.journal = TradeJournal(base_dir=str(tmp_path / "j_race"), timezone="America/New_York")
+    runner_d.contract = Future(conId=563947726, symbol="NQ", localSymbol="NQZ6", multiplier="20", exchange="CME", currency="USD")
+    runner_d._send_discord_alert = lambda *a, **k: None
+    runner_d._generate_trade_chart = lambda *a, **k: None
+
+    req_counter_d = iter(range(4000, 4050))
+    runner_d.ib.client = SimpleNamespace(getReqId=lambda: next(req_counter_d), isConnected=lambda: False)
+    placed_d = []
+    cancelled_d = []
+    lingering_ord = SimpleNamespace(orderId=4999, orderType="STP")
+    open_trades_d = []
+    runner_d.ib.placeOrder = lambda c, o: placed_d.append(o) or SimpleNamespace(order=o)
+    runner_d.ib.cancelOrder = lambda o: cancelled_d.append(o)
+    runner_d.ib.openTrades = lambda: open_trades_d
+    runner_d.ib.trades = lambda: open_trades_d
+    runner_d.ib.positions = lambda: []
+
+    sig_d = TradeSignal(
+        timestamp=pd.Timestamp("2026-11-18 12:18:00-05:00"),
+        direction="LONG",
+        reason="Bullish Pullback",
+        entry_price=27143.5,
+        stop_loss=27103.5,
+        take_profit=27263.5,
+        stop_distance_points=40.0,
+        atr=50.2,
+        rsi=62.4,
+        vwap=27112.4,
+        ema_fast=27135.0,
+        ema_slow=27125.0,
+    )
+    runner_d.place_bracket_order(sig_d, quantity=1)
+    p_d = runner_d._active_parent_orders[0]
+    tp_d = runner_d._active_tp_order
+    fill_d_t = pd.Timestamp("2026-11-18 17:18:07", tz="UTC")
+    runner_d._on_exec_details(
+        SimpleNamespace(),
+        SimpleNamespace(contract=runner_d.contract, execution=SimpleNamespace(orderId=p_d.orderId, side="BOT", shares=1, price=27143.75, time=fill_d_t)),
+    )
+
+    # TP Limit fills via execDetails BEFORE commissionReport; positions() is momentarily stale at +1
+    placed_d.clear()
+    runner_d.ib.positions = lambda: [SimpleNamespace(contract=runner_d.contract, position=1.0)]
+    tp_fill_t = pd.Timestamp("2026-11-18 17:26:04", tz="UTC")
+    tp_exit_exec = SimpleNamespace(orderId=tp_d.orderId, side="SLD", shares=1, price=27263.50, time=tp_fill_t)
+    runner_d._on_exec_details(SimpleNamespace(), SimpleNamespace(contract=runner_d.contract, execution=tp_exit_exec))
+
+    ts_bars = pd.date_range("2026-11-18 15:30:00", periods=60, freq="2min", tz="UTC")
+    bar_df = pd.DataFrame(
+        {
+            "timestamp": ts_bars,
+            "open": [27200.0 + i * 0.5 for i in range(60)],
+            "high": [27210.0 + i * 0.5 for i in range(60)],
+            "low": [27190.0 + i * 0.5 for i in range(60)],
+            "close": [27205.0 + i * 0.5 for i in range(60)],
+            "volume": [1000] * 60,
+        }
+    )
+    runner_d._on_bar_update(bar_df, has_new_bar=True)
+    assert len(placed_d) == 0  # NO orphan self-healed StopOrder submitted!
+
+    # Lingering open order on same contract is cancelled when full trade closes in _on_commission_report
+    open_trades_d.append(
+        SimpleNamespace(contract=runner_d.contract, order=lingering_ord, orderStatus=SimpleNamespace(status="Submitted"))
+    )
+    runner_d._on_commission_report(
+        SimpleNamespace(),
+        SimpleNamespace(execution=tp_exit_exec),
+        SimpleNamespace(realizedPNL=2390.52, commission=2.24),
+    )
+    assert lingering_ord in cancelled_d
+    assert runner_d.risk.state.trades_taken == 1
+    assert abs(runner_d.risk.state.realized_pnl_usd - 2390.52) < 1e-6
