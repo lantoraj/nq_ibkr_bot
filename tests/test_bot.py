@@ -924,16 +924,16 @@ def test_runner_2ct_scale_out_brackets_and_commission_aggregation(tmp_path) -> N
 
 
 def test_v42_execution_bugfixes_self_heal_race_and_tp_reanchor_transmit(tmp_path) -> None:
-    """Verify max_atr_points=58.0, transmit=True & dead-order skipping on re-anchor, and TP fill self-heal race block."""
+    """Verify max_atr_points=72.0, transmit=True & dead-order skipping on re-anchor, and TP fill self-heal race block."""
     from types import SimpleNamespace
     from ib_async import Future
     from ibkr_execution import IBKRNQBotRunner
     from strategy import TradeSignal
     from trade_journal import TradeJournal
 
-    # 1. Config ATR cap lowered to 58.0 so 40-pt max SL always stays >= ~0.70x ATR
+    # 1. Config ATR cap tuned to 72.0 (2Y RTH-Only global optimum preserving [58-72] trend runners while blocking >=75 panic whipsaws)
     cfg = BotConfig()
-    assert cfg.strategy.max_atr_points == 58.0
+    assert cfg.strategy.max_atr_points == 72.0
 
     # 2. Re-anchoring transmits TP orders (transmit=True) & skips terminal orders from ib.trades()
     cfg2 = BotConfig()

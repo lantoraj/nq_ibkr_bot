@@ -84,7 +84,7 @@ class StrategyConfig:
     atr_period: int = 14
     min_atr_points: float = 22.0          # Minimum 2-min ATR(14) in RTH to avoid dead low-volatility chop (validated on 2-Year data)
     premarket_min_atr_points: float = 16.0  # Minimum 2-min ATR(14) in European Pre-Market (04:00-06:00 ET)
-    max_atr_points: float = 58.0          # Cap 2-min ATR(14) at 58 pts so 40-pt max SL stays >= ~0.70x ATR and extreme whipsaw spikes are filtered out
+    max_atr_points: float = 72.0          # Cap 2-min ATR(14) at 72.0 pts (2-Year RTH-Only optimum: Sharpe 3.12 / PF 1.35 on Combo E; Sharpe 3.08 / PF 1.34 on Combo D) while blocking >=75 panic whipsaws
     rsi_period: int = 14
     rsi_long_min: float = 45.0
     rsi_overbought: float = 70.0          # Do not enter new longs above this RSI
