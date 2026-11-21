@@ -299,7 +299,17 @@ class NQIntradayStrategy:
             else self.r_cfg.fixed_stop_points
         )
         tick = self.c_cfg.tick_size
-        stop_dist = max(self.r_cfg.min_stop_points, min(self.r_cfg.max_stop_points, round_to_tick(raw_stop_dist, tick)))
+        high_vol_atr_thresh = float(getattr(self.r_cfg, "high_vol_atr_threshold", 60.0) or 60.0)
+        high_vol_max_stop = float(
+            getattr(self.r_cfg, "high_vol_max_stop_points", self.r_cfg.max_stop_points)
+            or self.r_cfg.max_stop_points
+        )
+        effective_max_stop = (
+            max(self.r_cfg.max_stop_points, high_vol_max_stop)
+            if atr > high_vol_atr_thresh
+            else self.r_cfg.max_stop_points
+        )
+        stop_dist = max(self.r_cfg.min_stop_points, min(effective_max_stop, round_to_tick(raw_stop_dist, tick)))
         rr_ratio = (
             getattr(self.r_cfg, "premarket_reward_risk_ratio", self.r_cfg.reward_risk_ratio)
             if hm < "09:30"

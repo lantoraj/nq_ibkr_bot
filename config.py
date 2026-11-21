@@ -111,17 +111,21 @@ class RiskConfig:
     risk_per_trade_usd: float = 0.0       # If > 0, dynamically sizes contracts up to max_contracts
     max_contracts: int = 3
 
-    # Order execution improvements (Two-Sided Stop-Limit Collar + Unfilled Order Timeout)
-    entry_limit_slippage_ticks: int = 1   # Submit Limit entry 1 tick (0.25 pt) marketable to prevent missed breakouts
+    # Order execution improvements (Marketable Stop-Limit Collar + Fast/Runaway Unfilled Order Guards)
+    entry_limit_slippage_ticks: int = 8   # Submit Limit entry 8 ticks (2.00 pts) marketable to prevent missed breakouts
     entry_collar_points: float = 6.0      # Stop-Limit protection band (pts) so delayed signals never fill far past entry/SL
-    cancel_unfilled_entry_bars: int = 3   # Automatically cancel unfilled parent entry order after 3 bars
+    cancel_unfilled_entry_bars: int = 1   # Automatically cancel unfilled parent entry order after 1 closed bar (2 mins)
+    cancel_unfilled_entry_seconds: float = 60.0  # Cancel unfilled parent entry order if still flat after 60s
+    runaway_cancel_points: float = 15.0   # Cancel unfilled parent entry order if price runs >=15 pts in signal direction without fill
 
     # Stop Loss, Take Profit, +1R Break-Even & v4 Time-Decay Stagnant Stop Tightening
     stop_mode: Literal["atr", "fixed_points"] = "atr"
     atr_stop_multiplier: float = 1.2      # Stop loss distance = 1.2 * ATR(14)
     fixed_stop_points: float = 15.0       # Used when stop_mode == "fixed_points"
     min_stop_points: float = 8.0          # Floor on stop distance (32 ticks)
-    max_stop_points: float = 40.0         # Cap on stop distance (160 ticks)
+    max_stop_points: float = 40.0         # Normal cap on stop distance when ATR <= high_vol_atr_threshold (160 ticks)
+    high_vol_atr_threshold: float = 60.0  # 2-min ATR(14) threshold above which the dynamic high-vol SL cap applies
+    high_vol_max_stop_points: float = 48.0  # Extended SL cap (192 ticks) when ATR > high_vol_atr_threshold to avoid noise stop-outs
     reward_risk_ratio: float = 3.0        # Take Profit distance = 3.0 * Stop distance (1-contract baseline)
     premarket_reward_risk_ratio: float = 2.0  # +2.0R Take Profit for Pre-Market (< 09:30 ET)
     enable_partial_tp: bool = True        # Scale out 1st contract at TP1 and let runner target extended TP2 when contracts >= 2

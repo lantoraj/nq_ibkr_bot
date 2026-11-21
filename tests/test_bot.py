@@ -261,7 +261,7 @@ def test_delayed_paper_execution_collar_and_unset_double() -> None:
     parent, tp, sl = placed_orders
     assert isinstance(parent, StopLimitOrder)
     assert parent.action == "SELL"
-    assert parent.lmtPrice == 27100.00
+    assert parent.lmtPrice == 27098.25  # 8 ticks (2.00 pts) marketable below 27100.25 signal
     assert parent.auxPrice == 27106.25  # +6.0 pt collar prevents filling at 27147.75 / 27252.00
 
     # Simulate fill within collar at 27104.25 (+4.0 pts above signal) and verify SL/TP re-anchor & UNSET_DOUBLE
@@ -1069,3 +1069,225 @@ def test_v42_execution_bugfixes_self_heal_race_and_tp_reanchor_transmit(tmp_path
     assert lingering_ord in cancelled_d
     assert runner_d.risk.state.trades_taken == 1
     assert abs(runner_d.risk.state.realized_pnl_usd - 2390.52) < 1e-6
+
+
+def test_p1_entry_guards_and_p3_dynamic_sl_cap(tmp_path) -> None:
+    """Verify P1 marketable-limit/fast-cancel/runaway-cancel/60s-timeout/fill-safety and P3_SL ATR>60 cap."""
+    import json
+    from types import SimpleNamespace
+    from ib_async import Future
+    from ibkr_execution import IBKRNQBotRunner
+    from strategy import TradeSignal
+    from trade_journal import TradeJournal
+
+    # 1. Config defaults match P1 + P3_SL
+    cfg = BotConfig()
+    assert cfg.risk.entry_limit_slippage_ticks == 8
+    assert cfg.risk.cancel_unfilled_entry_bars == 1
+    assert cfg.risk.cancel_unfilled_entry_seconds == 60.0
+    assert cfg.risk.runaway_cancel_points == 15.0
+    assert cfg.risk.max_stop_points == 40.0
+    assert cfg.risk.high_vol_atr_threshold == 60.0
+    assert cfg.risk.high_vol_max_stop_points == 48.0
+
+    # 2. P3_SL in NQIntradayStrategy.evaluate_bar: ATR=55 -> SL=40.0, ATR=65 -> SL=48.0
+    strat = NQIntradayStrategy(cfg.strategy, cfg.risk, cfg.contract)
+    n_bars = 70
+    ts_rth = pd.date_range("2026-11-20 09:30:00", periods=n_bars, freq="2min", tz="America/New_York")
+    base_df = pd.DataFrame(
+        {
+            "timestamp": ts_rth,
+            "open": [25000.0 + i * 2.0 for i in range(n_bars)],
+            "high": [25015.0 + i * 2.0 for i in range(n_bars)],
+            "low": [24995.0 + i * 2.0 for i in range(n_bars)],
+            "close": [25010.0 + i * 2.0 for i in range(n_bars)],
+            "volume": [1500.0] * n_bars,
+        }
+    )
+    enriched = strat.prepare_dataframe(base_df)
+    idx = n_bars - 1
+    prev_idx = idx - 1
+    enriched.at[prev_idx, "high"] = 25140.0
+    enriched.at[idx, "open"] = 25130.0
+    enriched.at[idx, "low"] = 25128.0
+    enriched.at[idx, "close"] = 25150.0
+    enriched.at[idx, "high"] = 25152.0
+    enriched.at[idx, "ema_fast"] = 25132.0
+    enriched.at[idx, "ema_slow"] = 25120.0
+    enriched.at[idx, "ema_trend"] = 25080.0
+    enriched.at[idx, "vwap"] = 25090.0
+    enriched.at[idx, "vwap_z"] = 1.10
+    enriched.at[idx, "rsi"] = 58.0
+    enriched.at[idx, "vol_ratio"] = 1.25
+    enriched.at[idx, "ema_spread_atr"] = 0.25
+    enriched.at[idx, "slow_slope_atr"] = 0.20
+    enriched.at[idx, "body_ratio"] = 0.80
+    enriched.at[idx, "upper_wick_ratio"] = 0.08
+    enriched.at[idx, "lower_wick_ratio"] = 0.08
+    enriched.at[idx, "pdh"] = 26000.0
+    enriched.at[idx, "pdl"] = 24000.0
+    enriched.at[idx, "orb_high"] = float("nan")
+    enriched.at[idx, "orb_low"] = float("nan")
+
+    enriched.at[idx, "atr"] = 55.0
+    sig_normal = strat.evaluate_bar(enriched, idx=idx)
+    assert sig_normal is not None
+    assert sig_normal.stop_distance_points == 40.0
+
+    enriched.at[idx, "atr"] = 65.0
+    sig_high_vol = strat.evaluate_bar(enriched, idx=idx)
+    assert sig_high_vol is not None
+    assert sig_high_vol.stop_distance_points == 48.0
+
+    # Helper to read logged entry_cancelled events from journal
+    def _read_cancel_events(j_dir) -> list[dict]:
+        evs = []
+        for p in sorted((j_dir / "events").glob("*.jsonl")):
+            for line in p.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    rec = json.loads(line)
+                    if rec.get("event") == "entry_cancelled":
+                        evs.append(rec)
+        return evs
+
+    # 3. P1 Marketable StopLimitOrder pricing + 4. Intra-bar Runaway Cancel (>=15 pts)
+    j_dir = tmp_path / "j_p1"
+    cfg_r = BotConfig()
+    cfg_r.risk.fixed_contracts = 1
+    cfg_r.risk.enable_partial_tp = False
+    cfg_r.risk.max_daily_loss_usd = 2500.0
+    runner = IBKRNQBotRunner(cfg_r, mode="paper")
+    runner.journal = TradeJournal(base_dir=str(j_dir), timezone="America/New_York")
+    runner.contract = Future(conId=563947726, symbol="NQ", localSymbol="NQZ6", multiplier="20", exchange="CME", currency="USD")
+    runner._send_discord_alert = lambda *a, **k: None
+
+    req_counter = iter(range(5000, 5200))
+    runner.ib.client = SimpleNamespace(getReqId=lambda: next(req_counter), isConnected=lambda: False)
+    placed_orders = []
+    cancelled_orders = []
+    open_trades = []
+
+    def _fake_place_order(c, o):
+        placed_orders.append(o)
+        tr = SimpleNamespace(contract=c, order=o, orderStatus=SimpleNamespace(status="Submitted"))
+        open_trades.append(tr)
+        return tr
+
+    runner.ib.placeOrder = _fake_place_order
+    runner.ib.cancelOrder = lambda o: cancelled_orders.append(o)
+    runner.ib.openTrades = lambda: list(open_trades)
+    runner.ib.trades = lambda: list(open_trades)
+    runner.ib.positions = lambda: []
+
+    now_utc = pd.Timestamp.now(tz="UTC")
+    curr_forming_ts = now_utc.floor("2min")
+    sig_closed_ts = curr_forming_ts - pd.Timedelta(minutes=2)
+    runner._last_processed_bar_time = sig_closed_ts
+    runner.bar_count = 60
+
+    sig_short = TradeSignal(
+        timestamp=sig_closed_ts,
+        direction="SHORT",
+        reason="Bearish Pullback",
+        entry_price=25616.25,
+        stop_loss=25664.25,
+        take_profit=25472.25,
+        stop_distance_points=48.0,
+        atr=62.5,
+        rsi=38.0,
+        vwap=25800.0,
+        ema_fast=25620.0,
+        ema_slow=25645.0,
+    )
+    runner.place_bracket_order(sig_short, quantity=1)
+    p_short = runner._active_parent_order
+    assert p_short.lmtPrice == 25614.25  # -2.00 pts marketable SHORT limit
+    assert p_short.auxPrice == 25622.25  # +6.00 pts collar stop trigger
+
+    # Check LONG limit/collar symmetry before testing runaway cancel
+    placed_orders.clear()
+    open_trades.clear()
+    sig_long = TradeSignal(
+        timestamp=sig_closed_ts,
+        direction="LONG",
+        reason="Bullish Pullback",
+        entry_price=25000.00,
+        stop_loss=24960.00,
+        take_profit=25120.00,
+        stop_distance_points=40.0,
+        atr=45.0,
+        rsi=58.0,
+        vwap=24980.0,
+        ema_fast=24998.0,
+        ema_slow=24990.0,
+    )
+    runner.place_bracket_order(sig_long, quantity=1)
+    p_long = runner._active_parent_order
+    assert p_long.lmtPrice == 25002.00  # +2.00 pts marketable LONG limit
+    assert p_long.auxPrice == 24994.00  # -6.00 pts collar stop trigger
+
+    # Re-submit SHORT @ 25616.25 and feed forming bar where price runs -21.25 pts (low=25595.00) without fill
+    placed_orders.clear()
+    cancelled_orders.clear()
+    open_trades.clear()
+    runner.place_bracket_order(sig_short, quantity=1)
+    placed_orders.clear()
+
+    forming_df = pd.DataFrame(
+        {
+            "timestamp": [sig_closed_ts, curr_forming_ts],
+            "open": [25650.0, 25613.0],
+            "high": [25652.0, 25613.5],
+            "low": [25614.0, 25595.0],   # 25616.25 - 25595.00 = +21.25 pts favorable move >= 15.0 pts!
+            "close": [25616.25, 25598.0],
+            "volume": [1200.0, 400.0],
+        }
+    )
+    runner._on_bar_update(forming_df, has_new_bar=True)
+    assert len(cancelled_orders) == 3  # parent, TP, SL cancelled via cancelOrder
+    assert not any(getattr(o, "orderType", "") == "MKT" for o in placed_orders)  # ZERO MarketOrders!
+    assert runner._active_parent_order is None
+    cancels = _read_cancel_events(j_dir)
+    assert len(cancels) == 1
+    assert cancels[-1]["cancel_trigger"] == "runaway_price"
+
+    # 5. P1 60-second Timeout Cancel (without runaway move)
+    placed_orders.clear()
+    cancelled_orders.clear()
+    open_trades.clear()
+    runner.place_bracket_order(sig_long, quantity=1)
+    placed_orders.clear()
+    runner._signal_submitted_utc = pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=65)
+    forming_flat_df = pd.DataFrame(
+        {
+            "timestamp": [sig_closed_ts, curr_forming_ts],
+            "open": [24995.0, 24999.0],
+            "high": [25001.0, 25001.0],   # only +1.0 pt favorable move < 15.0 pts
+            "low": [24992.0, 24996.0],
+            "close": [25000.0, 24998.0],
+            "volume": [1000.0, 250.0],
+        }
+    )
+    runner._on_bar_update(forming_flat_df, has_new_bar=True)
+    assert len(cancelled_orders) == 3
+    assert not any(getattr(o, "orderType", "") == "MKT" for o in placed_orders)
+    assert runner._active_parent_order is None
+    cancels = _read_cancel_events(j_dir)
+    assert len(cancels) == 2
+    assert cancels[-1]["cancel_trigger"] == "timeout_seconds"
+
+    # 6. P1 Safety Guard on Filled Position: NEVER cancel when filled_qty > 0 or live position exists
+    placed_orders.clear()
+    cancelled_orders.clear()
+    open_trades.clear()
+    runner.place_bracket_order(sig_short, quantity=1)
+    runner._signal_submitted_utc = pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=95)
+    runner._current_trade_filled_qty = 1
+    assert runner._check_pending_entry_guards(forming_df) is False
+    assert cancelled_orders == []
+
+    runner._current_trade_filled_qty = 0
+    runner._entry_fill_handled = False
+    runner.ib.positions = lambda: [SimpleNamespace(contract=runner.contract, position=-1.0)]
+    assert runner._check_pending_entry_guards(forming_df) is False
+    assert cancelled_orders == []

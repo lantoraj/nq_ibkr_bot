@@ -779,6 +779,163 @@ class IBKRNQBotRunner:
                 self.ib.placeOrder(self.contract, close_order)
                 logger.warning("Submitted %s %d %s MarketOrder to flatten position.", action, qty, self.contract.localSymbol)
 
+    def _cancel_unfilled_entry_orders(
+        self,
+        reason: str,
+        last_price: float,
+        trigger: str,
+        elapsed_sec: Optional[float] = None,
+        runaway_pts: Optional[float] = None,
+    ) -> bool:
+        """
+        Cancel working unfilled parent/child entry orders WITHOUT ever placing a MarketOrder.
+        Refuses to cancel if any filled qty or live IBKR position exists on the contract.
+        """
+        if self.contract is None or self._active_parent_order is None or self._active_signal is None:
+            return False
+        if self._current_trade_filled_qty > 0 or self._entry_fill_handled:
+            return False
+        for pos in self.ib.positions():
+            if pos.contract.conId == self.contract.conId and pos.position != 0:
+                return False
+
+        terminal = ("Cancelled", "ApiCancelled", "Filled", "Inactive")
+        for trade in self.ib.openTrades():
+            if (
+                trade.contract.conId == self.contract.conId
+                and getattr(getattr(trade, "orderStatus", None), "status", "") not in terminal
+            ):
+                self.ib.cancelOrder(trade.order)
+
+        cancelled_sig = self._active_signal
+        bars_waited = max(0, self.bar_count - self._entry_submitted_bar) if self._entry_submitted_bar >= 0 else 0
+        self._active_parent_order = None
+        self._active_parent_orders = []
+        self._active_tp_orders = []
+        self._active_stop_orders = []
+        self._active_tp1_order = None
+        self._active_tp_order = None
+        self._active_stop_order = None
+        self._active_signal = None
+
+        logger.warning(
+            "Cancelled unfilled %s %s entry @ %.2f (%s | last=%.2f | bars=%d)",
+            cancelled_sig.direction,
+            self.contract.localSymbol,
+            cancelled_sig.entry_price,
+            reason,
+            last_price,
+            bars_waited,
+        )
+        self.journal.log(
+            "entry_cancelled",
+            bar_ts=self._signal_bar_ts,
+            direction=cancelled_sig.direction,
+            signal_price=self._signal_price_orig,
+            last_close=last_price,
+            bars_waited=bars_waited,
+            cancel_trigger=trigger,
+            elapsed_sec=elapsed_sec,
+            runaway_pts=runaway_pts,
+            reason=reason,
+        )
+        self._send_discord_alert(
+            title=f"⚪ ENTRY CANCELLED (NOT FILLED) — {self.contract.localSymbol} {cancelled_sig.direction}",
+            description=(
+                f"**Trigger:** `{reason}`\n"
+                f"Limit entry @ `{cancelled_sig.entry_price:.2f}` was cancelled while flat (last price `{last_price:.2f}`).\n"
+                f"**No position was opened — PnL `$0.00`.**"
+            ),
+            color=0x95A5A6,
+        )
+        return True
+
+    def _check_pending_entry_guards(self, raw_bars: BarDataList | pd.DataFrame) -> bool:
+        """
+        Evaluate real-time sub-bar / inter-poll P1 guards on an unfilled working parent order:
+        1) Runaway Price Cancel: market ran >= `runaway_cancel_points` in signal direction without filling us
+        2) Seconds Timeout: unfilled entry older than `cancel_unfilled_entry_seconds`
+        """
+        if (
+            self.contract is None
+            or self._active_parent_order is None
+            or self._active_signal is None
+            or self._current_trade_filled_qty > 0
+            or self._entry_fill_handled
+        ):
+            return False
+        for pos in self.ib.positions():
+            if pos.contract.conId == self.contract.conId and pos.position != 0:
+                return False
+
+        def _to_utc(ts_val) -> Optional[pd.Timestamp]:
+            if ts_val is None:
+                return None
+            t = pd.Timestamp(ts_val)
+            if pd.isna(t):
+                return None
+            return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+
+        live_ts_utc: Optional[pd.Timestamp] = None
+        live_high: Optional[float] = None
+        live_low: Optional[float] = None
+        live_close: Optional[float] = None
+        if isinstance(raw_bars, pd.DataFrame):
+            if not raw_bars.empty:
+                last_row = raw_bars.iloc[-1]
+                live_ts_utc = _to_utc(last_row.get("timestamp"))
+                live_high = float(last_row["high"])
+                live_low = float(last_row["low"])
+                live_close = float(last_row["close"])
+        elif raw_bars:
+            try:
+                last_bar = raw_bars[-1]
+                live_ts_utc = _to_utc(getattr(last_bar, "date", None))
+                live_high = float(last_bar.high)
+                live_low = float(last_bar.low)
+                live_close = float(last_bar.close)
+            except Exception:
+                pass
+
+        sig_ts_utc = _to_utc(self._signal_bar_ts)
+        elapsed_sec = (
+            (pd.Timestamp.now(tz="UTC") - self._signal_submitted_utc).total_seconds()
+            if self._signal_submitted_utc is not None
+            else None
+        )
+
+        runaway_limit = float(getattr(self.cfg.risk, "runaway_cancel_points", 0.0) or 0.0)
+        if (
+            runaway_limit > 0.0
+            and live_ts_utc is not None
+            and sig_ts_utc is not None
+            and live_ts_utc > sig_ts_utc
+            and live_high is not None
+            and live_low is not None
+        ):
+            sig_p = float(self._signal_price_orig if self._signal_price_orig is not None else self._active_signal.entry_price)
+            fav_pts = (live_high - sig_p) if self._active_signal.direction == "LONG" else (sig_p - live_low)
+            if fav_pts >= runaway_limit:
+                return self._cancel_unfilled_entry_orders(
+                    reason=f"Runaway Price Cancel (+{fav_pts:.2f} pts >= {runaway_limit:.1f} pts without fill)",
+                    last_price=live_close if live_close is not None else sig_p,
+                    trigger="runaway_price",
+                    elapsed_sec=round(elapsed_sec, 1) if elapsed_sec is not None else None,
+                    runaway_pts=round(fav_pts, 2),
+                )
+
+        max_sec = float(getattr(self.cfg.risk, "cancel_unfilled_entry_seconds", 0.0) or 0.0)
+        if max_sec > 0.0 and elapsed_sec is not None and elapsed_sec >= max_sec:
+            fallback_p = float(self._active_signal.entry_price)
+            return self._cancel_unfilled_entry_orders(
+                reason=f"Unfilled Entry Timeout ({elapsed_sec:.0f}s >= {max_sec:.0f}s)",
+                last_price=live_close if live_close is not None else fallback_p,
+                trigger="timeout_seconds",
+                elapsed_sec=round(elapsed_sec, 1),
+            )
+
+        return False
+
     def _get_dead_order_ids(self) -> set[int]:
         """Collect order IDs already in terminal IBKR states across both trades() and openTrades()."""
         dead: set[int] = set()
@@ -1045,6 +1202,9 @@ class IBKRNQBotRunner:
             )
         else:
             tp_desc = f"**Take Profit (`+{tp2_r:.2g}R`):** `{signal.take_profit:.2f}`"
+        slip_pts_msg = self.cfg.risk.entry_limit_slippage_ticks * tick_size
+        cancel_sec_msg = float(getattr(self.cfg.risk, "cancel_unfilled_entry_seconds", 0.0) or 0.0)
+        runaway_msg = float(getattr(self.cfg.risk, "runaway_cancel_points", 0.0) or 0.0)
         self._send_discord_alert(
             title=f"{icon} — {action} {quantity} {self.contract.localSymbol} @ {signal.entry_price:.2f}",
             description=(
@@ -1053,8 +1213,8 @@ class IBKRNQBotRunner:
                 f"**Stop Loss (`-1R`):** `{signal.stop_loss:.2f}`\n"
                 f"{tp_desc}\n"
                 f"**Signal Setup:** {signal.reason}\n"
-                f"_Stop-Limit collar order working — a separate ✅ FILLED alert follows if executed, "
-                f"or ⚪ CANCELLED after {self.cfg.risk.cancel_unfilled_entry_bars} bars._"
+                f"_Stop-Limit collar (`±{slip_pts_msg:.2f} pt` LMT) working — a separate ✅ FILLED alert follows if executed, "
+                f"or ⚪ CANCELLED after `{self.cfg.risk.cancel_unfilled_entry_bars}b / {cancel_sec_msg:.0f}s` or `+{runaway_msg:.0f}pt` runaway._"
             ),
             color=color,
         )
@@ -1093,6 +1253,9 @@ class IBKRNQBotRunner:
         if not has_new_bar:
             return
 
+        # Run real-time sub-bar P1 guards on every poll before early-return on identical closed bars
+        cancelled_pending_now = self._check_pending_entry_guards(bars)
+
         df = self._bars_to_dataframe(bars)
         if df.empty:
             return
@@ -1126,6 +1289,9 @@ class IBKRNQBotRunner:
             if self.bar_count >= task["target_bar_count"]:
                 self._pending_post_trade_chart = None
                 self._dispatch_post_trade_review_chart(task)
+
+        if cancelled_pending_now:
+            return
 
         # 1. Check mandatory Session / EOD Flatten & Send Daily Summary Report (15:55 ET)
         self.risk.check_and_reset_session(latest_closed_ts)
@@ -1186,34 +1352,18 @@ class IBKRNQBotRunner:
                 and self.cfg.risk.cancel_unfilled_entry_bars > 0
                 and (self.bar_count - self._entry_submitted_bar) >= self.cfg.risk.cancel_unfilled_entry_bars
             ):
-                cancelled_sig = self._active_signal
-                self.flatten_all(reason=f"Unfilled Entry Order Timeout ({self.cfg.risk.cancel_unfilled_entry_bars} bars)")
-                self._active_parent_order = None
-                self._active_parent_orders = []
-                self._active_tp_orders = []
-                self._active_stop_orders = []
-                self._active_tp1_order = None
-                self._active_tp_order = None
-                self._active_stop_order = None
-                self._active_signal = None
-                if cancelled_sig is not None:
-                    self.journal.log(
-                        "entry_cancelled",
-                        bar_ts=self._signal_bar_ts,
-                        direction=cancelled_sig.direction,
-                        signal_price=self._signal_price_orig,
-                        last_close=close_p,
-                        bars_waited=self.bar_count - self._entry_submitted_bar,
-                    )
-                    self._send_discord_alert(
-                        title=f"⚪ ENTRY CANCELLED (NOT FILLED) — {self.contract.localSymbol} {cancelled_sig.direction}",
-                        description=(
-                            f"Limit entry @ `{cancelled_sig.entry_price:.2f}` was not filled within "
-                            f"`{self.cfg.risk.cancel_unfilled_entry_bars}` bars and was cancelled.\n"
-                            f"**No position was opened — PnL `$0.00`.**"
-                        ),
-                        color=0x95A5A6,
-                    )
+                elapsed_sec = (
+                    (pd.Timestamp.now(tz="UTC") - self._signal_submitted_utc).total_seconds()
+                    if self._signal_submitted_utc is not None
+                    else None
+                )
+                bars_cfg = self.cfg.risk.cancel_unfilled_entry_bars
+                self._cancel_unfilled_entry_orders(
+                    reason=f"Unfilled Entry Order Timeout ({bars_cfg} bar{'s' if bars_cfg != 1 else ''})",
+                    last_price=close_p,
+                    trigger="timeout_bars",
+                    elapsed_sec=round(elapsed_sec, 1) if elapsed_sec is not None else None,
+                )
                 return
 
             if (
@@ -2276,12 +2426,20 @@ class IBKRNQBotRunner:
                     f"RTH: +1R → +{self.cfg.risk.breakeven_offset_points:.1f}pt BE / {self.cfg.risk.reward_risk_ratio:.1f}R TP | "
                     f"PM: +{pm_be:.2g}R BE / {pm_rr:.1f}R TP"
                 )
+            slip_pts_cfg = self.cfg.risk.entry_limit_slippage_ticks * self.cfg.contract.tick_size
+            cancel_bars_cfg = int(getattr(self.cfg.risk, "cancel_unfilled_entry_bars", 1) or 0)
+            cancel_sec_cfg = float(getattr(self.cfg.risk, "cancel_unfilled_entry_seconds", 0.0) or 0.0)
+            runaway_cfg = float(getattr(self.cfg.risk, "runaway_cancel_points", 0.0) or 0.0)
+            hv_atr_thresh = float(getattr(self.cfg.risk, "high_vol_atr_threshold", 60.0) or 60.0)
+            hv_max_stop = float(getattr(self.cfg.risk, "high_vol_max_stop_points", self.cfg.risk.max_stop_points) or self.cfg.risk.max_stop_points)
             self._send_discord_alert(
                 title=f"🤖 {bot_name} Online — {self.contract.localSymbol} ({self.mode.upper()})",
                 description=(
                     f"**Profile:** `{bot_name}`\n"
                     f"**Contract:** `{self.contract.localSymbol}` (Expiry `{self.contract.lastTradeDateOrContractMonth}` | `${self.cfg.contract.point_value:.0f}/pt`)\n"
-                    f"**ATR Floor:** `RTH ≥ {self.cfg.strategy.min_atr_points:.0f} pts | Pre-Market ≥ {getattr(self.cfg.strategy, 'premarket_min_atr_points', self.cfg.strategy.min_atr_points):.0f} pts`\n"
+                    f"**ATR Window:** `RTH {self.cfg.strategy.min_atr_points:.0f}–{self.cfg.strategy.max_atr_points:.0f} pts`\n"
+                    f"**SL Cap:** `{self.cfg.risk.max_stop_points:.0f} pts ({hv_max_stop:.0f} pts if ATR > {hv_atr_thresh:.0f})`\n"
+                    f"**Entry Guard:** `±{slip_pts_cfg:.2f}pt LMT | Cancel {cancel_bars_cfg}b / {cancel_sec_cfg:.0f}s / +{runaway_cfg:.0f}pt`\n"
                     f"**Stop & TP Rules:** `{tp_rule_str} | {self.cfg.risk.time_decay_bars}b → -{self.cfg.risk.time_decay_stop_r:.2f}R Decay`\n"
                     f"**Data Feed:** `{feed_label}`\n"
                     f"**Timeframe:** `{self.cfg.strategy.bar_size}` | **Contracts:** `{self.cfg.risk.fixed_contracts}` | **Max Daily Loss:** `${self.cfg.risk.max_daily_loss_usd:.0f}`\n"
