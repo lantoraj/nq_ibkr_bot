@@ -112,12 +112,14 @@ class Backtester:
         config: BotConfig,
         commission_per_side_usd: float = 0.62,  # Typical IBKR MNQ commission ($2.10 for NQ)
         slippage_ticks: int = 1,
+        use_limit_execution: bool = False,
     ) -> None:
         self.cfg = config
         self.strategy = NQIntradayStrategy(config.strategy, config.risk, config.contract)
         self.risk = RiskManager(config.risk, config.contract)
         self.commission_per_side = commission_per_side_usd
         self.slippage_points = slippage_ticks * config.contract.tick_size
+        self.use_limit_execution = use_limit_execution
 
     def run(self, df: pd.DataFrame) -> Dict[str, object]:
         """Run bar-by-bar simulation and return trade log and summary metrics."""
@@ -157,16 +159,160 @@ class Backtester:
         be_moved: bool = False
         decay_moved: bool = False
 
+        # Pending StopLimit order state when use_limit_execution=True
+        pending_signal: Optional[TradeSignal] = None
+        pending_sig_idx: int = -1
+        pending_lmt: float = 0.0
+        pending_stp: float = 0.0
+        pending_best_fav: float = 0.0
+        prev_session_date = None
+
         point_val = self.cfg.contract.point_value
+        tick = self.cfg.contract.tick_size
+
+        def _activate_position(sig: TradeSignal, fill_price: float, bar_idx: int, reanchor_sl_tp: bool) -> None:
+            nonlocal active_signal, active_contracts, rem_contracts, active_entry_price
+            nonlocal active_stop_loss, active_take_profit, active_tp1_price, active_tp1_r
+            nonlocal active_is_pm, use_partial_tp, tp1_done, realized_leg1_pnl
+            nonlocal active_entry_idx, be_moved, decay_moved
+
+            active_signal = sig
+            active_contracts = self.risk.calculate_contracts(sig.stop_distance_points)
+            rem_contracts = active_contracts
+            active_entry_price = fill_price
+            one_r_pts = sig.stop_distance_points
+
+            sig_et = pd.Timestamp(sig.timestamp)
+            sig_et = (
+                sig_et.tz_localize(self.cfg.risk.timezone)
+                if sig_et.tzinfo is None
+                else sig_et.tz_convert(self.cfg.risk.timezone)
+            )
+            active_is_pm = sig_et.strftime("%H:%M") < "09:30"
+            use_partial_tp = (
+                active_contracts >= 2
+                and getattr(self.cfg.risk, "enable_partial_tp", True)
+            )
+
+            if reanchor_sl_tp:
+                active_stop_loss = (
+                    round_to_tick(fill_price - one_r_pts, tick)
+                    if sig.direction == "LONG"
+                    else round_to_tick(fill_price + one_r_pts, tick)
+                )
+            else:
+                active_stop_loss = sig.stop_loss
+
+            if use_partial_tp:
+                active_tp1_r = (
+                    getattr(self.cfg.risk, "premarket_partial_tp1_r", 1.4)
+                    if active_is_pm
+                    else getattr(self.cfg.risk, "partial_tp1_r", 2.0)
+                )
+                runner_r = (
+                    getattr(self.cfg.risk, "premarket_reward_risk_ratio", 2.0)
+                    if active_is_pm
+                    else getattr(self.cfg.risk, "runner_reward_risk_ratio", 5.0)
+                )
+                active_tp1_price = (
+                    round_to_tick(active_entry_price + active_tp1_r * one_r_pts, tick)
+                    if sig.direction == "LONG"
+                    else round_to_tick(active_entry_price - active_tp1_r * one_r_pts, tick)
+                )
+                runner_dist = round_to_tick(one_r_pts * runner_r, tick)
+                tp2_base = fill_price if reanchor_sl_tp else sig.entry_price
+                active_take_profit = (
+                    round_to_tick(tp2_base + runner_dist, tick)
+                    if sig.direction == "LONG"
+                    else round_to_tick(tp2_base - runner_dist, tick)
+                )
+            else:
+                active_tp1_r = 0.0
+                active_tp1_price = 0.0
+                if reanchor_sl_tp:
+                    rr = (
+                        getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+                        if active_is_pm
+                        else self.cfg.risk.reward_risk_ratio
+                    )
+                    tp_dist = round_to_tick(one_r_pts * rr, tick)
+                    active_take_profit = (
+                        round_to_tick(fill_price + tp_dist, tick)
+                        if sig.direction == "LONG"
+                        else round_to_tick(fill_price - tp_dist, tick)
+                    )
+                else:
+                    active_take_profit = sig.take_profit
+
+            active_entry_idx = bar_idx
+            be_moved = False
+            decay_moved = False
+            tp1_done = False
+            realized_leg1_pnl = 0.0
 
         for i in range(len(enriched)):
             bar = enriched.iloc[i]
             ts = pd.Timestamp(bar["timestamp"])
+            open_p = float(bar["open"])
             high_p = float(bar["high"])
             low_p = float(bar["low"])
             close_p = float(bar["close"])
 
             self.risk.check_and_reset_session(ts)
+            bar_date = self.risk.state.session_date
+            if bar_date != prev_session_date:
+                prev_session_date = bar_date
+                pending_signal = None
+
+            # 0. Evaluate resting StopLimit entry order if one is pending fill
+            if self.use_limit_execution and pending_signal is not None and active_signal is None:
+                bars_waited = i - pending_sig_idx
+                if self.risk.should_flatten_eod(ts):
+                    pending_signal = None
+                else:
+                    cancel_bars = int(getattr(self.cfg.risk, "cancel_unfilled_entry_bars", 1) or 1)
+                    runaway_pts = float(getattr(self.cfg.risk, "runaway_cancel_points", 0.0) or 0.0)
+                    filled_price: Optional[float] = None
+                    cancelled = False
+
+                    if pending_signal.direction == "LONG":
+                        if pending_stp <= open_p <= pending_lmt:
+                            filled_price = min(pending_lmt, round_to_tick(open_p + self.slippage_points, tick))
+                        elif runaway_pts > 0.0 and pending_best_fav >= runaway_pts:
+                            cancelled = True
+                        elif open_p > pending_lmt and low_p <= pending_lmt:
+                            if runaway_pts > 0.0 and (high_p - pending_signal.entry_price) >= runaway_pts:
+                                cancelled = True
+                            else:
+                                filled_price = pending_lmt
+                        elif open_p < pending_stp and high_p >= pending_stp:
+                            filled_price = min(pending_lmt, round_to_tick(pending_stp + self.slippage_points, tick))
+                        if filled_price is None and not cancelled:
+                            pending_best_fav = max(pending_best_fav, high_p - pending_signal.entry_price)
+                    else:  # SHORT
+                        if pending_lmt <= open_p <= pending_stp:
+                            filled_price = max(pending_lmt, round_to_tick(open_p - self.slippage_points, tick))
+                        elif runaway_pts > 0.0 and pending_best_fav >= runaway_pts:
+                            cancelled = True
+                        elif open_p < pending_lmt and high_p >= pending_lmt:
+                            if runaway_pts > 0.0 and (pending_signal.entry_price - low_p) >= runaway_pts:
+                                cancelled = True
+                            else:
+                                filled_price = pending_lmt
+                        elif open_p > pending_stp and low_p <= pending_stp:
+                            filled_price = max(pending_lmt, round_to_tick(pending_stp - self.slippage_points, tick))
+                        if filled_price is None and not cancelled:
+                            pending_best_fav = max(pending_best_fav, pending_signal.entry_price - low_p)
+
+                    if filled_price is not None:
+                        _activate_position(pending_signal, filled_price, bar_idx=i, reanchor_sl_tp=True)
+                        pending_signal = None
+                    else:
+                        if cancelled or bars_waited >= cancel_bars or (
+                            runaway_pts > 0.0 and pending_best_fav >= runaway_pts
+                        ):
+                            pending_signal = None
+                        continue
 
             # 1. Manage open position if one is active
             if active_signal is not None:
@@ -323,58 +469,25 @@ class Backtester:
 
             signal = self.strategy.evaluate_bar(enriched, idx=i)
             if signal is not None:
-                active_signal = signal
-                active_contracts = self.risk.calculate_contracts(signal.stop_distance_points)
-                rem_contracts = active_contracts
-                active_entry_price = (
-                    signal.entry_price + self.slippage_points
-                    if signal.direction == "LONG"
-                    else signal.entry_price - self.slippage_points
-                )
-                active_stop_loss = signal.stop_loss
-                sig_et = pd.Timestamp(signal.timestamp)
-                sig_et = (
-                    sig_et.tz_localize(self.cfg.risk.timezone)
-                    if sig_et.tzinfo is None
-                    else sig_et.tz_convert(self.cfg.risk.timezone)
-                )
-                active_is_pm = sig_et.strftime("%H:%M") < "09:30"
-                use_partial_tp = (
-                    active_contracts >= 2
-                    and getattr(self.cfg.risk, "enable_partial_tp", True)
-                )
-                if use_partial_tp:
-                    active_tp1_r = (
-                        getattr(self.cfg.risk, "premarket_partial_tp1_r", 1.4)
-                        if active_is_pm
-                        else getattr(self.cfg.risk, "partial_tp1_r", 2.0)
-                    )
-                    runner_r = (
-                        getattr(self.cfg.risk, "premarket_reward_risk_ratio", 2.0)
-                        if active_is_pm
-                        else getattr(self.cfg.risk, "runner_reward_risk_ratio", 5.0)
-                    )
-                    one_r = signal.stop_distance_points
-                    active_tp1_price = (
-                        round_to_tick(active_entry_price + active_tp1_r * one_r)
-                        if signal.direction == "LONG"
-                        else round_to_tick(active_entry_price - active_tp1_r * one_r)
-                    )
-                    runner_dist = round_to_tick(one_r * runner_r)
-                    active_take_profit = (
-                        round_to_tick(signal.entry_price + runner_dist)
-                        if signal.direction == "LONG"
-                        else round_to_tick(signal.entry_price - runner_dist)
-                    )
+                if self.use_limit_execution:
+                    slip_lmt = self.cfg.risk.entry_limit_slippage_ticks * tick
+                    collar = float(getattr(self.cfg.risk, "entry_collar_points", 0.0) or 0.0)
+                    pending_signal = signal
+                    pending_sig_idx = i
+                    pending_best_fav = 0.0
+                    if signal.direction == "LONG":
+                        pending_lmt = round_to_tick(signal.entry_price + slip_lmt, tick)
+                        pending_stp = round_to_tick(signal.entry_price - collar, tick) if collar > 0.0 else -1e12
+                    else:
+                        pending_lmt = round_to_tick(signal.entry_price - slip_lmt, tick)
+                        pending_stp = round_to_tick(signal.entry_price + collar, tick) if collar > 0.0 else 1e12
                 else:
-                    active_tp1_r = 0.0
-                    active_tp1_price = 0.0
-                    active_take_profit = signal.take_profit
-                active_entry_idx = i
-                be_moved = False
-                decay_moved = False
-                tp1_done = False
-                realized_leg1_pnl = 0.0
+                    instant_fill = (
+                        signal.entry_price + self.slippage_points
+                        if signal.direction == "LONG"
+                        else signal.entry_price - self.slippage_points
+                    )
+                    _activate_position(signal, instant_fill, bar_idx=i, reanchor_sl_tp=False)
 
         metrics = self._compute_metrics(trades)
         return {

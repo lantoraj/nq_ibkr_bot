@@ -1291,3 +1291,73 @@ def test_p1_entry_guards_and_p3_dynamic_sl_cap(tmp_path) -> None:
     runner.ib.positions = lambda: [SimpleNamespace(contract=runner.contract, position=-1.0)]
     assert runner._check_pending_entry_guards(forming_df) is False
     assert cancelled_orders == []
+
+
+def test_backtester_realistic_limit_execution_p1() -> None:
+    """Verify Backtester(use_limit_execution=True) models 2pt marketable fills, re-anchoring, and runaway cancel."""
+    from backtest import Backtester
+    from strategy import TradeSignal
+
+    cfg = BotConfig()
+    cfg.risk.fixed_contracts = 1
+    cfg.risk.enable_partial_tp = False
+    cfg.risk.max_daily_loss_usd = 500.0
+
+    # Scenario 1: SHORT signal @ 25616.25 (lmt=25614.25), next bar opens -1.25 pts below at 25615.0 ->
+    # fills at 25614.75 (25615.0 - 0.25 slippage), re-anchors SL to 25654.75 (+40) and TP to 25494.75 (-120).
+    ts1 = pd.date_range("2026-11-20 12:00:00", periods=3, freq="2min", tz="America/New_York").tz_convert("UTC")
+    df_gap = pd.DataFrame(
+        {
+            "timestamp": ts1,
+            "open": [25660.0, 25615.0, 25550.0],
+            "high": [25662.0, 25620.0, 25560.0],
+            "low": [25614.0, 25548.0, 25490.0],
+            "close": [25616.25, 25555.0, 25494.0],
+            "volume": [1000, 1200, 1400],
+        }
+    )
+    bt1 = Backtester(cfg, commission_per_side_usd=0.62, slippage_ticks=1, use_limit_execution=True)
+    bt1.strategy.prepare_dataframe = lambda d: d
+    bt1.strategy.evaluate_bar = lambda d, idx=-1: (
+        TradeSignal(
+            timestamp=d.iloc[idx]["timestamp"],
+            direction="SHORT",
+            reason="Bearish Pullback",
+            entry_price=25616.25,
+            stop_loss=25656.25,
+            take_profit=25496.25,
+            stop_distance_points=40.0,
+            atr=50.0,
+            rsi=40.0,
+            vwap=25700.0,
+            ema_fast=25625.0,
+            ema_slow=25645.0,
+        )
+        if idx == 0
+        else None
+    )
+    res1 = bt1.run(df_gap)
+    assert len(res1["trades"]) == 1
+    tr1 = res1["trades"][0]
+    assert tr1.entry_price == 25614.75
+    assert tr1.take_profit == 25494.75  # re-anchored -120.0 pts from exact fill 25614.75
+    assert tr1.exit_reason == "Take Profit"
+    assert tr1.exit_price == 25494.75
+
+    # Scenario 2: SHORT @ 25616.25 (lmt=25614.25), Bar 1 gaps below limit (open=25613.0) and runs -21.25 pts
+    # (low=25595.0) before bouncing back up through 25614.25 -> runaway >= 15pt cancels pending order cleanly!
+    df_runaway = pd.DataFrame(
+        {
+            "timestamp": ts1,
+            "open": [25660.0, 25613.0, 25610.0],
+            "high": [25662.0, 25620.0, 25670.0],
+            "low": [25614.0, 25595.0, 25605.0],
+            "close": [25616.25, 25618.0, 25665.0],
+            "volume": [1000, 1200, 1400],
+        }
+    )
+    bt2 = Backtester(cfg, commission_per_side_usd=0.62, slippage_ticks=1, use_limit_execution=True)
+    bt2.strategy.prepare_dataframe = lambda d: d
+    bt2.strategy.evaluate_bar = bt1.strategy.evaluate_bar
+    res2 = bt2.run(df_runaway)
+    assert len(res2["trades"]) == 0
