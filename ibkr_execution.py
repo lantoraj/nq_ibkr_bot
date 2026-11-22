@@ -24,6 +24,7 @@ import pandas as pd
 from ib_async import (
     IB,
     BarDataList,
+    ContFuture,
     Contract,
     Future,
     LimitOrder,
@@ -173,6 +174,16 @@ class IBKRNQBotRunner:
         self._signal_bar_ts: Optional[pd.Timestamp] = None
         self._signal_price_orig: Optional[float] = None
         self._signal_submitted_utc: Optional[pd.Timestamp] = None
+
+        # Dual-strategy MR-B regime & single-account PREEMPT_V42 coordination state
+        self._active_strategy_id: str = "v4.2"
+        self._daily_regime_date: Optional[date] = None
+        self._daily_regime_last_attempt_utc: Optional[pd.Timestamp] = None
+        self._daily_bull_50: Optional[bool] = None
+        self._daily_prev_close: Optional[float] = None
+        self._daily_ema50: Optional[float] = None
+        self._deferred_closed_trades: dict[Any, dict] = {}
+        self._order_strategy_map: dict[int, str] = {}
 
     def _sync_discord_webhook_profile(self) -> None:
         """Upload custom bot_icon.png and v4.1 name to the Discord webhook profile on startup."""
@@ -754,10 +765,15 @@ class IBKRNQBotRunner:
 
         return False
 
-    def flatten_all(self, reason: str = "Manual/EOD Flatten") -> None:
+    def flatten_all(
+        self,
+        reason: str = "Manual/EOD Flatten",
+        order_ref: Optional[str] = None,
+    ) -> List[Order]:
         """Cancel all open orders for the contract and close any open position with a MarketOrder."""
+        submitted: List[Order] = []
         if self.contract is None:
-            return
+            return submitted
 
         logger.warning("Flattening all orders and positions for %s (%s)", self.contract.localSymbol, reason)
 
@@ -775,9 +791,248 @@ class IBKRNQBotRunner:
             if pos.contract.conId == self.contract.conId and pos.position != 0:
                 action = "SELL" if pos.position > 0 else "BUY"
                 qty = abs(int(pos.position))
-                close_order = MarketOrder(action=action, totalQuantity=qty, tif="DAY")
-                self.ib.placeOrder(self.contract, close_order)
+                close_order = MarketOrder(
+                    action=action,
+                    totalQuantity=qty,
+                    tif="DAY",
+                    outsideRth=not self.cfg.risk.rth_only,
+                )
+                if order_ref:
+                    close_order.orderRef = order_ref
+                get_req = getattr(getattr(self.ib, "client", None), "getReqId", None)
+                if callable(get_req) and getattr(close_order, "orderId", 0) == 0:
+                    try:
+                        close_order.orderId = int(get_req())
+                    except Exception:
+                        pass
+                tr = self.ib.placeOrder(self.contract, close_order)
+                oid = int(
+                    getattr(close_order, "orderId", 0)
+                    or getattr(getattr(tr, "order", None), "orderId", 0)
+                    or 0
+                )
+                if oid and order_ref:
+                    self._order_strategy_map[oid] = order_ref.split(":", 1)[0]
+                submitted.append(close_order)
                 logger.warning("Submitted %s %d %s MarketOrder to flatten position.", action, qty, self.contract.localSymbol)
+        return submitted
+
+    def _wait_until_flat(self, timeout_sec: float = 8.0, poll_sec: float = 0.25) -> bool:
+        """Poll IBKR positions & open orders until contract is completely flat or timeout expires."""
+        import time
+
+        if self.contract is None:
+            return True
+
+        terminal = ("Cancelled", "ApiCancelled", "Filled", "Inactive")
+
+        def _is_flat_now() -> bool:
+            live_pos = any(
+                p.contract.conId == self.contract.conId and p.position != 0
+                for p in self.ib.positions()
+            )
+            if live_pos:
+                return False
+            active_orders = [
+                t for t in self.ib.openTrades()
+                if t.contract.conId == self.contract.conId
+                and getattr(getattr(t, "orderStatus", None), "status", "") not in terminal
+            ]
+            return len(active_orders) == 0
+
+        if _is_flat_now():
+            return True
+
+        try:
+            is_conn = bool(self.ib.isConnected())
+        except Exception:
+            is_conn = False
+        if not is_conn:
+            return _is_flat_now()
+
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            self.ib.sleep(poll_sec)
+            if _is_flat_now():
+                return True
+        return _is_flat_now()
+
+    def _reset_active_trade_state(self) -> None:
+        """Clear in-memory active trade & order references cleanly."""
+        self._current_trade_realized_pnl = 0.0
+        self._current_trade_commissions = 0.0
+        self._current_trade_closed_qty = 0
+        self._current_trade_filled_qty = 0
+        self._closing_exec_qty = 0
+        self._last_exit_exec_utc = None
+        self._active_signal = None
+        self._active_strategy_id = "v4.2"
+        self._active_parent_order = None
+        self._active_parent_orders = []
+        self._active_tp_orders = []
+        self._active_stop_orders = []
+        self._active_tp1_order = None
+        self._active_tp_order = None
+        self._active_stop_order = None
+        self._trade_entry_price = None
+        self._trade_direction = None
+        self._trade_initial_sl = None
+        self._trade_initial_tp1 = None
+        self._trade_initial_tp = None
+        self._entry_submitted_bar = -1
+        self._trade_filled_bar = -1
+        self._post_fill_bars = 0
+        self._trade_filled_ts_utc = None
+        self._trade_closed_ts_utc = None
+        self._signal_bar_ts = None
+        self._signal_price_orig = None
+        self._signal_submitted_utc = None
+        self._be_moved = False
+        self._decay_moved = False
+        self._tp1_filled = False
+        self._entry_fill_handled = False
+        self._stop_history = []
+
+    def _extract_daily_closes_from_bars(self, raw_bars: Any, today_et: date) -> pd.Series:
+        """Parse IBKR BarDataList or TradingView DataFrame of 1-day bars into completed-day close Series."""
+        if raw_bars is None:
+            return pd.Series(dtype=float)
+        if isinstance(raw_bars, pd.DataFrame):
+            df_d = raw_bars.copy()
+        else:
+            df_d = util.df(raw_bars)
+        if df_d is None or df_d.empty:
+            return pd.Series(dtype=float)
+        if "timestamp" not in df_d.columns and "date" in df_d.columns:
+            df_d = df_d.rename(columns={"date": "timestamp"})
+        if "timestamp" not in df_d.columns or "close" not in df_d.columns:
+            return pd.Series(dtype=float)
+
+        import pytz
+
+        tz = pytz.timezone(self.cfg.risk.timezone)
+        parsed: dict[date, float] = {}
+        for _, row in df_d.iterrows():
+            ts_val = row["timestamp"]
+            c_val = float(row["close"])
+            if pd.isna(c_val):
+                continue
+            if isinstance(ts_val, datetime):
+                if ts_val.tzinfo is not None:
+                    d_et = ts_val.astimezone(tz).date()
+                else:
+                    d_et = ts_val.date()
+            elif isinstance(ts_val, date):
+                d_et = ts_val
+            else:
+                ts_pd = pd.Timestamp(ts_val)
+                if pd.isna(ts_pd):
+                    continue
+                if ts_pd.tzinfo is not None and not (ts_pd.hour == 0 and ts_pd.minute == 0 and ts_pd.second == 0):
+                    d_et = ts_pd.tz_convert(tz).date()
+                else:
+                    d_et = ts_pd.date()
+            if d_et < today_et:
+                parsed[d_et] = c_val
+
+        if not parsed:
+            return pd.Series(dtype=float)
+        idx_dates = sorted(parsed.keys())
+        return pd.Series([parsed[d] for d in idx_dates], index=idx_dates, dtype=float)
+
+    def _refresh_daily_regime(self, ref_ts: Optional[pd.Timestamp] = None) -> bool:
+        """
+        Compute causal daily bull_50 regime (`prev_close > EMA50_d`) for MR-B using
+        completed daily RTH bars strictly before today's ET trading session.
+        Fails closed (`self._daily_bull_50 = False`) if daily history is unavailable.
+        """
+        if not self.cfg.strategy.enable_mr_b:
+            return False
+
+        ts_now = ref_ts if ref_ts is not None else pd.Timestamp.now(tz="UTC")
+        today_et = self.risk._to_session_dt(ts_now).date()
+        if self._daily_regime_date == today_et and self._daily_bull_50 is not None:
+            return True
+
+        now_utc = pd.Timestamp.now(tz="UTC")
+        if (
+            self._daily_regime_last_attempt_utc is not None
+            and (now_utc - self._daily_regime_last_attempt_utc).total_seconds() < 300.0
+        ):
+            return False
+        self._daily_regime_last_attempt_utc = now_utc
+
+        ema_period = int(getattr(self.cfg.strategy, "mr_b_daily_ema_period", 50) or 50)
+        completed_closes = pd.Series(dtype=float)
+
+        try:
+            is_conn = bool(self.ib.isConnected())
+        except Exception:
+            is_conn = False
+
+        if is_conn:
+            try:
+                cont = ContFuture(
+                    symbol=self.cfg.contract.symbol,
+                    exchange=self.cfg.contract.exchange,
+                    currency=self.cfg.contract.currency,
+                )
+                qualified = self.ib.qualifyContracts(cont)
+                target_contract = qualified[0] if qualified else self.contract
+                if target_contract is not None:
+                    bars_1d = self.ib.reqHistoricalData(
+                        target_contract,
+                        endDateTime="",
+                        durationStr="6 M",
+                        barSizeSetting="1 day",
+                        whatToShow="TRADES",
+                        useRTH=True,
+                        formatDate=1,
+                        keepUpToDate=False,
+                        timeout=30,
+                    )
+                    completed_closes = self._extract_daily_closes_from_bars(bars_1d, today_et)
+            except Exception as exc:
+                logger.warning("IBKR daily history fetch failed for MR-B EMA%d regime: %s", ema_period, exc)
+
+        if len(completed_closes) < ema_period and self.tv_feed is not None:
+            try:
+                tv_daily = self.tv_feed.fetch_daily_bars(
+                    base_symbol=self.cfg.contract.symbol,
+                    n_bars=max(150, ema_period + 40),
+                )
+                tv_closes = self._extract_daily_closes_from_bars(tv_daily, today_et)
+                if len(tv_closes) >= len(completed_closes):
+                    completed_closes = tv_closes
+            except Exception as exc:
+                logger.warning("TradingView daily history fallback failed for MR-B EMA%d regime: %s", ema_period, exc)
+
+        if len(completed_closes) < ema_period:
+            self._daily_bull_50 = False
+            logger.warning(
+                "MR-B daily EMA%d regime unavailable (completed days=%d < %d); failing closed (bull_50=False).",
+                ema_period,
+                len(completed_closes),
+                ema_period,
+            )
+            return False
+
+        prev_close = float(completed_closes.iloc[-1])
+        ema50_d = float(completed_closes.ewm(span=ema_period, adjust=False).mean().iloc[-1])
+        self._daily_prev_close = round(prev_close, 2)
+        self._daily_ema50 = round(ema50_d, 2)
+        self._daily_bull_50 = bool(prev_close > ema50_d)
+        self._daily_regime_date = today_et
+        logger.info(
+            "MR-B Daily Regime [%s] | PrevClose=%.2f vs EMA%d=%.2f -> bull_50=%s (%d completed days)",
+            today_et,
+            prev_close,
+            ema_period,
+            ema50_d,
+            self._daily_bull_50,
+            len(completed_closes),
+        )
+        return True
 
     def _cancel_unfilled_entry_orders(
         self,
@@ -808,6 +1063,7 @@ class IBKRNQBotRunner:
                 self.ib.cancelOrder(trade.order)
 
         cancelled_sig = self._active_signal
+        cancelled_strat = self._active_strategy_id
         bars_waited = max(0, self.bar_count - self._entry_submitted_bar) if self._entry_submitted_bar >= 0 else 0
         self._active_parent_order = None
         self._active_parent_orders = []
@@ -817,9 +1073,11 @@ class IBKRNQBotRunner:
         self._active_tp_order = None
         self._active_stop_order = None
         self._active_signal = None
+        self._active_strategy_id = "v4.2"
 
         logger.warning(
-            "Cancelled unfilled %s %s entry @ %.2f (%s | last=%.2f | bars=%d)",
+            "Cancelled unfilled [%s] %s %s entry @ %.2f (%s | last=%.2f | bars=%d)",
+            cancelled_strat,
             cancelled_sig.direction,
             self.contract.localSymbol,
             cancelled_sig.entry_price,
@@ -830,6 +1088,7 @@ class IBKRNQBotRunner:
         self.journal.log(
             "entry_cancelled",
             bar_ts=self._signal_bar_ts,
+            strategy_id=cancelled_strat,
             direction=cancelled_sig.direction,
             signal_price=self._signal_price_orig,
             last_close=last_price,
@@ -839,10 +1098,11 @@ class IBKRNQBotRunner:
             runaway_pts=runaway_pts,
             reason=reason,
         )
+        strat_badge = f"[{cancelled_strat}] " if cancelled_strat == "MR-B" else ""
         self._send_discord_alert(
-            title=f"⚪ ENTRY CANCELLED (NOT FILLED) — {self.contract.localSymbol} {cancelled_sig.direction}",
+            title=f"⚪ {strat_badge}ENTRY CANCELLED (NOT FILLED) — {self.contract.localSymbol} {cancelled_sig.direction}",
             description=(
-                f"**Trigger:** `{reason}`\n"
+                f"**Strategy:** `{cancelled_strat}` | **Trigger:** `{reason}`\n"
                 f"Limit entry @ `{cancelled_sig.entry_price:.2f}` was cancelled while flat (last price `{last_price:.2f}`).\n"
                 f"**No position was opened — PnL `$0.00`.**"
             ),
@@ -1000,11 +1260,15 @@ class IBKRNQBotRunner:
             if sig_et.tzinfo is None
             else sig_et.tz_convert(self.cfg.risk.timezone)
         )
-        is_pm = sig_et.strftime("%H:%M") < "09:30"
-        use_scale_out = quantity >= 2 and getattr(self.cfg.risk, "enable_partial_tp", True)
+        strat_id = getattr(signal, "strategy_id", "v4.2")
+        is_mr_b = strat_id == "MR-B"
+        is_pm = (not is_mr_b) and (sig_et.strftime("%H:%M") < "09:30")
+        # MR-B always submits a single unified bracket targeting fixed Session VWAP (no TP1/TP2 split)
+        use_scale_out = (not is_mr_b) and quantity >= 2 and getattr(self.cfg.risk, "enable_partial_tp", True)
 
         def _build_bracket(qty: int, tp_price: float) -> tuple[Order, LimitOrder, StopOrder]:
             parent_id = self.ib.client.getReqId()
+            order_ref = f"{strat_id}:{parent_id}"
             if use_market_entry:
                 parent: Order = MarketOrder(
                     action=action,
@@ -1013,6 +1277,7 @@ class IBKRNQBotRunner:
                     transmit=False,
                     outsideRth=not self.cfg.risk.rth_only,
                     tif="DAY",
+                    orderRef=order_ref,
                 )
             else:
                 slip_pts = self.cfg.risk.entry_limit_slippage_ticks * tick_size
@@ -1037,6 +1302,7 @@ class IBKRNQBotRunner:
                         transmit=False,
                         outsideRth=not self.cfg.risk.rth_only,
                         tif="DAY",
+                        orderRef=order_ref,
                     )
                 else:
                     parent = LimitOrder(
@@ -1047,6 +1313,7 @@ class IBKRNQBotRunner:
                         transmit=False,
                         outsideRth=not self.cfg.risk.rth_only,
                         tif="DAY",
+                        orderRef=order_ref,
                     )
 
             take_profit = LimitOrder(
@@ -1057,6 +1324,7 @@ class IBKRNQBotRunner:
                 transmit=False,
                 outsideRth=not self.cfg.risk.rth_only,
                 tif="DAY",
+                orderRef=order_ref,
             )
             take_profit.orderId = self.ib.client.getReqId()
 
@@ -1068,6 +1336,7 @@ class IBKRNQBotRunner:
                 transmit=True,  # Final child order transmits this bracket atomically
                 outsideRth=not self.cfg.risk.rth_only,
                 tif="DAY",
+                orderRef=order_ref,
             )
             stop_loss.orderId = self.ib.client.getReqId()
             return parent, take_profit, stop_loss
@@ -1113,11 +1382,14 @@ class IBKRNQBotRunner:
             stop_orders = [sl1, sl2]
             tp1_order = tp1
         else:
-            tp2_r = (
-                getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
-                if is_pm
-                else self.cfg.risk.reward_risk_ratio
-            )
+            if is_mr_b and signal.stop_distance_points > 0:
+                tp2_r = (signal.take_profit - signal.entry_price) / signal.stop_distance_points
+            else:
+                tp2_r = (
+                    getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+                    if is_pm
+                    else self.cfg.risk.reward_risk_ratio
+                )
             p1, tp1, sl1 = _build_bracket(quantity, signal.take_profit)
             orders_to_place = (p1, tp1, sl1)
             parent_orders = [p1]
@@ -1131,11 +1403,13 @@ class IBKRNQBotRunner:
             is_conn = False
         pace = is_conn and hasattr(self.ib, "sleep")
         for idx_ord, o in enumerate(orders_to_place):
+            self._order_strategy_map[int(getattr(o, "orderId", 0) or 0)] = strat_id
             trades.append(self.ib.placeOrder(self.contract, o))
             if pace and use_scale_out and idx_ord in (0, 2, 3):
                 self.ib.sleep(0.05)
 
         self._active_signal = signal
+        self._active_strategy_id = strat_id
         self._active_parent_orders = parent_orders
         self._active_tp_orders = tp_orders
         self._active_stop_orders = stop_orders
@@ -1171,6 +1445,7 @@ class IBKRNQBotRunner:
         self.journal.log(
             "order_submitted",
             bar_ts=signal.timestamp,
+            strategy_id=strat_id,
             direction=signal.direction,
             quantity=quantity,
             order_type=type(parent_orders[0]).__name__,
@@ -1183,7 +1458,8 @@ class IBKRNQBotRunner:
             take_profit_1=tp1_price,
         )
         logger.info(
-            "BRACKET ORDER SUBMITTED [%s] %s %d %s @ %.2f | SL=%.2f | TP=%s | Reason: %s",
+            "BRACKET ORDER SUBMITTED [%s | %s] %s %d %s @ %.2f | SL=%.2f | TP=%s | Reason: %s",
+            strat_id,
             signal.direction,
             action,
             quantity,
@@ -1193,22 +1469,25 @@ class IBKRNQBotRunner:
             f"TP1={tp1_price:.2f} / TP2={signal.take_profit:.2f}" if tp1_price is not None else f"{signal.take_profit:.2f}",
             signal.reason,
         )
+        strat_badge = f"[{strat_id}] " if is_mr_b else ""
         icon = "🟢 LONG ORDER SUBMITTED" if signal.direction == "LONG" else "🔴 SHORT ORDER SUBMITTED"
-        color = 0x2ECC71 if signal.direction == "LONG" else 0xE74C3C
+        color = 0x1ABC9C if is_mr_b else (0x2ECC71 if signal.direction == "LONG" else 0xE74C3C)
         if tp1_price is not None:
             tp_desc = (
                 f"**TP1 (`+{tp1_r:.2g}R`, `1 ct`):** `{tp1_price:.2f}`\n"
                 f"**TP2 Runner (`+{tp2_r:.2g}R`, `1 ct`):** `{signal.take_profit:.2f}`"
             )
+        elif is_mr_b:
+            tp_desc = f"**Take Profit (Fixed VWAP, `+{tp2_r:.2f}R`):** `{signal.take_profit:.2f}`"
         else:
             tp_desc = f"**Take Profit (`+{tp2_r:.2g}R`):** `{signal.take_profit:.2f}`"
         slip_pts_msg = self.cfg.risk.entry_limit_slippage_ticks * tick_size
         cancel_sec_msg = float(getattr(self.cfg.risk, "cancel_unfilled_entry_seconds", 0.0) or 0.0)
         runaway_msg = float(getattr(self.cfg.risk, "runaway_cancel_points", 0.0) or 0.0)
         self._send_discord_alert(
-            title=f"{icon} — {action} {quantity} {self.contract.localSymbol} @ {signal.entry_price:.2f}",
+            title=f"{icon} {strat_badge}— {action} {quantity} {self.contract.localSymbol} @ {signal.entry_price:.2f}",
             description=(
-                f"**Mode:** `{self.mode.upper()}`\n"
+                f"**Mode:** `{self.mode.upper()}` | **Strategy:** `{strat_id}`\n"
                 f"**Entry Price:** `{signal.entry_price:.2f}`\n"
                 f"**Stop Loss (`-1R`):** `{signal.stop_loss:.2f}`\n"
                 f"{tp_desc}\n"
@@ -1219,6 +1498,136 @@ class IBKRNQBotRunner:
             color=color,
         )
         return trades
+
+    def _preempt_mr_b_for_v42(
+        self,
+        v42_signal: TradeSignal,
+        latest_closed_ts: pd.Timestamp,
+        close_p: float,
+        has_pos: bool,
+    ) -> bool:
+        """
+        Single-account Yield + Auto-Flatten (`PREEMPT_V42`):
+        When an MR-B working order or open position exists and v4.2 fires a signal,
+        flatten/cancel MR-B, wait for IBKR flat confirmation before submitting v4.2.
+        """
+        sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+        if not has_pos:
+            cancelled = self._cancel_unfilled_entry_orders(
+                reason=f"Preempted by v4.2 {v42_signal.direction} signal (Yield)",
+                last_price=close_p,
+                trigger="preempt_v42",
+            )
+            if not cancelled or not self._wait_until_flat(timeout_sec=5.0):
+                logger.error("PREEMPT_V42 ABORTED: MR-B working order did not clear cleanly; skipping v4.2 entry.")
+                return False
+        else:
+            planned_qty = (
+                sum(int(getattr(p, "totalQuantity", 1) or 1) for p in self._active_parent_orders)
+                if self._active_parent_orders
+                else int(getattr(self._active_parent_order, "totalQuantity", 1) or 1)
+            )
+            snapshot = {
+                "strategy_id": "MR-B",
+                "expected_qty": max(1, self._current_trade_filled_qty or planned_qty),
+                "closed_qty": self._current_trade_closed_qty,
+                "realized_pnl": self._current_trade_realized_pnl,
+                "commissions": self._current_trade_commissions,
+                "entry_price": self._trade_entry_price or (self._active_signal.entry_price if self._active_signal else close_p),
+                "direction": self._trade_direction or "LONG",
+                "sl_price": self._trade_initial_sl,
+                "tp_price": self._trade_initial_tp,
+                "signal_price": self._signal_price_orig,
+                "signal_bar_ts": self._signal_bar_ts or latest_closed_ts,
+                "filled_ts_utc": self._trade_filled_ts_utc,
+                "filled_bar": self._trade_filled_bar,
+                "submitted_bar": self._entry_submitted_bar,
+                "be_moved": self._be_moved,
+                "decay_moved": self._decay_moved,
+                "stop_history": list(self._stop_history),
+                "exit_reason": "PREEMPT_V42",
+                "exit_bar_count": self.bar_count,
+                "keys": [],
+            }
+            close_orders = self.flatten_all(
+                reason=f"PREEMPT_V42: Yielding MR-B to v4.2 {v42_signal.direction}",
+                order_ref="MR-B:PREEMPT_V42",
+            )
+            if not self._wait_until_flat(timeout_sec=8.0):
+                logger.error("PREEMPT_V42 ABORTED: IBKR did not confirm flat after flatten timeout; skipping v4.2 entry.")
+                self._send_discord_alert(
+                    title=f"🚨 PREEMPT_V42 ABORTED — {sym}",
+                    description=(
+                        f"MR-B flatten did not confirm flat before `v4.2 {v42_signal.direction}` entry.\n"
+                        f"**Action:** Skipped `v4.2` order submission to prevent netting conflict."
+                    ),
+                    color=0xE74C3C,
+                )
+                return False
+
+            try:
+                is_conn = bool(self.ib.isConnected())
+            except Exception:
+                is_conn = False
+            if is_conn and self._active_signal is not None:
+                for _ in range(6):
+                    self.ib.sleep(0.25)
+                    if self._active_signal is None:
+                        break
+
+            if self._active_signal is not None:
+                snapshot["closed_qty"] = self._current_trade_closed_qty
+                snapshot["realized_pnl"] = self._current_trade_realized_pnl
+                snapshot["commissions"] = self._current_trade_commissions
+                for co in close_orders:
+                    oid = int(getattr(co, "orderId", 0) or 0)
+                    if oid:
+                        self._deferred_closed_trades[oid] = snapshot
+                        snapshot["keys"].append(oid)
+                if not snapshot["keys"]:
+                    self._deferred_closed_trades["MR-B:PREEMPT_V42"] = snapshot
+                    snapshot["keys"].append("MR-B:PREEMPT_V42")
+                self._reset_active_trade_state()
+
+        v42_ok_after, block_reason = self.risk.can_open_trade(latest_closed_ts, self.bar_count)
+        if not v42_ok_after:
+            logger.warning("PREEMPT_V42 cancelled v4.2 submission after flatten: %s", block_reason)
+            return False
+
+        qty = self.risk.calculate_contracts(v42_signal.stop_distance_points)
+        self.journal.log(
+            "preempt_v42",
+            bar_ts=latest_closed_ts,
+            v42_direction=v42_signal.direction,
+            v42_entry_price=v42_signal.entry_price,
+            close_price=close_p,
+        )
+        self.journal.log(
+            "signal",
+            bar_ts=latest_closed_ts,
+            strategy_id="v4.2",
+            direction=v42_signal.direction,
+            reason=v42_signal.reason,
+            entry_price=v42_signal.entry_price,
+            stop_loss=v42_signal.stop_loss,
+            take_profit=v42_signal.take_profit,
+            stop_distance=v42_signal.stop_distance_points,
+            atr=v42_signal.atr,
+            rsi=v42_signal.rsi,
+            vwap=v42_signal.vwap,
+            meta_probability=v42_signal.meta_probability,
+            quantity=qty,
+        )
+        self._send_discord_alert(
+            title=f"⚡ PREEMPT_V42 — MR-B Yielded to v4.2 {v42_signal.direction} ({sym})",
+            description=(
+                f"MR-B position/order flattened cleanly @ `{close_p:.2f}`.\n"
+                f"Submitting priority **`v4.2 {v42_signal.direction}`** (`{qty} ct`) @ `{v42_signal.entry_price:.2f}`."
+            ),
+            color=0x9B59B6,
+        )
+        self.place_bracket_order(v42_signal, quantity=qty)
+        return True
 
     def _bars_to_dataframe(self, bars: BarDataList | pd.DataFrame) -> pd.DataFrame:
         """Convert IBKR BarDataList or TradingView DataFrame to standardized OHLCV DataFrame (excluding incomplete forming bar)."""
@@ -1315,6 +1724,15 @@ class IBKRNQBotRunner:
                 self.send_daily_summary_report(df, latest_closed_ts)
             return
 
+        # 1b. Refresh causal daily EMA50_d regime once per ET session when MR-B is enabled
+        if self.cfg.strategy.enable_mr_b and self._daily_regime_date != self.risk.state.session_date:
+            try:
+                is_conn = bool(self.ib.isConnected())
+            except Exception:
+                is_conn = False
+            if is_conn:
+                self._refresh_daily_regime(latest_closed_ts)
+
         # 2. Compute indicators on latest closed bar
         enriched = self.strategy.prepare_dataframe(df)
         last = enriched.iloc[-1]
@@ -1327,14 +1745,19 @@ class IBKRNQBotRunner:
         kalman_vel = float(last.get("kalman_vel_atr", 0.0))
         et_ts_str = self.risk._to_session_dt(latest_closed_ts).strftime("%H:%M ET")
 
-        # 3. If already in a position or working order, check Unfilled Timeout & +1R Break-Even Stop
+        # 3. If already in a position or working order, check Yield/PREEMPT_V42, Timeout, BE Stop & MR-B Time Exit
         if self.has_open_position_or_orders():
             has_pos = any(
                 pos.contract.conId == self.contract.conId and pos.position != 0
                 for pos in self.ib.positions()
             )
+            active_strat = (
+                getattr(self._active_signal, "strategy_id", self._active_strategy_id)
+                if self._active_signal is not None
+                else self._active_strategy_id
+            )
             logger.info(
-                "BAR CLOSE [%s] %s=%.2f | VWAP=%.2f (Z=%+.2f) | EMA9/21=%.2f/%.2f | Hurst=%.2f | KalVel=%+.2f | Status: %s",
+                "BAR CLOSE [%s] %s=%.2f | VWAP=%.2f (Z=%+.2f) | EMA9/21=%.2f/%.2f | Hurst=%.2f | KalVel=%+.2f | Status: %s [%s]",
                 et_ts_str,
                 self.contract.localSymbol if self.contract else "MNQ",
                 close_p,
@@ -1345,7 +1768,17 @@ class IBKRNQBotRunner:
                 hurst_v,
                 kalman_vel,
                 "In Active Position" if has_pos else "Working Entry Order",
+                active_strat,
             )
+
+            # 3a. Single-account Yield + Auto-Flatten (PREEMPT_V42) when MR-B is active and v4.2 fires
+            if self.cfg.strategy.enable_mr_b and self._active_signal is not None and active_strat == "MR-B":
+                v42_ok, _ = self.risk.can_open_trade(latest_closed_ts, self.bar_count)
+                v42_sig = self.strategy.evaluate_bar(enriched, idx=-1) if v42_ok else None
+                if v42_sig is not None:
+                    self._preempt_mr_b_for_v42(v42_sig, latest_closed_ts, close_p, has_pos)
+                    return
+
             if (
                 not has_pos
                 and self._active_parent_order is not None
@@ -1385,6 +1818,21 @@ class IBKRNQBotRunner:
                             ot.order.orderId,
                             self.cfg.risk.cancel_unfilled_entry_bars,
                         )
+
+            # 3b. MR-B Pre-FOMC 13:56 ET Auto-Flatten
+            if has_pos and active_strat == "MR-B" and self.risk.should_flatten_mr_b_fomc(latest_closed_ts):
+                sym_lbl = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+                self.flatten_all(
+                    reason="MR-B Pre-FOMC (13:56 ET) Auto-Flatten",
+                    order_ref="MR-B:FOMC_FLAT",
+                )
+                self.journal.log("mr_b_fomc_flatten", bar_ts=latest_closed_ts, close_price=close_p)
+                self._send_discord_alert(
+                    title=f"🏛️ PRE-FOMC AUTO-FLATTEN [MR-B] — {sym_lbl}",
+                    description=f"Flattened open MR-B position @ `{close_p:.2f}` ahead of 14:00 ET FOMC decision.",
+                    color=0xE67E22,
+                )
+                return
 
             if has_pos and self._active_stop_order is not None and self._active_signal is not None:
                 closed_so_far = max(
@@ -1445,6 +1893,7 @@ class IBKRNQBotRunner:
                                     ocaType=3,
                                     overridePercentageConstraints=True,
                                     transmit=True,
+                                    orderRef=f"{active_strat}:HEAL",
                                 )
                                 self.ib.placeOrder(self.contract, new_stp)
                                 self._active_stop_order = new_stp
@@ -1454,7 +1903,7 @@ class IBKRNQBotRunner:
                                     self.contract.localSymbol, rev_action, qty, target_sl,
                                 )
 
-            # Delay-aware check: only evaluate +1R Break-Even and 6-bar Time-Decay on bars that
+            # Delay-aware check: only evaluate BE, Time-Decay, and Time-Exit on bars that
             # closed AT OR AFTER the real-time entry fill timestamp (handles 10-min delayed Paper bars).
             bar_end_utc = pd.Timestamp(latest_closed_ts).tz_convert("UTC") + pd.Timedelta(minutes=2)
             is_post_fill_bar = (
@@ -1462,7 +1911,61 @@ class IBKRNQBotRunner:
                 or bar_end_utc >= self._trade_filled_ts_utc
             )
 
+            if has_pos and is_post_fill_bar and self._active_signal is not None:
+                self._post_fill_bars += 1
+
             if (
+                has_pos
+                and is_post_fill_bar
+                and self._active_signal is not None
+                and self._active_stop_order is not None
+                and active_strat == "MR-B"
+            ):
+                from indicators import round_to_tick
+
+                sig = self._active_signal
+                entry_ref = float(self._trade_entry_price or sig.entry_price)
+                one_r = sig.stop_distance_points
+                mr_be_r = float(getattr(self.cfg.risk, "mr_b_breakeven_r", 0.6))
+                mr_be_off = float(getattr(self.cfg.risk, "mr_b_breakeven_offset_points", 1.5))
+
+                if not self._be_moved and mr_be_r > 0.0 and close_p >= entry_ref + mr_be_r * one_r:
+                    new_sl = round_to_tick(entry_ref + mr_be_off, self.cfg.contract.tick_size)
+                    if close_p <= new_sl + 0.50:
+                        logger.warning(
+                            "MR-B BE trigger reached (+%.2fR), but close %.2f <= BE stop %.2f + 0.50; deferring stop move.",
+                            mr_be_r,
+                            close_p,
+                            new_sl,
+                        )
+                    elif new_sl > self._active_stop_order.auxPrice:
+                        self._modify_active_stop_orders(new_sl)
+                        self._be_moved = True
+                        self._record_stop_level(new_sl, "breakeven")
+                        self.journal.log("stop_moved", bar_ts=latest_closed_ts, strategy_id="MR-B", kind="breakeven", direction="LONG", new_stop=new_sl, entry_price=entry_ref)
+                        logger.info("Moved MR-B LONG StopOrder to Break-Even+ (%.2f) after reaching +%.2fR", new_sl, mr_be_r)
+                        self._send_discord_alert(
+                            title=f"🛡️ BREAK-EVEN [MR-B] (+{mr_be_r:.2g}R) LOCKED — {self.contract.localSymbol} LONG",
+                            description=f"Moved MR-B Stop Loss up to **`{new_sl:.2f}`** (`+{mr_be_off:.1f} pts` above entry `{entry_ref:.2f}`).",
+                            color=0xF1C40F,
+                        )
+
+                mr_max_hold = int(getattr(self.cfg.risk, "mr_b_max_hold_bars", 45) or 0)
+                if mr_max_hold > 0 and self._post_fill_bars >= mr_max_hold:
+                    sym_lbl = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+                    self.flatten_all(
+                        reason=f"MR-B Time Exit ({self._post_fill_bars} bars / 90 min)",
+                        order_ref="MR-B:TIME_EXIT",
+                    )
+                    self.journal.log("mr_b_time_exit", bar_ts=latest_closed_ts, bars_held=self._post_fill_bars, close_price=close_p)
+                    self._send_discord_alert(
+                        title=f"⏱️ MR-B TIME EXIT ({self._post_fill_bars} bars) — {sym_lbl}",
+                        description=f"Flattened MR-B LONG @ `{close_p:.2f}` after reaching `{mr_max_hold}`-bar hold limit.",
+                        color=0xE67E22,
+                    )
+                    return
+
+            elif (
                 has_pos
                 and is_post_fill_bar
                 and self.cfg.risk.breakeven_at_1r
@@ -1472,7 +1975,6 @@ class IBKRNQBotRunner:
             ):
                 from indicators import round_to_tick
 
-                self._post_fill_bars += 1
                 latest_bar = df.iloc[-1]
                 high_p = float(latest_bar["high"])
                 low_p = float(latest_bar["low"])
@@ -1580,13 +2082,18 @@ class IBKRNQBotRunner:
                     sig = self._active_signal
                     entry_ref = float(self._trade_entry_price or sig.entry_price)
                     one_r = sig.stop_distance_points
+                    news_be_off = (
+                        self.cfg.risk.mr_b_breakeven_offset_points
+                        if active_strat == "MR-B"
+                        else self.cfg.risk.breakeven_offset_points
+                    )
                     news_sl, news_kind = compute_pre_news_tightened_stop(
                         direction=sig.direction,
                         entry_ref=entry_ref,
                         one_r=one_r,
                         current_sl=float(self._active_stop_order.auxPrice),
                         close_p=close_p,
-                        be_offset_pts=self.cfg.risk.breakeven_offset_points,
+                        be_offset_pts=news_be_off,
                         decay_stop_r=self.cfg.risk.time_decay_stop_r,
                         round_fn=round_to_tick,
                     )
@@ -1600,6 +2107,7 @@ class IBKRNQBotRunner:
                         self.journal.log(
                             "stop_moved",
                             bar_ts=latest_closed_ts,
+                            strategy_id=active_strat,
                             kind=news_kind,
                             direction=sig.direction,
                             new_stop=news_sl,
@@ -1624,47 +2132,35 @@ class IBKRNQBotRunner:
                         )
             return
 
-        # 4. Check intraday risk guardrails
+        # 4. Check intraday risk guardrails (v4.2 has strict priority over MR-B)
         allowed, risk_reason = self.risk.can_open_trade(latest_closed_ts, self.bar_count)
-        if not allowed:
-            # Record signals that would have fired but were blocked by risk rules (inside session windows only)
-            if not risk_reason.startswith("Outside"):
-                try:
-                    blocked_sig = self.strategy.evaluate_bar(enriched, idx=-1)
-                    if blocked_sig is not None:
-                        self.journal.log(
-                            "signal_blocked",
-                            bar_ts=latest_closed_ts,
-                            direction=blocked_sig.direction,
-                            reason=blocked_sig.reason,
-                            entry_price=blocked_sig.entry_price,
-                            atr=blocked_sig.atr,
-                            block_reason=risk_reason,
-                        )
-                except Exception as exc:
-                    logger.debug("Blocked-signal journal evaluation failed: %s", exc)
-            logger.info(
-                "BAR CLOSE [%s] %s=%.2f | VWAP=%.2f (Z=%+.2f) | EMA9/21=%.2f/%.2f | Hurst=%.2f | KalVel=%+.2f | Status: %s",
-                et_ts_str,
-                self.contract.localSymbol if self.contract else "MNQ",
-                close_p,
-                vwap_p,
-                vwap_z,
-                ema_fast_p,
-                ema_slow_p,
-                hurst_v,
-                kalman_vel,
-                risk_reason,
-            )
-            return
+        signal: Optional[TradeSignal] = None
+        if allowed:
+            signal = self.strategy.evaluate_bar(enriched, idx=-1)
+        elif not risk_reason.startswith("Outside"):
+            try:
+                blocked_sig = self.strategy.evaluate_bar(enriched, idx=-1)
+                if blocked_sig is not None:
+                    self.journal.log(
+                        "signal_blocked",
+                        bar_ts=latest_closed_ts,
+                        strategy_id="v4.2",
+                        direction=blocked_sig.direction,
+                        reason=blocked_sig.reason,
+                        entry_price=blocked_sig.entry_price,
+                        atr=blocked_sig.atr,
+                        block_reason=risk_reason,
+                    )
+            except Exception as exc:
+                logger.debug("Blocked-signal journal evaluation failed: %s", exc)
 
-        # 5. Evaluate strategy on latest closed bar
-        signal = self.strategy.evaluate_bar(enriched, idx=-1)
+        # 5. Execute priority v4.2 signal or fall back to MR-B when enabled
         if signal is not None:
             qty = self.risk.calculate_contracts(signal.stop_distance_points)
             self.journal.log(
                 "signal",
                 bar_ts=latest_closed_ts,
+                strategy_id="v4.2",
                 direction=signal.direction,
                 reason=signal.reason,
                 entry_price=signal.entry_price,
@@ -1678,19 +2174,162 @@ class IBKRNQBotRunner:
                 quantity=qty,
             )
             self.place_bracket_order(signal, quantity=qty)
-        else:
+            return
+
+        mr_status = ""
+        if self.cfg.strategy.enable_mr_b:
+            mr_ok, mr_reason = self.risk.can_open_mr_b_trade(latest_closed_ts, self.bar_count)
+            if mr_ok:
+                mr_signal = self.strategy.evaluate_mr_b_bar(
+                    enriched,
+                    idx=-1,
+                    daily_bull_50=bool(self._daily_bull_50),
+                )
+                if mr_signal is not None:
+                    mr_qty = self.risk.calculate_mr_b_contracts()
+                    raw_atr_pct = last.get("atr_pct", np.nan)
+                    self.journal.log(
+                        "signal",
+                        bar_ts=latest_closed_ts,
+                        strategy_id="MR-B",
+                        direction=mr_signal.direction,
+                        reason=mr_signal.reason,
+                        entry_price=mr_signal.entry_price,
+                        stop_loss=mr_signal.stop_loss,
+                        take_profit=mr_signal.take_profit,
+                        stop_distance=mr_signal.stop_distance_points,
+                        atr=mr_signal.atr,
+                        atr_pct=round(float(raw_atr_pct), 4) if pd.notna(raw_atr_pct) else None,
+                        daily_bull_50=bool(self._daily_bull_50),
+                        rsi=mr_signal.rsi,
+                        vwap=mr_signal.vwap,
+                        vwap_z=round(vwap_z, 3),
+                        quantity=mr_qty,
+                    )
+                    self.place_bracket_order(mr_signal, quantity=mr_qty)
+                    return
+                mr_status = f" | MR-B: Scanning (bull50={bool(self._daily_bull_50)})"
+            else:
+                if not mr_reason.startswith("Outside"):
+                    try:
+                        blocked_mr = self.strategy.evaluate_mr_b_bar(
+                            enriched,
+                            idx=-1,
+                            daily_bull_50=bool(self._daily_bull_50),
+                        )
+                        if blocked_mr is not None:
+                            self.journal.log(
+                                "signal_blocked",
+                                bar_ts=latest_closed_ts,
+                                strategy_id="MR-B",
+                                direction=blocked_mr.direction,
+                                reason=blocked_mr.reason,
+                                entry_price=blocked_mr.entry_price,
+                                atr=blocked_mr.atr,
+                                block_reason=mr_reason,
+                            )
+                    except Exception as exc:
+                        logger.debug("Blocked MR-B journal evaluation failed: %s", exc)
+                mr_status = f" | MR-B: {mr_reason}"
+
+        base_status = risk_reason if not allowed else "Scanning (No trigger)"
+        logger.info(
+            "BAR CLOSE [%s] %s=%.2f | VWAP=%.2f (Z=%+.2f) | EMA9/21=%.2f/%.2f | Hurst=%.2f | KalVel=%+.2f | Status: %s%s",
+            et_ts_str,
+            self.contract.localSymbol if self.contract else "MNQ",
+            close_p,
+            vwap_p,
+            vwap_z,
+            ema_fast_p,
+            ema_slow_p,
+            hurst_v,
+            kalman_vel,
+            base_status,
+            mr_status,
+        )
+
+    def _finalize_deferred_commission(
+        self,
+        snapshot: dict,
+        leg_pnl: float,
+        leg_comm: float,
+        shares_closed: int,
+        fill_price: float,
+        exec_time: Any,
+    ) -> None:
+        """Finalize an already-flattened (e.g. PREEMPT_V42) trade whose commissionReport arrived asynchronously."""
+        sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+        strat_id = snapshot.get("strategy_id", "MR-B")
+        snapshot["realized_pnl"] += leg_pnl
+        snapshot["commissions"] += leg_comm
+        snapshot["closed_qty"] += shares_closed
+
+        if snapshot["closed_qty"] < snapshot["expected_qty"]:
             logger.info(
-                "BAR CLOSE [%s] %s=%.2f | VWAP=%.2f (Z=%+.2f) | EMA9/21=%.2f/%.2f | Hurst=%.2f | KalVel=%+.2f | Status: Scanning (No trigger)",
-                et_ts_str,
-                self.contract.localSymbol if self.contract else "MNQ",
-                close_p,
-                vwap_p,
-                vwap_z,
-                ema_fast_p,
-                ema_slow_p,
-                hurst_v,
-                kalman_vel,
+                "Deferred [%s] closing leg filled (%d/%d closed, leg PnL $%+.2f @ %.2f); awaiting remaining leg.",
+                strat_id,
+                snapshot["closed_qty"],
+                snapshot["expected_qty"],
+                leg_pnl,
+                fill_price,
             )
+            return
+
+        for key in snapshot.get("keys", ()):
+            self._deferred_closed_trades.pop(key, None)
+
+        net_pnl = round(float(snapshot["realized_pnl"]), 2)
+        total_comm = float(snapshot["commissions"])
+        self.risk.record_trade_closed(
+            net_pnl,
+            exit_bar_index=int(snapshot.get("exit_bar_count", self.bar_count)),
+            strategy_id=strat_id,
+        )
+        closed_ts = (
+            pd.Timestamp(exec_time).tz_convert("UTC")
+            if exec_time is not None
+            else pd.Timestamp.now(tz="UTC")
+        )
+        entry_p = float(snapshot.get("entry_price") or fill_price)
+        direction = str(snapshot.get("direction") or "LONG")
+        gross_pts = (fill_price - entry_p) if direction == "LONG" else (entry_p - fill_price)
+        self.journal.log(
+            "trade_closed",
+            bar_ts=snapshot.get("signal_bar_ts") or self._last_processed_bar_time,
+            strategy_id=strat_id,
+            direction=direction,
+            exit_reason=snapshot.get("exit_reason", "PREEMPT_V42"),
+            signal_price=snapshot.get("signal_price"),
+            entry_price=entry_p,
+            exit_price=fill_price,
+            stop_loss=snapshot.get("sl_price"),
+            take_profit=snapshot.get("tp_price"),
+            be_moved=bool(snapshot.get("be_moved", False)),
+            decay_moved=bool(snapshot.get("decay_moved", False)),
+            gross_points=round(gross_pts, 2),
+            net_pnl_usd=net_pnl,
+            commission=total_comm,
+            entry_filled_utc=snapshot.get("filled_ts_utc"),
+            exit_filled_utc=closed_ts,
+        )
+        logger.info(
+            "Deferred [%s | %s] trade closed | Realized PnL: $%.2f | Session PnL: $%.2f",
+            strat_id,
+            snapshot.get("exit_reason", "PREEMPT_V42"),
+            net_pnl,
+            self.risk.state.realized_pnl_usd,
+        )
+        self._send_discord_alert(
+            title=f"⚡ [{strat_id} · {snapshot.get('exit_reason', 'PREEMPT_V42')}] CLOSED — {sym} ({net_pnl:+.2f} USD)",
+            description=(
+                f"**Exit Fill Price:** `{fill_price:.2f}`\n"
+                f"**Trade Realized PnL:** **`${net_pnl:+.2f}`**\n"
+                f"**Daily Session PnL:** `${self.risk.state.realized_pnl_usd:+.2f}`"
+            ),
+            color=0x2ECC71 if net_pnl > 0 else 0xE74C3C,
+        )
+        if self.risk.state.account_halted:
+            self.flatten_all(reason=self.risk.state.account_halt_reason)
 
     def _on_commission_report(self, trade: Trade, fill, report) -> None:
         """Track realized PnL from IBKR commission reports as positions close (aggregating multi-leg scale-outs)."""
@@ -1702,6 +2341,24 @@ class IBKRNQBotRunner:
             fill_price = float(getattr(exec_obj, "price", 0.0) or 0.0)
             exec_time = getattr(exec_obj, "time", None)
             sym = self.contract.localSymbol if self.contract else self.cfg.contract.symbol
+
+            exec_oid = int(getattr(exec_obj, "orderId", 0) or 0) if exec_obj is not None else 0
+            trade_oid = int(getattr(getattr(trade, "order", None), "orderId", 0) or 0)
+            exec_ref = str(
+                (getattr(exec_obj, "orderRef", "") if exec_obj is not None else "")
+                or getattr(getattr(trade, "order", None), "orderRef", "")
+                or ""
+            )
+            deferred = (
+                self._deferred_closed_trades.get(exec_oid)
+                or self._deferred_closed_trades.get(trade_oid)
+                or (self._deferred_closed_trades.get(exec_ref) if exec_ref else None)
+            )
+            if deferred is not None:
+                self._finalize_deferred_commission(
+                    deferred, leg_pnl, leg_comm, shares_closed, fill_price, exec_time
+                )
+                return
 
             self._current_trade_realized_pnl += leg_pnl
             self._current_trade_commissions += leg_comm
@@ -1728,6 +2385,7 @@ class IBKRNQBotRunner:
                 self.journal.log(
                     "partial_tp1_closed",
                     bar_ts=self._signal_bar_ts or self._last_processed_bar_time,
+                    strategy_id=self._active_strategy_id,
                     direction=self._trade_direction or (self._active_signal.direction if self._active_signal else "LONG"),
                     fill_price=fill_price,
                     shares=shares_closed,
@@ -1771,16 +2429,31 @@ class IBKRNQBotRunner:
                 )
                 return
 
+            closed_strat = (
+                (getattr(self._active_signal, "strategy_id", None) if self._active_signal is not None else None)
+                or self._active_strategy_id
+                or self._order_strategy_map.get(exec_oid)
+                or self._order_strategy_map.get(trade_oid)
+                or (exec_ref.split(":", 1)[0] if ":" in exec_ref else "")
+                or "v4.2"
+            )
             net_pnl = round(self._current_trade_realized_pnl, 2)
             total_comm = self._current_trade_commissions
-            self.risk.record_trade_closed(net_pnl, exit_bar_index=self.bar_count)
+            self.risk.record_trade_closed(
+                net_pnl,
+                exit_bar_index=self.bar_count,
+                strategy_id=closed_strat,
+            )
             logger.info(
-                "Trade closed | Realized PnL: $%.2f | Session PnL: $%.2f | Trades Today: %d",
+                "Trade closed [%s] | Realized PnL: $%.2f | Session PnL: $%.2f | v4.2=%d | MR-B=%d",
+                closed_strat,
                 net_pnl,
                 self.risk.state.realized_pnl_usd,
                 self.risk.state.trades_taken,
+                self.risk.state.mr_b_trades_taken,
             )
-            win_str = "💰 TRADE CLOSED (PROFIT)" if net_pnl > 0 else "🛑 TRADE CLOSED (LOSS)"
+            strat_badge = f"[{closed_strat}] " if closed_strat == "MR-B" else ""
+            win_str = f"💰 {strat_badge}TRADE CLOSED (PROFIT)" if net_pnl > 0 else f"🛑 {strat_badge}TRADE CLOSED (LOSS)"
             color = 0x2ECC71 if net_pnl > 0 else 0xE74C3C
             self._trade_closed_ts_utc = (
                 pd.Timestamp(exec_time).tz_convert("UTC")
@@ -1797,6 +2470,7 @@ class IBKRNQBotRunner:
             self.journal.log(
                 "trade_closed",
                 bar_ts=self._signal_bar_ts or self._last_processed_bar_time,
+                strategy_id=closed_strat,
                 direction=direction,
                 signal_price=self._signal_price_orig,
                 entry_price=entry_p,
@@ -1845,13 +2519,19 @@ class IBKRNQBotRunner:
                 if self._tp1_filled and tp1_p is not None
                 else f"**Exit Fill Price:** `{fill_price:.2f}`\n"
             )
+            trades_line = (
+                f"**Trades Today (`{closed_strat}`):** `{self.risk.state.mr_b_trades_taken}/{self.cfg.risk.mr_b_max_daily_trades}` "
+                f"(v4.2 RTH: `{self.risk.state.rth_trades_taken}/{self.cfg.risk.max_daily_trades}`)\n"
+                if self.cfg.strategy.enable_mr_b
+                else f"**Trades Today:** `{self.risk.state.trades_taken}/{self.cfg.risk.max_daily_trades}`\n"
+            )
             self._send_discord_alert(
                 title=f"{win_str} — {sym} ({net_pnl:+.2f} USD)",
                 description=(
                     f"{leg_note}"
-                    f"**Trade Realized PnL:** **`${net_pnl:+.2f}`**\n"
+                    f"**Strategy:** `{closed_strat}` | **Trade Realized PnL:** **`${net_pnl:+.2f}`**\n"
                     f"**Daily Session PnL:** `${self.risk.state.realized_pnl_usd:+.2f}`\n"
-                    f"**Trades Today:** `{self.risk.state.trades_taken}/{self.cfg.risk.max_daily_trades}`\n"
+                    f"{trades_line}"
                     f"_Post-trade context chart (+10 bars after exit) will post automatically once 10 post-exit bars close._"
                 ),
                 color=color,
@@ -1893,6 +2573,7 @@ class IBKRNQBotRunner:
             self._closing_exec_qty = 0
             self._last_exit_exec_utc = None
             self._active_signal = None
+            self._active_strategy_id = "v4.2"
             self._active_parent_order = None
             self._active_parent_orders = []
             self._active_tp_orders = []
@@ -1904,8 +2585,13 @@ class IBKRNQBotRunner:
             self._tp1_filled = False
             self._entry_fill_handled = False
 
-            if self.risk.state.halted:
-                self.flatten_all(reason=self.risk.state.halt_reason)
+            halt_active = (
+                self.risk.state.account_halted
+                if self.cfg.strategy.enable_mr_b
+                else self.risk.state.halted
+            )
+            if halt_active:
+                self.flatten_all(reason=self.risk.state.account_halt_reason or self.risk.state.halt_reason)
 
     def _on_exec_details(self, trade: Trade, fill) -> None:
         """Handle parent ENTRY fills (with re-anchoring) and TP1 scale-out fills (moving runner SL to Break-Even)."""
@@ -1915,6 +2601,20 @@ class IBKRNQBotRunner:
 
         e = fill.execution
         tick_size = self.cfg.contract.tick_size
+
+        exec_oid = int(getattr(e, "orderId", 0) or 0)
+        trade_oid = int(getattr(getattr(trade, "order", None), "orderId", 0) or 0)
+        exec_ref = str(
+            getattr(e, "orderRef", "")
+            or getattr(getattr(trade, "order", None), "orderRef", "")
+            or ""
+        )
+        if (
+            (exec_oid and exec_oid in self._deferred_closed_trades)
+            or (trade_oid and trade_oid in self._deferred_closed_trades)
+            or (exec_ref and exec_ref in self._deferred_closed_trades)
+        ):
+            return
 
         # 1. Handle TP1 partial fill -> remove Leg 1 SL and move Runner SL immediately to Break-Even
         if (
@@ -1995,85 +2695,100 @@ class IBKRNQBotRunner:
             else pd.Timestamp.now(tz="UTC")
         )
 
-        # If actual fill price differs from signal entry price by >= 0.25 pts (1 tick), dynamically re-anchor SL and TP(s)
+        # If actual fill price differs from signal entry price by >= 0.25 pts (1 tick), dynamically re-anchor SL (and TP for v4.2 only)
+        entry_strat_id = getattr(sig, "strategy_id", self._active_strategy_id) if sig is not None else self._active_strategy_id
         if sig is not None and abs(fill_p - sig.entry_price) >= 0.25:
             one_r = sig.stop_distance_points
-            sig_et = pd.Timestamp(sig.timestamp)
-            sig_et = (
-                sig_et.tz_localize(self.cfg.risk.timezone)
-                if sig_et.tzinfo is None
-                else sig_et.tz_convert(self.cfg.risk.timezone)
-            )
-            is_pm = sig_et.strftime("%H:%M") < "09:30"
-            has_partial = self._active_tp1_order is not None
-            if has_partial:
-                tp1_r = (
-                    getattr(self.cfg.risk, "premarket_partial_tp1_r", 1.4)
-                    if is_pm
-                    else getattr(self.cfg.risk, "partial_tp1_r", 2.0)
-                )
-                rr_ratio = (
-                    getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
-                    if is_pm
-                    else getattr(self.cfg.risk, "runner_reward_risk_ratio", 5.0)
-                )
-                tp1_dist = round_to_tick(one_r * tp1_r, tick_size)
-                new_tp1: Optional[float] = (
-                    round_to_tick(fill_p + tp1_dist, tick_size)
-                    if self._trade_direction == "LONG"
-                    else round_to_tick(fill_p - tp1_dist, tick_size)
-                )
-            else:
-                rr_ratio = (
-                    getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
-                    if is_pm
-                    else self.cfg.risk.reward_risk_ratio
-                )
-                new_tp1 = None
-
-            tp_dist = round_to_tick(one_r * rr_ratio, tick_size)
-            if self._trade_direction == "LONG":
+            if entry_strat_id == "MR-B":
+                # MR-B targets fixed signal Session VWAP; only SL re-anchors around the actual fill
                 new_sl = round_to_tick(fill_p - one_r, tick_size)
-                new_tp = round_to_tick(fill_p + tp_dist, tick_size)
+                sig.entry_price = fill_p
+                sig.stop_loss = new_sl
+                self._trade_initial_sl = new_sl
+                self._modify_active_stop_orders(new_sl)
+                logger.info(
+                    "Re-anchored [MR-B] SL to actual fill %.2f -> SL=%.2f (fixed VWAP TP=%.2f preserved)",
+                    fill_p,
+                    new_sl,
+                    float(self._trade_initial_tp or sig.take_profit),
+                )
             else:
-                new_sl = round_to_tick(fill_p + one_r, tick_size)
-                new_tp = round_to_tick(fill_p - tp_dist, tick_size)
+                sig_et = pd.Timestamp(sig.timestamp)
+                sig_et = (
+                    sig_et.tz_localize(self.cfg.risk.timezone)
+                    if sig_et.tzinfo is None
+                    else sig_et.tz_convert(self.cfg.risk.timezone)
+                )
+                is_pm = sig_et.strftime("%H:%M") < "09:30"
+                has_partial = self._active_tp1_order is not None
+                if has_partial:
+                    tp1_r = (
+                        getattr(self.cfg.risk, "premarket_partial_tp1_r", 1.4)
+                        if is_pm
+                        else getattr(self.cfg.risk, "partial_tp1_r", 2.0)
+                    )
+                    rr_ratio = (
+                        getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+                        if is_pm
+                        else getattr(self.cfg.risk, "runner_reward_risk_ratio", 5.0)
+                    )
+                    tp1_dist = round_to_tick(one_r * tp1_r, tick_size)
+                    new_tp1: Optional[float] = (
+                        round_to_tick(fill_p + tp1_dist, tick_size)
+                        if self._trade_direction == "LONG"
+                        else round_to_tick(fill_p - tp1_dist, tick_size)
+                    )
+                else:
+                    rr_ratio = (
+                        getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+                        if is_pm
+                        else self.cfg.risk.reward_risk_ratio
+                    )
+                    new_tp1 = None
 
-            sig.entry_price = fill_p
-            sig.stop_loss = new_sl
-            sig.take_profit = new_tp
-            self._trade_initial_sl = new_sl
-            self._trade_initial_tp = new_tp
-            if new_tp1 is not None:
-                self._trade_initial_tp1 = new_tp1
+                tp_dist = round_to_tick(one_r * rr_ratio, tick_size)
+                if self._trade_direction == "LONG":
+                    new_sl = round_to_tick(fill_p - one_r, tick_size)
+                    new_tp = round_to_tick(fill_p + tp_dist, tick_size)
+                else:
+                    new_sl = round_to_tick(fill_p + one_r, tick_size)
+                    new_tp = round_to_tick(fill_p - tp_dist, tick_size)
 
-            dead_ids = self._get_dead_order_ids()
-            if (
-                self._active_tp1_order is not None
-                and new_tp1 is not None
-                and getattr(self._active_tp1_order, "orderId", 0) not in dead_ids
-            ):
-                self._active_tp1_order.lmtPrice = new_tp1
-                self._active_tp1_order.cashQty = UNSET_DOUBLE
-                self._active_tp1_order.overridePercentageConstraints = True
-                self._active_tp1_order.transmit = True
-                self.ib.placeOrder(self.contract, self._active_tp1_order)
-            if (
-                self._active_tp_order is not None
-                and getattr(self._active_tp_order, "orderId", 0) not in dead_ids
-            ):
-                self._active_tp_order.lmtPrice = new_tp
-                self._active_tp_order.cashQty = UNSET_DOUBLE
-                self._active_tp_order.overridePercentageConstraints = True
-                self._active_tp_order.transmit = True
-                self.ib.placeOrder(self.contract, self._active_tp_order)
-            self._modify_active_stop_orders(new_sl)
-            logger.info(
-                "Re-anchored bracket SL/TP to actual fill %.2f -> SL=%.2f | TP=%s",
-                fill_p,
-                new_sl,
-                f"TP1={new_tp1:.2f} / TP2={new_tp:.2f}" if new_tp1 is not None else f"{new_tp:.2f}",
-            )
+                sig.entry_price = fill_p
+                sig.stop_loss = new_sl
+                sig.take_profit = new_tp
+                self._trade_initial_sl = new_sl
+                self._trade_initial_tp = new_tp
+                if new_tp1 is not None:
+                    self._trade_initial_tp1 = new_tp1
+
+                dead_ids = self._get_dead_order_ids()
+                if (
+                    self._active_tp1_order is not None
+                    and new_tp1 is not None
+                    and getattr(self._active_tp1_order, "orderId", 0) not in dead_ids
+                ):
+                    self._active_tp1_order.lmtPrice = new_tp1
+                    self._active_tp1_order.cashQty = UNSET_DOUBLE
+                    self._active_tp1_order.overridePercentageConstraints = True
+                    self._active_tp1_order.transmit = True
+                    self.ib.placeOrder(self.contract, self._active_tp1_order)
+                if (
+                    self._active_tp_order is not None
+                    and getattr(self._active_tp_order, "orderId", 0) not in dead_ids
+                ):
+                    self._active_tp_order.lmtPrice = new_tp
+                    self._active_tp_order.cashQty = UNSET_DOUBLE
+                    self._active_tp_order.overridePercentageConstraints = True
+                    self._active_tp_order.transmit = True
+                    self.ib.placeOrder(self.contract, self._active_tp_order)
+                self._modify_active_stop_orders(new_sl)
+                logger.info(
+                    "Re-anchored bracket SL/TP to actual fill %.2f -> SL=%.2f | TP=%s",
+                    fill_p,
+                    new_sl,
+                    f"TP1={new_tp1:.2f} / TP2={new_tp:.2f}" if new_tp1 is not None else f"{new_tp:.2f}",
+                )
 
         # Seed the stop history with the live stop actually resting at fill time
         live_sl = None
@@ -2089,7 +2804,7 @@ class IBKRNQBotRunner:
         )
         disp_qty = max(int(e.shares), intended_qty)
 
-        logger.info("ENTRY FILLED: %s %s %s @ %.2f", e.side, disp_qty, self.contract.localSymbol, e.price)
+        logger.info("ENTRY FILLED [%s]: %s %s %s @ %.2f", entry_strat_id, e.side, disp_qty, self.contract.localSymbol, e.price)
         sig_orig = self._signal_price_orig if self._signal_price_orig is not None else fill_p
         slip_pts = (fill_p - sig_orig) if self._trade_direction == "LONG" else (sig_orig - fill_p)
         fill_delay_s = (
@@ -2100,6 +2815,7 @@ class IBKRNQBotRunner:
         self.journal.log(
             "entry_filled",
             bar_ts=self._signal_bar_ts,
+            strategy_id=entry_strat_id,
             direction=self._trade_direction,
             quantity=disp_qty,
             signal_price=sig_orig,
@@ -2111,16 +2827,17 @@ class IBKRNQBotRunner:
             fill_delay_sec=round(fill_delay_s, 2) if fill_delay_s is not None else None,
             filled_at_utc=self._trade_filled_ts_utc,
         )
-        desc = f"**Fill Price:** `{e.price:.2f}` | **Qty:** `{disp_qty}`\n"
+        strat_badge = f"[{entry_strat_id}] " if entry_strat_id == "MR-B" else ""
+        desc = f"**Strategy:** `{entry_strat_id}` | **Fill Price:** `{e.price:.2f}` | **Qty:** `{disp_qty}`\n"
         if sig is not None:
             if self._trade_initial_tp1 is not None:
                 desc += f"**Stop Loss:** `{sig.stop_loss:.2f}` | **TP1:** `{self._trade_initial_tp1:.2f}` | **TP2 Runner:** `{sig.take_profit:.2f}`"
             else:
                 desc += f"**Stop Loss:** `{sig.stop_loss:.2f}` | **Take Profit:** `{sig.take_profit:.2f}`"
         self._send_discord_alert(
-            title=f"✅ ENTRY FILLED — {'BUY' if e.side == 'BOT' else 'SELL'} {disp_qty} {self.contract.localSymbol} @ {e.price:.2f}",
+            title=f"✅ {strat_badge}ENTRY FILLED — {'BUY' if e.side == 'BOT' else 'SELL'} {disp_qty} {self.contract.localSymbol} @ {e.price:.2f}",
             description=desc,
-            color=0x2ECC71 if e.side == "BOT" else 0xE74C3C,
+            color=0x1ABC9C if entry_strat_id == "MR-B" else (0x2ECC71 if e.side == "BOT" else 0xE74C3C),
         )
 
     def _restore_daily_risk_state(self) -> None:
@@ -2143,24 +2860,34 @@ class IBKRNQBotRunner:
                 ev_ts = ev_ts.tz_localize("UTC") if ev_ts.tzinfo is None else ev_ts.tz_convert("UTC")
                 self.risk.check_and_reset_session(ev_ts)
                 net_pnl = float(ev.get("net_pnl_usd", 0.0) or 0.0)
+                strat_id = str(ev.get("strategy_id") or "v4.2")
+                cd_offset = (
+                    -int(getattr(self.cfg.risk, "mr_b_cooldown_bars", 3))
+                    if strat_id == "MR-B"
+                    else -self.cfg.risk.cooldown_bars_after_exit
+                )
                 self.risk.record_trade_closed(
                     net_pnl,
-                    exit_bar_index=-self.cfg.risk.cooldown_bars_after_exit,
+                    exit_bar_index=cd_offset,
+                    strategy_id=strat_id,
                 )
             # Refresh current session phase / RTH transition after replaying history
             self.risk.check_and_reset_session(now_et)
             st = self.risk.state
             logger.info(
-                "Restored DailyRiskState from %s journal: trades=%d (PM=%d, RTH=%d) | PnL=$%+.2f (PM=$%+.2f, RTH=$%+.2f) | ConsecLosses=%d | Halted=%s",
+                "Restored DailyRiskState from %s journal: v4.2=%d (PM=%d, RTH=%d, ConsecL=%d) | MR-B=%d (L=%d, PnL=$%+.2f) | Session PnL=$%+.2f (RTH=$%+.2f) | Halted=%s (Acct=%s)",
                 day_str,
                 st.trades_taken,
                 st.premarket_trades_taken + st.premarket_vrev_trades_taken,
                 st.rth_trades_taken,
-                st.realized_pnl_usd,
-                st.premarket_realized_pnl_usd,
-                st.rth_realized_pnl_usd,
                 st.consecutive_losses,
+                st.mr_b_trades_taken,
+                st.mr_b_losses,
+                st.mr_b_realized_pnl_usd,
+                st.realized_pnl_usd,
+                st.rth_realized_pnl_usd,
                 st.halted,
+                st.account_halted,
             )
         except Exception as exc:
             logger.warning("Failed to restore DailyRiskState from journal: %s", exc)
@@ -2195,6 +2922,24 @@ class IBKRNQBotRunner:
         tp1_t = tp_trades_sorted[0] if len(tp_trades_sorted) >= 2 else None
         stop = float(stop_t.order.auxPrice)
         tp = float(tp_t.order.lmtPrice) if tp_t else entry
+
+        recovered_strat = "v4.2"
+        for ord_cand in (stop_t.order, tp_t.order if tp_t else None):
+            ref = str(getattr(ord_cand, "orderRef", "") or "")
+            if ref.startswith("MR-B"):
+                recovered_strat = "MR-B"
+                break
+        if recovered_strat == "v4.2" and getattr(self.journal, "enabled", False):
+            try:
+                day_str = pd.Timestamp.now(tz=self.cfg.risk.timezone).strftime("%Y-%m-%d")
+                for ev in reversed(load_journal(day_str, base_dir=str(self.journal.base_dir))):
+                    if ev.get("event") in ("order_submitted", "entry_filled") and ev.get("strategy_id"):
+                        recovered_strat = str(ev["strategy_id"])
+                        break
+            except Exception:
+                pass
+
+        self._active_strategy_id = recovered_strat
         self._trade_entry_price = entry
         self._trade_direction = direction
         self._trade_initial_sl = stop
@@ -2210,11 +2955,11 @@ class IBKRNQBotRunner:
         self._last_exit_exec_utc = None
         self._current_trade_realized_pnl = 0.0
         self._current_trade_commissions = 0.0
-        self._tp1_filled = len(tp_trades_sorted) == 1 and self.cfg.risk.fixed_contracts >= 2
+        self._tp1_filled = (recovered_strat == "v4.2") and len(tp_trades_sorted) == 1 and self.cfg.risk.fixed_contracts >= 2
         self._active_signal = TradeSignal(
             timestamp=pd.Timestamp.now(tz="UTC"),
             direction=direction,
-            reason="Recovered after restart",
+            reason=f"Recovered {recovered_strat} after restart",
             entry_price=entry,
             stop_loss=stop,
             take_profit=tp,
@@ -2224,6 +2969,7 @@ class IBKRNQBotRunner:
             vwap=entry,
             ema_fast=entry,
             ema_slow=entry,
+            strategy_id=recovered_strat,
         )
         self._active_stop_orders = []
         for st in stop_trades:
@@ -2270,10 +3016,13 @@ class IBKRNQBotRunner:
             day_high = float(enriched["high"].tail(100).max())
             day_low = float(enriched["low"].tail(100).min())
 
-        win_rate = (st.wins / st.trades_taken * 100.0) if st.trades_taken > 0 else 0.0
+        total_trades = st.trades_taken + st.mr_b_trades_taken
+        total_wins = st.wins + st.mr_b_wins
+        total_losses = st.losses + st.mr_b_losses
+        win_rate = (total_wins / total_trades * 100.0) if total_trades > 0 else 0.0
         pnl = st.realized_pnl_usd
 
-        if st.trades_taken == 0:
+        if total_trades == 0:
             color = 0x3498DB
             outcome_icon = "📊 DAILY SUMMARY (NO TRADES)"
         elif pnl > 0:
@@ -2283,28 +3032,46 @@ class IBKRNQBotRunner:
             color = 0xE74C3C
             outcome_icon = "📉 DAILY SUMMARY (NET LOSS)"
 
-        status_line = f"Halted ({st.halt_reason})" if st.halted else "Completed Normally (15:55 ET EOD)"
+        status_line = (
+            f"Halted ({st.account_halt_reason or st.halt_reason})"
+            if (st.account_halted or st.halted)
+            else "Completed Normally (15:55 ET EOD)"
+        )
+        v42_rth_pnl = st.rth_realized_pnl_usd - st.mr_b_realized_pnl_usd
 
         logger.info(
-            "EOD DAILY SUMMARY [%s] %s | Trades: %d (W:%d / L:%d, %.1f%%) | Net PnL: $%+.2f | Close: %.2f | VWAP: %.2f",
+            "EOD DAILY SUMMARY [%s] %s | Trades: %d (W:%d / L:%d, %.1f%%) | v4.2=%d | MR-B=%d | Net PnL: $%+.2f | Close: %.2f | VWAP: %.2f",
             session_date_str,
             sym,
-            st.trades_taken,
-            st.wins,
-            st.losses,
+            total_trades,
+            total_wins,
+            total_losses,
             win_rate,
+            st.trades_taken,
+            st.mr_b_trades_taken,
             pnl,
             close_p,
             vwap_p,
         )
 
+        breakdown_line = (
+            f"**Strategy Breakdown:** `v4.2: {st.rth_trades_taken}/{self.cfg.risk.max_daily_trades} (${v42_rth_pnl:+.2f})` | "
+            f"`MR-B: {st.mr_b_trades_taken}/{self.cfg.risk.mr_b_max_daily_trades} (L:{st.mr_b_losses}/{self.cfg.risk.mr_b_max_daily_losses}, ${st.mr_b_realized_pnl_usd:+.2f})`\n"
+            if self.cfg.strategy.enable_mr_b
+            else ""
+        )
+        trades_cap_disp = (
+            f"`{total_trades}` (Wins: `{total_wins}` | Losses: `{total_losses}` | WR: `{win_rate:.1f}%`)"
+            if self.cfg.strategy.enable_mr_b
+            else f"`{st.trades_taken}/{self.cfg.risk.max_daily_trades}` (Wins: `{total_wins}` | Losses: `{total_losses}` | WR: `{win_rate:.1f}%`)"
+        )
         self._send_discord_alert(
             title=f"{outcome_icon} — {sym} ({session_date_str})",
             description=(
                 f"**Mode:** `{self.mode.upper()}` | **Contract:** `{sym}`\n"
                 f"**Session Net PnL:** **`${pnl:+.2f} USD`**\n"
-                f"**Trades Taken:** `{st.trades_taken}/{self.cfg.risk.max_daily_trades}` "
-                f"(Wins: `{st.wins}` | Losses: `{st.losses}` | WR: `{win_rate:.1f}%`)\n"
+                f"**Trades Taken:** {trades_cap_disp}\n"
+                f"{breakdown_line}"
                 f"**Closing Price (15:55 ET):** `{close_p:.2f}` (VWAP: `{vwap_p:.2f}`)\n"
                 f"**Session Range:** `{day_low:.2f} – {day_high:.2f}` (`{day_high - day_low:.2f} pts`)\n"
                 f"**Session Status:** `{status_line}`"
@@ -2376,6 +3143,8 @@ class IBKRNQBotRunner:
             self.ib.commissionReportEvent += self._on_commission_report
             self.ib.execDetailsEvent += self._on_exec_details
             self.ib.errorEvent += self._on_ib_error
+            if self.cfg.strategy.enable_mr_b:
+                self._refresh_daily_regime(pd.Timestamp.now(tz="UTC"))
 
             feed_label = (
                 f"TradingView Real-Time Hybrid ({self.contract.localSymbol} + {self.cfg.ibkr.tradingview_realtime_proxy})"
@@ -2432,6 +3201,19 @@ class IBKRNQBotRunner:
             runaway_cfg = float(getattr(self.cfg.risk, "runaway_cancel_points", 0.0) or 0.0)
             hv_atr_thresh = float(getattr(self.cfg.risk, "high_vol_atr_threshold", 60.0) or 60.0)
             hv_max_stop = float(getattr(self.cfg.risk, "high_vol_max_stop_points", self.cfg.risk.max_stop_points) or self.cfg.risk.max_stop_points)
+            mr_b_line = ""
+            if self.cfg.strategy.enable_mr_b:
+                mr_qty_cfg = self.risk.calculate_mr_b_contracts()
+                regime_str = (
+                    f"bull_50={self._daily_bull_50} ({self._daily_prev_close} vs EMA50={self._daily_ema50})"
+                    if self._daily_prev_close is not None and self._daily_ema50 is not None
+                    else f"bull_50={bool(self._daily_bull_50)}"
+                )
+                mr_b_line = (
+                    f"\n**MR-B Dual-Engine:** `ON ({mr_qty_cfg} ct | ATR% {self.cfg.strategy.mr_b_atr_pct_min:.3f}–{self.cfg.strategy.mr_b_atr_pct_max:.3f}% | "
+                    f"SL cap {self.cfg.strategy.mr_b_max_sl_points:.0f}b | +{self.cfg.risk.mr_b_breakeven_r:.1f}R→+{self.cfg.risk.mr_b_breakeven_offset_points:.1f}b BE | "
+                    f"{self.cfg.risk.mr_b_max_hold_bars}b TIME | FOMC 13:56 | Yield+PREEMPT_V42 | {regime_str})`"
+                )
             self._send_discord_alert(
                 title=f"🤖 {bot_name} Online — {self.contract.localSymbol} ({self.mode.upper()})",
                 description=(
@@ -2446,6 +3228,7 @@ class IBKRNQBotRunner:
                     f"**Session Windows:** {window_desc}\n"
                     f"**Today's USD High-Impact News:** `{news_summary}`\n"
                     f"**News Blackout Guard:** `T1 (-{self.cfg.risk.news_mega_pre_blackout_mins}m/+{self.cfg.risk.news_mega_post_blackout_mins}m) | T2 (-{self.cfg.risk.news_pre_blackout_mins}m/+{self.cfg.risk.news_post_blackout_mins}m) | Tighten {self.cfg.risk.pre_news_tighten_stop_mins}m prior`"
+                    f"{mr_b_line}"
                 ),
                 color=0x3498DB,
             )

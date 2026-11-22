@@ -53,6 +53,58 @@ TIER1_KEYWORDS: Tuple[str, ...] = (
     "employment change",
 )
 
+# Historical & scheduled FOMC rate decision dates (2021-2027 ET) for offline/backtest reliability
+# and as a fallback if live ForexFactory feed is unavailable.
+FOMC_DECISION_DATES: frozenset[str] = frozenset(
+    {
+        "2021-11-03", "2021-12-15",
+        "2022-01-26", "2022-03-16", "2022-05-04", "2022-06-15",
+        "2022-07-27", "2022-09-21", "2022-11-02", "2022-12-14",
+        "2023-02-01", "2023-03-22", "2023-05-03", "2023-06-14",
+        "2023-07-26", "2023-09-20", "2023-11-01", "2023-12-13",
+        "2024-01-31", "2024-03-20", "2024-05-01", "2024-06-12",
+        "2024-07-31", "2024-09-18", "2024-11-07", "2024-12-18",
+        "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18",
+        "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
+        "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+        "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+        "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09",
+        "2027-07-28", "2027-09-22", "2027-10-27", "2027-12-08",
+    }
+)
+
+
+def is_fomc_decision_date(
+    ts: Any,
+    timezone_name: str = "America/New_York",
+    calendar: Optional["EconomicCalendar"] = None,
+) -> bool:
+    """Return True if `ts` falls on an FOMC rate-decision day (static schedule or live USD High FOMC event)."""
+    tz = pytz.timezone(timezone_name)
+    ts_pd = pd.Timestamp(ts)
+    if ts_pd.tzinfo is None:
+        ts_et = ts_pd.tz_localize(tz)
+    else:
+        ts_et = ts_pd.tz_convert(tz)
+    date_str = ts_et.strftime("%Y-%m-%d")
+
+    if date_str in FOMC_DECISION_DATES:
+        return True
+
+    if calendar is not None and calendar.events:
+        target_date = ts_et.date()
+        for ev in calendar.events:
+            if (
+                ev.dt_et.date() == target_date
+                and ev.country.upper() == "USD"
+                and ev.impact.strip().lower() == "high"
+            ):
+                lower_title = ev.title.lower()
+                if ("fomc" in lower_title or "federal funds rate" in lower_title) and "minutes" not in lower_title:
+                    return True
+
+    return False
+
 
 @dataclass(frozen=True)
 class EconomicEvent:
@@ -629,3 +681,7 @@ class EconomicCalendar:
             out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception as exc:
             logger.warning("Could not export report calendar JSON %s: %s", out, exc)
+
+    def is_fomc_day(self, ts: Any) -> bool:
+        """Return True if `ts` falls on an FOMC rate-decision date."""
+        return is_fomc_decision_date(ts, timezone_name=str(self.tz), calendar=self)

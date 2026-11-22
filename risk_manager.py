@@ -17,6 +17,7 @@ import pandas as pd
 import pytz
 
 from config import ContractConfig, RiskConfig
+from economic_calendar import is_fomc_decision_date
 
 
 @dataclass
@@ -39,6 +40,13 @@ class DailyRiskState:
     last_exit_bar_index: int = -999
     halted: bool = False
     halt_reason: str = ""
+    account_halted: bool = False
+    account_halt_reason: str = ""
+    mr_b_trades_taken: int = 0
+    mr_b_wins: int = 0
+    mr_b_losses: int = 0
+    mr_b_last_exit_bar_index: int = -999
+    mr_b_realized_pnl_usd: float = 0.0
 
 
 class RiskManager:
@@ -59,6 +67,13 @@ class RiskManager:
         self._flatten_time = self._parse_hhmm(self.r_cfg.flatten_eod_time)
         blackouts = getattr(self.r_cfg, "rth_blackout_windows", ())
         self._rth_blackouts = [(self._parse_hhmm(s), self._parse_hhmm(e)) for s, e in blackouts]
+
+        self._mr_b_start = self._parse_hhmm(getattr(self.r_cfg, "mr_b_entry_start_time", "10:15"))
+        self._mr_b_end = self._parse_hhmm(getattr(self.r_cfg, "mr_b_entry_end_time", "14:30"))
+        self._mr_b_fomc_b_start = self._parse_hhmm(getattr(self.r_cfg, "mr_b_fomc_blackout_start", "13:50"))
+        self._mr_b_fomc_b_end = self._parse_hhmm(getattr(self.r_cfg, "mr_b_fomc_blackout_end", "14:45"))
+        self._mr_b_fomc_f_start = self._parse_hhmm(getattr(self.r_cfg, "mr_b_fomc_flatten_start", "13:56"))
+        self._mr_b_fomc_f_end = self._parse_hhmm(getattr(self.r_cfg, "mr_b_fomc_flatten_end", "14:00"))
 
     @staticmethod
     def _parse_hhmm(hhmm: str) -> time:
@@ -94,6 +109,8 @@ class RiskManager:
                 # Unconditionally clear any Pre-Market halt so RTH starts with its own isolated daily loss budget
                 self.state.halted = False
                 self.state.halt_reason = ""
+                self.state.account_halted = False
+                self.state.account_halt_reason = ""
 
     def should_flatten_eod(self, ts: pd.Timestamp) -> bool:
         """Return True if current time is at Pre-Market close (09:24-09:29 ET) or EOD flatten time (15:55-17:00 ET)."""
@@ -122,8 +139,9 @@ class RiskManager:
         """
         self.check_and_reset_session(ts)
 
-        if self.state.halted:
-            return False, f"Session halted: {self.state.halt_reason}"
+        if self.state.halted or self.state.account_halted:
+            reason = self.state.halt_reason or self.state.account_halt_reason
+            return False, f"Session halted: {reason}"
 
         if not self.is_within_entry_window(ts):
             return False, "Outside allowed RTH / Premarket entry time window"
@@ -153,6 +171,8 @@ class RiskManager:
             self.state.halt_reason = (
                 f"Max {session_label} daily loss reached (${active_session_pnl:.2f} <= -${self.r_cfg.max_daily_loss_usd:.2f})"
             )
+            self.state.account_halted = True
+            self.state.account_halt_reason = self.state.halt_reason
             return False, self.state.halt_reason
 
         if self.state.in_premarket_phase:
@@ -179,6 +199,76 @@ class RiskManager:
 
         return True, "OK"
 
+    def is_fomc_day(self, ts: pd.Timestamp) -> bool:
+        """Return True if `ts` falls on an FOMC decision date."""
+        return is_fomc_decision_date(ts, timezone_name=self.r_cfg.timezone, calendar=self.calendar)
+
+    def should_flatten_mr_b_fomc(self, ts: pd.Timestamp) -> bool:
+        """Return True during the 13:56-14:00 ET pre-FOMC flatten window on FOMC decision days."""
+        if not self.is_fomc_day(ts):
+            return False
+        local_t = self._to_session_dt(ts).time()
+        return self._mr_b_fomc_f_start <= local_t <= self._mr_b_fomc_f_end
+
+    def can_open_mr_b_trade(
+        self,
+        ts: pd.Timestamp,
+        current_bar_index: int = 0,
+    ) -> Tuple[bool, str]:
+        """
+        Check isolated MR-B daily guardrails plus the shared account RTH daily loss kill-switch.
+        Deliberately ignores v4.2 consecutive-loss halts, cooldowns, and EU Close blackouts.
+        """
+        self.check_and_reset_session(ts)
+
+        if self.state.account_halted:
+            return False, f"Session account halted: {self.state.account_halt_reason}"
+
+        local_dt = self._to_session_dt(ts)
+        local_t = local_dt.time()
+        if self.state.in_premarket_phase or not (self._mr_b_start <= local_t <= self._mr_b_end):
+            return False, "Outside allowed MR-B entry window (10:15-14:30 ET)"
+
+        if self.is_fomc_day(ts) and (self._mr_b_fomc_b_start <= local_t <= self._mr_b_fomc_b_end):
+            return False, "Inside MR-B FOMC blackout window (13:50-14:45 ET)"
+
+        if self.calendar is not None and getattr(self.r_cfg, "use_news_calendar_filter", True):
+            in_news, news_reason = self.calendar.is_in_news_blackout(ts)
+            if in_news:
+                return False, news_reason
+
+        if self.state.rth_realized_pnl_usd <= -abs(self.r_cfg.max_daily_loss_usd):
+            reason = (
+                f"Max RTH daily loss reached (${self.state.rth_realized_pnl_usd:.2f} <= "
+                f"-${self.r_cfg.max_daily_loss_usd:.2f})"
+            )
+            self.state.account_halted = True
+            self.state.account_halt_reason = reason
+            self.state.halted = True
+            self.state.halt_reason = reason
+            return False, reason
+
+        max_mr_losses = getattr(self.r_cfg, "mr_b_max_daily_losses", 1)
+        if self.state.mr_b_losses >= max_mr_losses:
+            return False, f"MR-B max daily losses reached ({self.state.mr_b_losses}/{max_mr_losses})"
+
+        max_mr_trades = getattr(self.r_cfg, "mr_b_max_daily_trades", 3)
+        if self.state.mr_b_trades_taken >= max_mr_trades:
+            return False, f"MR-B max daily trades reached ({self.state.mr_b_trades_taken}/{max_mr_trades})"
+
+        mr_cooldown = getattr(self.r_cfg, "mr_b_cooldown_bars", 3)
+        bars_since_exit = current_bar_index - self.state.mr_b_last_exit_bar_index
+        if bars_since_exit < mr_cooldown:
+            return False, f"MR-B cooldown active ({bars_since_exit}/{mr_cooldown} bars)"
+
+        return True, "OK"
+
+    def calculate_mr_b_contracts(self) -> int:
+        """Determine fixed contract quantity for MR-B trades."""
+        mr_c = int(getattr(self.r_cfg, "mr_b_contracts", 0) or 0)
+        base = mr_c if mr_c > 0 else self.r_cfg.fixed_contracts
+        return max(1, min(base, self.r_cfg.max_contracts))
+
     def calculate_contracts(self, stop_distance_points: float) -> int:
         """
         Determine contract quantity based on fixed_contracts or dynamic dollar risk per trade.
@@ -193,8 +283,32 @@ class RiskManager:
         raw_qty = int(self.r_cfg.risk_per_trade_usd // dollar_risk_per_contract)
         return max(1, min(raw_qty, self.r_cfg.max_contracts))
 
-    def record_trade_closed(self, net_pnl_usd: float, exit_bar_index: int = 0) -> None:
-        """Update session risk state after a position is closed."""
+    def record_trade_closed(
+        self,
+        net_pnl_usd: float,
+        exit_bar_index: int = 0,
+        strategy_id: str = "v4.2",
+    ) -> None:
+        """Update session risk state after a position is closed (isolating MR-B counters from v4.2)."""
+        if strategy_id == "MR-B":
+            self.state.mr_b_trades_taken += 1
+            self.state.mr_b_realized_pnl_usd += net_pnl_usd
+            self.state.rth_realized_pnl_usd += net_pnl_usd
+            self.state.realized_pnl_usd += net_pnl_usd
+            self.state.mr_b_last_exit_bar_index = exit_bar_index
+            if net_pnl_usd < 0:
+                self.state.mr_b_losses += 1
+            else:
+                self.state.mr_b_wins += 1
+
+            if self.state.rth_realized_pnl_usd <= -abs(self.r_cfg.max_daily_loss_usd):
+                reason = f"Max RTH daily loss breached (${self.state.rth_realized_pnl_usd:.2f})"
+                self.state.account_halted = True
+                self.state.account_halt_reason = reason
+                self.state.halted = True
+                self.state.halt_reason = reason
+            return
+
         self.state.trades_taken += 1
         if self.state.in_premarket_phase:
             if self.state.in_vrev_phase:
@@ -226,6 +340,8 @@ class RiskManager:
             self.state.halt_reason = (
                 f"Max {session_label} daily loss breached (${active_session_pnl:.2f})"
             )
+            self.state.account_halted = True
+            self.state.account_halt_reason = self.state.halt_reason
         elif self.state.consecutive_losses >= self.r_cfg.max_consecutive_losses:
             self.state.halted = True
             self.state.halt_reason = (

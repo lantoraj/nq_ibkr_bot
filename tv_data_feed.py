@@ -505,3 +505,79 @@ class TradingViewDataFeed:
         self.last_stitched_bars_count = len(stitched_df)
         combined = pd.concat([cme_closed, stitched_df], ignore_index=True)
         return combined.reset_index(drop=True)
+
+    def fetch_daily_bars(
+        self,
+        base_symbol: str = "MNQ",
+        n_bars: int = 150,
+    ) -> pd.DataFrame:
+        """
+        Fetch daily RTH OHLCV bars (`1D`, regular session) from TradingView as a fallback
+        source for computing the causal daily EMA50 regime (`prev_close > EMA50_d`).
+        """
+        cme_sym = f"CME_MINI:{base_symbol.upper()}1!"
+        ws = _TVWebSocket(timeout=self.timeout)
+        cs = _random_session_id("cs_daily")
+        bars_dict: Dict[int, Tuple[float, float, float, float, float]] = {}
+
+        try:
+            ws.connect()
+            init_raw = ws.recv_text()
+            for msg in _tv_parse_messages(init_raw):
+                if msg.startswith("~h~"):
+                    ws.send_text(f"~m~{len(msg)}~m~{msg}")
+
+            ws.send_cmd("set_auth_token", [self.auth_token])
+            ws.send_cmd("chart_create_session", [cs, ""])
+            ws.send_cmd("switch_timezone", [cs, "America/New_York"])
+            ws.send_cmd(
+                "resolve_symbol",
+                [
+                    cs,
+                    "sds_sym_d",
+                    "=" + json.dumps({"symbol": cme_sym, "adjustment": "splits", "session": "regular"}),
+                ],
+            )
+            ws.send_cmd("create_series", [cs, "sds_1", "s1", "sds_sym_d", "1D", int(n_bars), ""])
+
+            done = False
+            for _ in range(60):
+                if done:
+                    break
+                try:
+                    raw = ws.recv_text()
+                except (socket.timeout, TimeoutError):
+                    break
+                for payload in _tv_parse_messages(raw):
+                    if payload.startswith("~h~"):
+                        ws.send_text(f"~m~{len(payload)}~m~{payload}")
+                        continue
+                    try:
+                        obj = json.loads(payload)
+                    except Exception:
+                        continue
+                    m = obj.get("m")
+                    p = obj.get("p", [])
+                    if not p or p[0] != cs:
+                        continue
+                    if m in ("timescale_update", "du") and len(p) >= 2 and isinstance(p[1], dict):
+                        s_obj = p[1].get("sds_1")
+                        if isinstance(s_obj, dict) and "s" in s_obj:
+                            for item in s_obj["s"]:
+                                v = item.get("v", [])
+                                if len(v) >= 5:
+                                    ts_sec = int(v[0])
+                                    vol = float(v[5]) if len(v) >= 6 else 0.0
+                                    bars_dict[ts_sec] = (
+                                        float(v[1]),
+                                        float(v[2]),
+                                        float(v[3]),
+                                        float(v[4]),
+                                        vol,
+                                    )
+                    elif m in ("series_completed", "symbol_error", "series_error"):
+                        done = True
+        finally:
+            ws.close()
+
+        return self._dict_to_df(bars_dict).reset_index(drop=True)

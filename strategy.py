@@ -36,6 +36,7 @@ class TradeSignal:
     meta_probability: float = 1.0
     kalman_vel_atr: float = 0.0
     hurst: float = 0.5
+    strategy_id: str = "v4.2"
 
 
 class NQIntradayStrategy:
@@ -67,6 +68,7 @@ class NQIntradayStrategy:
             atr_period=self.s_cfg.atr_period,
             rsi_period=self.s_cfg.rsi_period,
             timezone=self.r_cfg.timezone,
+            mr_b_daily_ema_period=self.s_cfg.mr_b_daily_ema_period,
         )
 
     @staticmethod
@@ -343,4 +345,106 @@ class NQIntradayStrategy:
             meta_probability=round(meta_prob, 3),
             kalman_vel_atr=round(kalman_vel_atr, 3),
             hurst=round(hurst, 3),
+            strategy_id="v4.2",
+        )
+
+    def evaluate_mr_b_bar(
+        self,
+        enriched_df: pd.DataFrame,
+        idx: int = -1,
+        daily_bull_50: Optional[bool] = None,
+    ) -> Optional[TradeSignal]:
+        """
+        Evaluate MR-B Low-Volatility Bull VWAP Mean-Reversion setup on bar `idx`:
+        - Causal daily bull regime (`prev_close > EMA50_d`)
+        - Scale-invariant ATR% filter: `[mr_b_atr_pct_min, mr_b_atr_pct_max)` (default `0.050% - 0.150%`)
+        - Oversold session VWAP extension (`vwap_z <= -2.0`) + bullish reversal candle (`close > open` and `close > prev_close`)
+        - LONG-only, `SL = min(max(8.0, 2.0 * ATR), max_sl_points)`, fixed signal VWAP TP with `RR >= 0.80`
+        """
+        n = len(enriched_df)
+        if n < 2:
+            return None
+        pos_idx = n + idx if idx < 0 else idx
+        if pos_idx < 1 or pos_idx >= n:
+            return None
+
+        curr = enriched_df.iloc[pos_idx]
+        prev = enriched_df.iloc[pos_idx - 1]
+
+        bull_50 = (
+            bool(daily_bull_50)
+            if daily_bull_50 is not None
+            else bool(curr.get("daily_bull_50", False))
+        )
+        if not bull_50:
+            return None
+
+        open_p = float(curr["open"])
+        close_p = float(curr["close"])
+        prev_close_bar = float(prev["close"])
+        vwap = float(curr["vwap"])
+        vwap_z = float(curr["vwap_z"])
+        atr = float(curr["atr"])
+        raw_atr_pct = curr.get("atr_pct", np.nan)
+        atr_pct = (
+            float(raw_atr_pct)
+            if pd.notna(raw_atr_pct)
+            else ((atr / close_p) * 100.0 if close_p > 0.0 else float("nan"))
+        )
+
+        if any(np.isnan(v) for v in (open_p, close_p, prev_close_bar, vwap, vwap_z, atr, atr_pct)):
+            return None
+        if atr <= 0.0 or close_p <= 0.0:
+            return None
+
+        if atr_pct < self.s_cfg.mr_b_atr_pct_min or atr_pct >= self.s_cfg.mr_b_atr_pct_max:
+            return None
+
+        if vwap_z > -self.s_cfg.mr_b_vwap_z_threshold:
+            return None
+        if not (close_p > open_p and close_p > prev_close_bar):
+            return None
+
+        tick = self.c_cfg.tick_size
+        sl_dist = max(
+            self.s_cfg.mr_b_min_sl_points,
+            round_to_tick(self.s_cfg.mr_b_sl_atr_multiplier * atr, tick),
+        )
+        if self.s_cfg.mr_b_max_sl_points > 0.0:
+            sl_dist = min(sl_dist, round_to_tick(self.s_cfg.mr_b_max_sl_points, tick))
+
+        entry_price = round_to_tick(close_p, tick)
+        stop_loss = round_to_tick(entry_price - sl_dist, tick)
+        take_profit = round_to_tick(vwap, tick)
+        actual_sl_dist = round(entry_price - stop_loss, 2)
+        if actual_sl_dist <= 0.0 or take_profit <= entry_price:
+            return None
+
+        rr = (take_profit - entry_price) / actual_sl_dist
+        if rr < self.s_cfg.mr_b_min_rr:
+            return None
+
+        rsi = float(curr.get("rsi", 50.0))
+        ema_f = float(curr.get("ema_fast", close_p))
+        ema_s = float(curr.get("ema_slow", close_p))
+        kalman_vel_atr = float(curr.get("kalman_vel_atr", 0.0)) if pd.notna(curr.get("kalman_vel_atr", 0.0)) else 0.0
+        hurst = float(curr.get("hurst", 0.5)) if pd.notna(curr.get("hurst", 0.5)) else 0.5
+
+        return TradeSignal(
+            timestamp=pd.Timestamp(curr["timestamp"]),
+            direction="LONG",
+            reason=f"MR-B Low-Vol Bull VWAP Dip (ATR%={atr_pct:.3f}%, Z={vwap_z:+.2f}, RR={rr:.2f})",
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            stop_distance_points=actual_sl_dist,
+            atr=round(atr, 2),
+            rsi=round(rsi, 2) if pd.notna(rsi) else 50.0,
+            vwap=round(vwap, 2),
+            ema_fast=round(ema_f, 2) if pd.notna(ema_f) else entry_price,
+            ema_slow=round(ema_s, 2) if pd.notna(ema_s) else entry_price,
+            meta_probability=1.0,
+            kalman_vel_atr=round(kalman_vel_atr, 3),
+            hurst=round(hurst, 3),
+            strategy_id="MR-B",
         )

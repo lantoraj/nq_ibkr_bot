@@ -197,6 +197,31 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return true_range.ewm(alpha=1.0 / period, adjust=False).mean()
 
 
+def compute_daily_ema_regime(
+    daily_closes: pd.Series,
+    ema_period: int = 50,
+) -> pd.DataFrame:
+    """
+    Compute causal daily macro trend regime (`prev_close > EMA_period_d`).
+    Strictly shifted by 1 completed trading day so intraday bars never peek at today's close.
+    """
+    if daily_closes.empty:
+        return pd.DataFrame(columns=["daily_prev_close", "daily_ema50", "daily_bull_50"])
+
+    ordered = daily_closes.sort_index().astype(float)
+    prev_close = ordered.shift(1)
+    ema_d = ordered.ewm(span=ema_period, adjust=False).mean().shift(1)
+    bull_50 = (prev_close > ema_d).fillna(False).astype(bool)
+    return pd.DataFrame(
+        {
+            "daily_prev_close": prev_close,
+            "daily_ema50": ema_d,
+            "daily_bull_50": bull_50,
+        },
+        index=ordered.index,
+    )
+
+
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     """Compute Wilder's Relative Strength Index (0 to 100)."""
     if series.empty:
@@ -233,6 +258,7 @@ def _enrich_single_stream(
     out["roll_vwap_z_max"] = out["vwap_z"].rolling(12, min_periods=1).max()
     out["roll_vwap_z_min"] = out["vwap_z"].rolling(12, min_periods=1).min()
     out["atr"] = compute_atr(out, period=atr_period)
+    out["atr_pct"] = (out["atr"] / out["close"].replace(0.0, np.nan)) * 100.0
     out["gk_atr"] = compute_garman_klass_atr(out, period=atr_period)
     out["rsi"] = compute_rsi(out["close"], period=rsi_period)
 
@@ -289,6 +315,7 @@ def enrich_indicators(
     atr_period: int = 14,
     rsi_period: int = 14,
     timezone: str = "America/New_York",
+    mr_b_daily_ema_period: int = 50,
 ) -> pd.DataFrame:
     """
     Compute and attach all technical and quantitative v4 indicators to an OHLCV DataFrame.
@@ -321,6 +348,19 @@ def enrich_indicators(
             df.loc[rth_mask].copy(), fast_ema, slow_ema, trend_ema, atr_period, rsi_period, timezone
         )
         out.loc[rth_mask, rth_enriched.columns] = rth_enriched
-        return out
+    else:
+        out = _enrich_single_stream(df, fast_ema, slow_ema, trend_ema, atr_period, rsi_period, timezone)
 
-    return _enrich_single_stream(df, fast_ema, slow_ema, trend_ema, atr_period, rsi_period, timezone)
+    # Attach causal daily EMA50_d regime (prev RTH close > EMA50_d, shifted by 1 completed day)
+    dates = ts_et.dt.date
+    rth_close_mask = (hhmms >= "09:30") & (hhmms < "16:00")
+    if rth_close_mask.any():
+        daily_closes = out.loc[rth_close_mask, "close"].groupby(dates.loc[rth_close_mask]).last()
+    else:
+        daily_closes = out["close"].groupby(dates).last()
+
+    regime_df = compute_daily_ema_regime(daily_closes, ema_period=mr_b_daily_ema_period)
+    out["daily_prev_close"] = dates.map(regime_df["daily_prev_close"])
+    out["daily_ema50"] = dates.map(regime_df["daily_ema50"])
+    out["daily_bull_50"] = dates.map(regime_df["daily_bull_50"]).eq(True).astype(bool)
+    return out

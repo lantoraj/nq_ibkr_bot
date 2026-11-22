@@ -38,9 +38,12 @@ services:
       --symbol MNQ
       --bar-size "${BOT_BAR_SIZE:-2 mins}"
       --contracts ${BOT_CONTRACTS:-2}
-      --max-daily-loss ${BOT_MAX_DAILY_LOSS:-500.0}
+      --max-daily-loss ${BOT_MAX_DAILY_LOSS:-1000.0}
       --premarket-min-atr 22.0
-      --bot-name "NQ Quant Bot v4.2 (Combo E · 2 MNQ)"
+      --enable-mr-b
+      --mr-b-contracts ${BOT_MR_B_CONTRACTS:-2}
+      --mr-b-max-sl-pts 45.0
+      --bot-name "${BOT_NAME:-NQ Quant Bot v4.2 + MR-B (Combo E · 2 MNQ)}"
       --host 127.0.0.1
       --port ${IB_GATEWAY_PORT:-4002}
       --client-id 101

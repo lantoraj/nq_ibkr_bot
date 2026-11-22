@@ -35,6 +35,7 @@ class SimulatedTrade:
     exit_reason: str
     gross_points: float
     net_pnl_usd: float
+    strategy_id: str = "v4.2"
 
 
 def generate_synthetic_nq_data(
@@ -177,78 +178,155 @@ class Backtester:
             nonlocal active_entry_idx, be_moved, decay_moved
 
             active_signal = sig
-            active_contracts = self.risk.calculate_contracts(sig.stop_distance_points)
-            rem_contracts = active_contracts
-            active_entry_price = fill_price
+            strat_id = getattr(sig, "strategy_id", "v4.2")
             one_r_pts = sig.stop_distance_points
+            active_entry_price = fill_price
 
-            sig_et = pd.Timestamp(sig.timestamp)
-            sig_et = (
-                sig_et.tz_localize(self.cfg.risk.timezone)
-                if sig_et.tzinfo is None
-                else sig_et.tz_convert(self.cfg.risk.timezone)
-            )
-            active_is_pm = sig_et.strftime("%H:%M") < "09:30"
-            use_partial_tp = (
-                active_contracts >= 2
-                and getattr(self.cfg.risk, "enable_partial_tp", True)
-            )
-
-            if reanchor_sl_tp:
-                active_stop_loss = (
-                    round_to_tick(fill_price - one_r_pts, tick)
-                    if sig.direction == "LONG"
-                    else round_to_tick(fill_price + one_r_pts, tick)
-                )
-            else:
-                active_stop_loss = sig.stop_loss
-
-            if use_partial_tp:
-                active_tp1_r = (
-                    getattr(self.cfg.risk, "premarket_partial_tp1_r", 1.4)
-                    if active_is_pm
-                    else getattr(self.cfg.risk, "partial_tp1_r", 2.0)
-                )
-                runner_r = (
-                    getattr(self.cfg.risk, "premarket_reward_risk_ratio", 2.0)
-                    if active_is_pm
-                    else getattr(self.cfg.risk, "runner_reward_risk_ratio", 5.0)
-                )
-                active_tp1_price = (
-                    round_to_tick(active_entry_price + active_tp1_r * one_r_pts, tick)
-                    if sig.direction == "LONG"
-                    else round_to_tick(active_entry_price - active_tp1_r * one_r_pts, tick)
-                )
-                runner_dist = round_to_tick(one_r_pts * runner_r, tick)
-                tp2_base = fill_price if reanchor_sl_tp else sig.entry_price
-                active_take_profit = (
-                    round_to_tick(tp2_base + runner_dist, tick)
-                    if sig.direction == "LONG"
-                    else round_to_tick(tp2_base - runner_dist, tick)
-                )
-            else:
+            if strat_id == "MR-B":
+                active_contracts = self.risk.calculate_mr_b_contracts()
+                rem_contracts = active_contracts
+                active_is_pm = False
+                use_partial_tp = False
                 active_tp1_r = 0.0
                 active_tp1_price = 0.0
+                active_stop_loss = (
+                    round_to_tick(fill_price - one_r_pts, tick)
+                    if reanchor_sl_tp
+                    else sig.stop_loss
+                )
+                # MR-B always targets the fixed signal Session VWAP (never RR-scaled on fill)
+                active_take_profit = sig.take_profit
+            else:
+                active_contracts = self.risk.calculate_contracts(sig.stop_distance_points)
+                rem_contracts = active_contracts
+
+                sig_et = pd.Timestamp(sig.timestamp)
+                sig_et = (
+                    sig_et.tz_localize(self.cfg.risk.timezone)
+                    if sig_et.tzinfo is None
+                    else sig_et.tz_convert(self.cfg.risk.timezone)
+                )
+                active_is_pm = sig_et.strftime("%H:%M") < "09:30"
+                use_partial_tp = (
+                    active_contracts >= 2
+                    and getattr(self.cfg.risk, "enable_partial_tp", True)
+                )
+
                 if reanchor_sl_tp:
-                    rr = (
-                        getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
-                        if active_is_pm
-                        else self.cfg.risk.reward_risk_ratio
-                    )
-                    tp_dist = round_to_tick(one_r_pts * rr, tick)
-                    active_take_profit = (
-                        round_to_tick(fill_price + tp_dist, tick)
+                    active_stop_loss = (
+                        round_to_tick(fill_price - one_r_pts, tick)
                         if sig.direction == "LONG"
-                        else round_to_tick(fill_price - tp_dist, tick)
+                        else round_to_tick(fill_price + one_r_pts, tick)
                     )
                 else:
-                    active_take_profit = sig.take_profit
+                    active_stop_loss = sig.stop_loss
+
+                if use_partial_tp:
+                    active_tp1_r = (
+                        getattr(self.cfg.risk, "premarket_partial_tp1_r", 1.4)
+                        if active_is_pm
+                        else getattr(self.cfg.risk, "partial_tp1_r", 2.0)
+                    )
+                    runner_r = (
+                        getattr(self.cfg.risk, "premarket_reward_risk_ratio", 2.0)
+                        if active_is_pm
+                        else getattr(self.cfg.risk, "runner_reward_risk_ratio", 5.0)
+                    )
+                    active_tp1_price = (
+                        round_to_tick(active_entry_price + active_tp1_r * one_r_pts, tick)
+                        if sig.direction == "LONG"
+                        else round_to_tick(active_entry_price - active_tp1_r * one_r_pts, tick)
+                    )
+                    runner_dist = round_to_tick(one_r_pts * runner_r, tick)
+                    tp2_base = fill_price if reanchor_sl_tp else sig.entry_price
+                    active_take_profit = (
+                        round_to_tick(tp2_base + runner_dist, tick)
+                        if sig.direction == "LONG"
+                        else round_to_tick(tp2_base - runner_dist, tick)
+                    )
+                else:
+                    active_tp1_r = 0.0
+                    active_tp1_price = 0.0
+                    if reanchor_sl_tp:
+                        rr = (
+                            getattr(self.cfg.risk, "premarket_reward_risk_ratio", self.cfg.risk.reward_risk_ratio)
+                            if active_is_pm
+                            else self.cfg.risk.reward_risk_ratio
+                        )
+                        tp_dist = round_to_tick(one_r_pts * rr, tick)
+                        active_take_profit = (
+                            round_to_tick(fill_price + tp_dist, tick)
+                            if sig.direction == "LONG"
+                            else round_to_tick(fill_price - tp_dist, tick)
+                        )
+                    else:
+                        active_take_profit = sig.take_profit
 
             active_entry_idx = bar_idx
             be_moved = False
             decay_moved = False
             tp1_done = False
             realized_leg1_pnl = 0.0
+
+        def _submit_signal(sig: TradeSignal, bar_idx: int) -> None:
+            nonlocal pending_signal, pending_sig_idx, pending_best_fav, pending_lmt, pending_stp
+            if self.use_limit_execution:
+                slip_lmt = self.cfg.risk.entry_limit_slippage_ticks * tick
+                collar = float(getattr(self.cfg.risk, "entry_collar_points", 0.0) or 0.0)
+                pending_signal = sig
+                pending_sig_idx = bar_idx
+                pending_best_fav = 0.0
+                if sig.direction == "LONG":
+                    pending_lmt = round_to_tick(sig.entry_price + slip_lmt, tick)
+                    pending_stp = round_to_tick(sig.entry_price - collar, tick) if collar > 0.0 else -1e12
+                else:
+                    pending_lmt = round_to_tick(sig.entry_price - slip_lmt, tick)
+                    pending_stp = round_to_tick(sig.entry_price + collar, tick) if collar > 0.0 else 1e12
+            else:
+                instant_fill = (
+                    sig.entry_price + self.slippage_points
+                    if sig.direction == "LONG"
+                    else sig.entry_price - self.slippage_points
+                )
+                _activate_position(sig, instant_fill, bar_idx=bar_idx, reanchor_sl_tp=False)
+
+        def _close_active_trade(exit_price: float, exit_reason: str, exit_ts: pd.Timestamp, bar_idx: int) -> None:
+            nonlocal active_signal, active_contracts, rem_contracts, realized_leg1_pnl, tp1_done
+            assert active_signal is not None
+            strat_id = getattr(active_signal, "strategy_id", "v4.2")
+            gross_pts = (
+                (exit_price - active_entry_price)
+                if active_signal.direction == "LONG"
+                else (active_entry_price - exit_price)
+            )
+            round_turn_comm = 2.0 * self.commission_per_side * rem_contracts
+            leg2_pnl = (gross_pts * point_val * rem_contracts) - round_turn_comm
+            net_pnl = realized_leg1_pnl + leg2_pnl
+            full_reason = f"TP1 (+{active_tp1_r:.1f}R) + {exit_reason}" if tp1_done else exit_reason
+
+            trades.append(
+                SimulatedTrade(
+                    entry_time=active_signal.timestamp,
+                    exit_time=exit_ts,
+                    direction=active_signal.direction,
+                    reason=active_signal.reason,
+                    contracts=active_contracts,
+                    entry_price=round(active_entry_price, 2),
+                    exit_price=round(exit_price, 2),
+                    stop_loss=active_stop_loss,
+                    take_profit=active_take_profit,
+                    exit_reason=full_reason,
+                    gross_points=round(gross_pts, 2),
+                    net_pnl_usd=round(net_pnl, 2),
+                    strategy_id=strat_id,
+                )
+            )
+            self.risk.record_trade_closed(net_pnl, exit_bar_index=bar_idx, strategy_id=strat_id)
+            active_signal = None
+            active_contracts = 0
+            rem_contracts = 0
+            realized_leg1_pnl = 0.0
+            tp1_done = False
 
         for i in range(len(enriched)):
             bar = enriched.iloc[i]
@@ -312,6 +390,16 @@ class Backtester:
                             runaway_pts > 0.0 and pending_best_fav >= runaway_pts
                         ):
                             pending_signal = None
+                        elif (
+                            self.cfg.strategy.enable_mr_b
+                            and getattr(pending_signal, "strategy_id", "v4.2") == "MR-B"
+                        ):
+                            v42_ok, _ = self.risk.can_open_trade(ts, current_bar_index=i)
+                            if v42_ok:
+                                v42_sig = self.strategy.evaluate_bar(enriched, idx=i)
+                                if v42_sig is not None:
+                                    pending_signal = None
+                                    _submit_signal(v42_sig, i)
                         continue
 
             # 1. Manage open position if one is active
@@ -320,6 +408,48 @@ class Backtester:
                 exit_reason = ""
                 one_r = active_signal.stop_distance_points
                 bars_held = i - active_entry_idx
+                active_strat_id = getattr(active_signal, "strategy_id", "v4.2")
+
+                if active_strat_id == "MR-B":
+                    if self.risk.should_flatten_mr_b_fomc(ts):
+                        exit_price = close_p - self.slippage_points
+                        exit_reason = "FOMC_FLAT"
+                    elif low_p <= active_stop_loss:
+                        exit_price = active_stop_loss - self.slippage_points
+                        exit_reason = "Break-Even Stop" if be_moved else "Stop Loss"
+                    elif high_p >= active_take_profit:
+                        exit_price = active_take_profit
+                        exit_reason = "Take Profit"
+                    elif self.risk.should_flatten_eod(ts):
+                        exit_price = close_p - self.slippage_points
+                        exit_reason = "EOD Flatten"
+                    else:
+                        mr_be_r = getattr(self.cfg.risk, "mr_b_breakeven_r", 0.6)
+                        if not be_moved and mr_be_r > 0.0 and close_p >= active_entry_price + mr_be_r * one_r:
+                            mr_be_off = getattr(self.cfg.risk, "mr_b_breakeven_offset_points", 1.5)
+                            new_sl = round_to_tick(active_entry_price + mr_be_off, tick)
+                            if close_p > new_sl:
+                                active_stop_loss = max(active_stop_loss, new_sl)
+                                be_moved = True
+                        mr_max_hold = int(getattr(self.cfg.risk, "mr_b_max_hold_bars", 45) or 0)
+                        if mr_max_hold > 0 and bars_held >= mr_max_hold:
+                            exit_price = close_p - self.slippage_points
+                            exit_reason = "TIME"
+
+                    if exit_price is not None:
+                        _close_active_trade(exit_price, exit_reason, ts, i)
+                        continue
+
+                    if self.cfg.strategy.enable_mr_b:
+                        v42_ok, _ = self.risk.can_open_trade(ts, current_bar_index=i)
+                        v42_sig = self.strategy.evaluate_bar(enriched, idx=i) if v42_ok else None
+                        if v42_sig is not None:
+                            _close_active_trade(close_p - self.slippage_points, "PREEMPT_V42", ts, i)
+                            v42_ok_after, _ = self.risk.can_open_trade(ts, current_bar_index=i)
+                            if v42_ok_after:
+                                _submit_signal(v42_sig, i)
+                    continue
+
                 be_r = (
                     getattr(self.cfg.risk, "premarket_breakeven_r", 1.0)
                     if active_is_pm
@@ -428,66 +558,22 @@ class Backtester:
                                 decay_moved = True
 
                 if exit_price is not None:
-                    gross_pts = (
-                        (exit_price - active_entry_price)
-                        if active_signal.direction == "LONG"
-                        else (active_entry_price - exit_price)
-                    )
-                    round_turn_comm = 2.0 * self.commission_per_side * rem_contracts
-                    leg2_pnl = (gross_pts * point_val * rem_contracts) - round_turn_comm
-                    net_pnl = realized_leg1_pnl + leg2_pnl
-                    full_reason = f"TP1 (+{active_tp1_r:.1f}R) + {exit_reason}" if tp1_done else exit_reason
-
-                    trades.append(
-                        SimulatedTrade(
-                            entry_time=active_signal.timestamp,
-                            exit_time=ts,
-                            direction=active_signal.direction,
-                            reason=active_signal.reason,
-                            contracts=active_contracts,
-                            entry_price=round(active_entry_price, 2),
-                            exit_price=round(exit_price, 2),
-                            stop_loss=active_stop_loss,
-                            take_profit=active_take_profit,
-                            exit_reason=full_reason,
-                            gross_points=round(gross_pts, 2),
-                            net_pnl_usd=round(net_pnl, 2),
-                        )
-                    )
-                    self.risk.record_trade_closed(net_pnl, exit_bar_index=i)
-                    active_signal = None
-                    active_contracts = 0
-                    rem_contracts = 0
-                    realized_leg1_pnl = 0.0
-                    tp1_done = False
+                    _close_active_trade(exit_price, exit_reason, ts, i)
                 continue
 
-            # 2. Check if new trade is allowed when flat
+            # 2. Check if new trade is allowed when flat (v4.2 has strict priority over MR-B)
             allowed, _ = self.risk.can_open_trade(ts, current_bar_index=i)
-            if not allowed:
+            signal = self.strategy.evaluate_bar(enriched, idx=i) if allowed else None
+            if signal is not None:
+                _submit_signal(signal, i)
                 continue
 
-            signal = self.strategy.evaluate_bar(enriched, idx=i)
-            if signal is not None:
-                if self.use_limit_execution:
-                    slip_lmt = self.cfg.risk.entry_limit_slippage_ticks * tick
-                    collar = float(getattr(self.cfg.risk, "entry_collar_points", 0.0) or 0.0)
-                    pending_signal = signal
-                    pending_sig_idx = i
-                    pending_best_fav = 0.0
-                    if signal.direction == "LONG":
-                        pending_lmt = round_to_tick(signal.entry_price + slip_lmt, tick)
-                        pending_stp = round_to_tick(signal.entry_price - collar, tick) if collar > 0.0 else -1e12
-                    else:
-                        pending_lmt = round_to_tick(signal.entry_price - slip_lmt, tick)
-                        pending_stp = round_to_tick(signal.entry_price + collar, tick) if collar > 0.0 else 1e12
-                else:
-                    instant_fill = (
-                        signal.entry_price + self.slippage_points
-                        if signal.direction == "LONG"
-                        else signal.entry_price - self.slippage_points
-                    )
-                    _activate_position(signal, instant_fill, bar_idx=i, reanchor_sl_tp=False)
+            if self.cfg.strategy.enable_mr_b:
+                mr_ok, _ = self.risk.can_open_mr_b_trade(ts, current_bar_index=i)
+                if mr_ok:
+                    mr_signal = self.strategy.evaluate_mr_b_bar(enriched, idx=i)
+                    if mr_signal is not None:
+                        _submit_signal(mr_signal, i)
 
         metrics = self._compute_metrics(trades)
         return {
@@ -497,7 +583,21 @@ class Backtester:
         }
 
     @staticmethod
-    def _compute_metrics(trades: List[SimulatedTrade]) -> Dict[str, float]:
+    def _compute_metrics(trades: List[SimulatedTrade]) -> Dict[str, object]:
+        by_strategy: Dict[str, Dict[str, object]] = {}
+        for sid in ("v4.2", "MR-B"):
+            sub = [t for t in trades if getattr(t, "strategy_id", "v4.2") == sid]
+            sub_wins = sum(1 for t in sub if t.net_pnl_usd > 0)
+            sub_losses = len(sub) - sub_wins
+            by_strategy[sid] = {
+                "trades": len(sub),
+                "wins": sub_wins,
+                "losses": sub_losses,
+                "win_rate_pct": round(100.0 * sub_wins / len(sub), 2) if sub else 0.0,
+                "net_pnl_usd": round(float(sum(t.net_pnl_usd for t in sub)), 2),
+                "preempt_count": sum(1 for t in sub if t.exit_reason == "PREEMPT_V42"),
+            }
+
         if not trades:
             return {
                 "total_trades": 0,
@@ -507,6 +607,7 @@ class Backtester:
                 "max_drawdown_usd": 0.0,
                 "avg_trade_usd": 0.0,
                 "sharpe_ratio": 0.0,
+                "by_strategy": by_strategy,
             }
 
         pnls = np.array([t.net_pnl_usd for t in trades], dtype=float)
@@ -533,4 +634,5 @@ class Backtester:
             "max_drawdown_usd": round(max_dd, 2),
             "avg_trade_usd": round(float(np.mean(pnls)), 2),
             "sharpe_ratio": round(sharpe, 2),
+            "by_strategy": by_strategy,
         }

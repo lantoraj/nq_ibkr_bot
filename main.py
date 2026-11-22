@@ -141,6 +141,23 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Runner TP2 R-multiple for Leg 2 in RTH when contracts >= 2 (default: 5.0)",
     )
+    parser.add_argument(
+        "--enable-mr-b",
+        action="store_true",
+        help="Enable MR-B Low-Vol Bull VWAP Mean-Reversion alongside v4.2 (ATR%% 0.050-0.150%%, LONG-only)",
+    )
+    parser.add_argument(
+        "--mr-b-contracts",
+        type=int,
+        default=0,
+        help="Contract quantity for MR-B trades (0 = inherit --contracts)",
+    )
+    parser.add_argument(
+        "--mr-b-max-sl-pts",
+        type=float,
+        default=45.0,
+        help="Hard Stop Loss cap in points for MR-B trades (default: 45.0; 0 = uncapped)",
+    )
     return parser.parse_args()
 
 
@@ -159,6 +176,9 @@ def main() -> int:
     cfg.risk.enable_partial_tp = not args.no_partial_tp
     cfg.risk.partial_tp1_r = args.partial_tp1_r
     cfg.risk.runner_reward_risk_ratio = args.runner_rr
+    cfg.strategy.enable_mr_b = bool(args.enable_mr_b)
+    cfg.risk.mr_b_contracts = int(args.mr_b_contracts)
+    cfg.strategy.mr_b_max_sl_points = float(args.mr_b_max_sl_pts)
     cfg.ibkr.host = args.host
     cfg.ibkr.client_id = args.client_id
     if args.discord_webhook:
@@ -192,7 +212,18 @@ def main() -> int:
         print(f"  NQ / MNQ INTRADAY BACKTEST REPORT ({cfg.contract.symbol} | {cfg.strategy.bar_size})")
         print("=" * 68)
         for k, v in metrics.items():
+            if k == "by_strategy":
+                continue
             print(f"  {k:<22}: {v}")
+        if cfg.strategy.enable_mr_b and isinstance(metrics.get("by_strategy"), dict):
+            print("-" * 68)
+            print("  Per-Strategy Breakdown (Separate Counters + PREEMPT_V42):")
+            for sid, stats in metrics["by_strategy"].items():
+                extra = f" | PREEMPT_V42: {stats['preempt_count']}" if sid == "MR-B" else ""
+                print(
+                    f"  {sid:<22}: trades={stats['trades']} (W:{stats['wins']}/L:{stats['losses']}, "
+                    f"WR {stats['win_rate_pct']}%) | Net=${stats['net_pnl_usd']:+.2f}{extra}"
+                )
         print("=" * 68)
 
         if not trades_df.empty:
@@ -200,6 +231,7 @@ def main() -> int:
             cols = [
                 "entry_time",
                 "exit_time",
+                *(["strategy_id"] if "strategy_id" in trades_df.columns and cfg.strategy.enable_mr_b else []),
                 "direction",
                 "contracts",
                 "entry_price",

@@ -102,6 +102,17 @@ class StrategyConfig:
     v_reversal_min_body_ratio: float = 0.55 # Strong impulse reversal candle body >= 55% of range
     v_reversal_min_vwap_dist_atr: float = 2.0 # At least 2.0 * ATR room back to Session VWAP
 
+    # MR-B Low-Volatility Bull VWAP Mean-Reversion Engine (Opt-in; ATR% 0.050-0.150%, LONG-only)
+    enable_mr_b: bool = False
+    mr_b_atr_pct_min: float = 0.050        # Inclusive lower bound on ATR(14)/Close * 100 (%)
+    mr_b_atr_pct_max: float = 0.150        # Exclusive upper bound on ATR(14)/Close * 100 (%)
+    mr_b_vwap_z_threshold: float = 2.0     # Enter LONG when VWAP Z <= -2.0 on bullish reversal candle
+    mr_b_daily_ema_period: int = 50        # Causal daily macro bull filter: prev_close > EMA50_d
+    mr_b_sl_atr_multiplier: float = 2.0    # Initial 1R SL distance = 2.0 * ATR(14)
+    mr_b_min_sl_points: float = 8.0        # Floor on MR-B SL distance (pts)
+    mr_b_max_sl_points: float = 45.0       # Hard SL cap (pts) for MR-B (0.0 = uncapped)
+    mr_b_min_rr: float = 0.80              # Minimum reward-to-risk to fixed signal Session VWAP TP
+
 
 @dataclass
 class RiskConfig:
@@ -173,6 +184,21 @@ class RiskConfig:
     news_mega_post_blackout_mins: int = 10 # Tier-1 Mega Shock post-release settle blackout
     pre_news_tighten_stop_mins: int = 4   # Tighten SL on open positions N mins ahead of USD High news
     daily_calendar_alert_time_cet: str = "09:00"  # Daily 09:00 AM Prague Discord calendar briefing
+
+    # MR-B Isolated Risk & Trade Management Guardrails (separate counters, shared RTH daily loss kill-switch)
+    mr_b_contracts: int = 0                    # 0 = inherit fixed_contracts
+    mr_b_entry_start_time: str = "10:15"       # RTH entry window start (ET)
+    mr_b_entry_end_time: str = "14:30"         # RTH entry window end (ET)
+    mr_b_fomc_blackout_start: str = "13:50"    # FOMC decision day entry blackout start (ET)
+    mr_b_fomc_blackout_end: str = "14:45"      # FOMC decision day entry blackout end (ET)
+    mr_b_fomc_flatten_start: str = "13:56"     # Pre-FOMC forced market flatten window start (ET)
+    mr_b_fomc_flatten_end: str = "14:00"       # Pre-FOMC forced market flatten window end (ET)
+    mr_b_max_daily_trades: int = 3             # Separate MR-B max trades per RTH session
+    mr_b_max_daily_losses: int = 1             # Separate MR-B max losing trades per RTH session
+    mr_b_cooldown_bars: int = 3                # Separate MR-B post-exit cooldown in 2-min bars
+    mr_b_breakeven_r: float = 0.6              # Lock BE on bar close >= +0.6R
+    mr_b_breakeven_offset_points: float = 1.5  # Move SL to entry + 1.5 pts when MR-B BE triggers
+    mr_b_max_hold_bars: int = 45               # Hard MR-B time exit after 45 bars (90 minutes)
 
 
 @dataclass

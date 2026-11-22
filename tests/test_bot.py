@@ -1361,3 +1361,535 @@ def test_backtester_realistic_limit_execution_p1() -> None:
     bt2.strategy.evaluate_bar = bt1.strategy.evaluate_bar
     res2 = bt2.run(df_runaway)
     assert len(res2["trades"]) == 0
+
+
+def test_mr_b_signal_filters_sl_cap_and_causal_daily_ema50() -> None:
+    """Verify MR-B ATR% [0.050, 0.150) gate, causal daily EMA50_d regime, SL=min(2*ATR,45), and VWAP RR>=0.80."""
+    from indicators import compute_daily_ema_regime
+
+    # 1. Causal daily EMA50_d check (today's close must NEVER affect today's regime)
+    dates = pd.bdate_range("2026-06-01", periods=60).date
+    closes_up = pd.Series([19000.0 + i * 15.0 for i in range(60)], index=dates)
+    reg1 = compute_daily_ema_regime(closes_up, ema_period=50)
+    assert bool(reg1.iloc[-1]["daily_bull_50"]) is True
+    assert reg1.iloc[-1]["daily_prev_close"] == closes_up.iloc[-2]
+
+    # Crash last day's close far below EMA50 -> today's regime (-1) MUST stay unchanged!
+    closes_crash_last = closes_up.copy()
+    closes_crash_last.iloc[-1] = 15000.0
+    reg2 = compute_daily_ema_regime(closes_crash_last, ema_period=50)
+    assert bool(reg2.iloc[-1]["daily_bull_50"]) is True
+
+    # 2. Signal filter checks
+    cfg = BotConfig()
+    cfg.strategy.enable_mr_b = True
+    cfg.strategy.mr_b_max_sl_points = 45.0
+    strat = NQIntradayStrategy(cfg.strategy, cfg.risk, cfg.contract)
+
+    ts = pd.date_range("2026-10-20 11:00:00", periods=3, freq="2min", tz="America/New_York").tz_convert("UTC")
+    df = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": [25010.0, 25005.0, 24992.0],
+            "high": [25012.0, 25006.0, 25004.0],
+            "low": [24998.0, 24990.0, 24991.0],
+            "close": [25000.0, 24994.0, 25000.0],  # bar 2 > bar 2 open (24992) and > bar 1 close (24994)
+            "volume": [1000.0, 1100.0, 1200.0],
+            "vwap": [25050.0, 25050.0, 25050.0],
+            "vwap_z": [-1.8, -2.2, -2.1],
+            "atr": [30.0, 30.0, 30.0],
+            "atr_pct": [0.120, 0.120, 0.120],
+            "rsi": [40.0, 38.0, 42.0],
+            "ema_fast": [25010.0, 25005.0, 25003.0],
+            "ema_slow": [25020.0, 25015.0, 25012.0],
+            "daily_bull_50": [True, True, True],
+        }
+    )
+
+    # SL cap: 2 * 30 = 60 -> capped at 45.0 pts; fixed VWAP TP = 25050.0 (RR = 50/45 = 1.11 >= 0.80)
+    sig = strat.evaluate_mr_b_bar(df, idx=-1)
+    assert sig is not None
+    assert sig.strategy_id == "MR-B"
+    assert sig.direction == "LONG"
+    assert sig.stop_distance_points == 45.0
+    assert sig.stop_loss == 24955.0
+    assert sig.take_profit == 25050.0
+
+    # Half-open ATR% bounds [0.050, 0.150)
+    df_lo = df.copy()
+    df_lo.at[2, "atr_pct"] = 0.049
+    assert strat.evaluate_mr_b_bar(df_lo, idx=-1) is None
+
+    df_exact_lo = df.copy()
+    df_exact_lo.at[2, "atr_pct"] = 0.050
+    df_exact_lo.at[2, "atr"] = 12.5
+    sig_lo = strat.evaluate_mr_b_bar(df_exact_lo, idx=-1)
+    assert sig_lo is not None and sig_lo.stop_distance_points == 25.0
+
+    df_hi = df.copy()
+    df_hi.at[2, "atr_pct"] = 0.150
+    assert strat.evaluate_mr_b_bar(df_hi, idx=-1) is None
+
+    # Bull50 False or override False blocks signal
+    assert strat.evaluate_mr_b_bar(df, idx=-1, daily_bull_50=False) is None
+
+    # Min RR < 0.80 blocks signal (sl_dist=45, VWAP distance=30 -> RR=0.67 < 0.80)
+    df_rr = df.copy()
+    df_rr.at[2, "vwap"] = 25030.0
+    assert strat.evaluate_mr_b_bar(df_rr, idx=-1) is None
+
+    # SL floor 8.0 pts
+    df_floor = df.copy()
+    df_floor.at[2, "atr"] = 3.0
+    df_floor.at[2, "atr_pct"] = 0.060
+    df_floor.at[2, "vwap"] = 25010.0  # RR = 10/8 = 1.25 >= 0.80
+    sig_floor = strat.evaluate_mr_b_bar(df_floor, idx=-1)
+    assert sig_floor is not None and sig_floor.stop_distance_points == 8.0
+
+
+def test_mr_b_separate_risk_counters_and_shared_kill_switch(tmp_path) -> None:
+    """Verify isolated MR-B daily counters, v4.2 independence, FOMC guards, and shared $1000 kill-switch."""
+    from economic_calendar import EconomicCalendar
+
+    cal = EconomicCalendar(cache_path=str(tmp_path / "ff.json"), report_path=None)
+    cal.load_events_from_list(
+        [
+            {"title": "FOMC Statement", "country": "USD", "date": "2027-02-03T14:00:00-05:00", "impact": "High"},
+            {"title": "FOMC Meeting Minutes", "country": "USD", "date": "2027-02-24T14:00:00-05:00", "impact": "High"},
+        ]
+    )
+    cfg = BotConfig()
+    cfg.strategy.enable_mr_b = True
+    cfg.risk.fixed_contracts = 2
+    cfg.risk.mr_b_contracts = 2
+    cfg.risk.max_daily_loss_usd = 1000.0
+    cfg.risk.max_consecutive_losses = 2
+    rm = RiskManager(cfg.risk, cfg.contract, calendar=cal)
+
+    # 1. FOMC blackout & flatten checks (static 2026-10-28 + live 2027-02-03, ignoring FOMC Minutes on 2027-02-24)
+    assert rm.is_fomc_day(pd.Timestamp("2026-10-28 13:56:00-04:00")) is True
+    assert rm.should_flatten_mr_b_fomc(pd.Timestamp("2026-10-28 13:56:00-04:00")) is True
+    assert rm.can_open_mr_b_trade(pd.Timestamp("2026-10-28 13:52:00-04:00"), 10)[0] is False
+    assert rm.is_fomc_day(pd.Timestamp("2027-02-03 13:56:00-05:00")) is True
+    assert rm.is_fomc_day(pd.Timestamp("2027-02-24 13:56:00-05:00")) is False
+
+    # 2. MR-B loss blocks MR-B (1/1) while leaving v4.2 counters completely clean
+    ts_ok = pd.Timestamp("2026-10-20 11:45:00-04:00")  # inside EU Close blackout (blocks v4.2), valid for MR-B
+    assert rm.can_open_trade(ts_ok, 20)[0] is False
+    assert rm.can_open_mr_b_trade(ts_ok, 20)[0] is True
+
+    rm.record_trade_closed(-182.48, exit_bar_index=25, strategy_id="MR-B")
+    assert rm.state.mr_b_losses == 1
+    assert rm.state.mr_b_trades_taken == 1
+    assert rm.state.rth_trades_taken == 0
+    assert rm.state.consecutive_losses == 0
+    assert rm.state.last_exit_bar_index == -999
+    assert rm.state.rth_realized_pnl_usd == -182.48
+    assert rm.can_open_mr_b_trade(pd.Timestamp("2026-10-20 12:15:00-04:00"), 40)[0] is False
+    assert rm.can_open_trade(pd.Timestamp("2026-10-20 12:00:00-04:00"), 26)[0] is True  # zero cooldown leak
+
+    # 3. Next day: v4.2 hits 2 consecutive losses (-$300) -> halts v4.2 ONLY; MR-B stays active until -$1000 shared limit
+    ts_d2 = pd.Timestamp("2026-10-21 10:30:00-04:00")
+    assert rm.can_open_mr_b_trade(ts_d2, 50)[0] is True
+    rm.record_trade_closed(-150.0, exit_bar_index=55, strategy_id="v4.2")
+    rm.record_trade_closed(-150.0, exit_bar_index=65, strategy_id="v4.2")
+    assert rm.state.halted is True
+    assert rm.state.account_halted is False
+    assert rm.can_open_trade(pd.Timestamp("2026-10-21 10:50:00-04:00"), 75)[0] is False
+    assert rm.can_open_mr_b_trade(pd.Timestamp("2026-10-21 11:00:00-04:00"), 80)[0] is True
+
+    # 4. Shared account daily kill-switch (-$1000) blocks BOTH strategies
+    rm.record_trade_closed(-710.0, exit_bar_index=90, strategy_id="MR-B")
+    assert rm.state.account_halted is True
+    assert rm.can_open_trade(pd.Timestamp("2026-10-21 12:10:00-04:00"), 100)[0] is False
+    assert rm.can_open_mr_b_trade(pd.Timestamp("2026-10-21 12:10:00-04:00"), 100)[0] is False
+
+
+def test_backtester_dual_strategy_preempt_be_time_exit_and_fomc() -> None:
+    """Verify Backtester unified v4.2 + MR-B execution: single 2ct VWAP TP, +0.6R BE, 45b TIME, PREEMPT_V42, FOMC_FLAT."""
+    from backtest import Backtester
+    from strategy import TradeSignal
+
+    # Scenario A: MR-B 2 MNQ no scale-out, +0.6R -> +1.5b BE, skips 6-bar decay, exits at 45 bars (TIME)
+    cfg = BotConfig()
+    cfg.strategy.enable_mr_b = True
+    cfg.risk.fixed_contracts = 2
+    cfg.risk.mr_b_contracts = 2
+    cfg.risk.enable_partial_tp = True
+    cfg.risk.max_daily_loss_usd = 1000.0
+
+    ts_a = pd.date_range("2026-10-20 10:20:00", periods=48, freq="2min", tz="America/New_York").tz_convert("UTC")
+    closes_a = [25000.0] * 48
+    closes_a[5] = 25026.0  # >= +0.6R (24 pts) on bar 5 close -> moves SL to 25000.25 + 1.5 = 25001.75
+    for k in range(6, 48):
+        closes_a[k] = 25015.0  # holds cleanly above BE (25001.75) and below fixed VWAP TP (25050.0)
+    df_a = pd.DataFrame(
+        {
+            "timestamp": ts_a,
+            "open": closes_a,
+            "high": [c + 3.0 for c in closes_a],
+            "low": [c - 3.0 for c in closes_a],
+            "close": closes_a,
+            "volume": [1000.0] * 48,
+        }
+    )
+    bt_a = Backtester(cfg, commission_per_side_usd=0.62, slippage_ticks=1)
+    bt_a.strategy.prepare_dataframe = lambda d: d
+    bt_a.strategy.evaluate_bar = lambda d, idx=-1: None
+    bt_a.strategy.evaluate_mr_b_bar = lambda d, idx=-1, daily_bull_50=None: (
+        TradeSignal(
+            timestamp=d.iloc[idx]["timestamp"],
+            direction="LONG",
+            reason="MR-B Test",
+            entry_price=25000.0,
+            stop_loss=24960.0,
+            take_profit=25050.0,
+            stop_distance_points=40.0,
+            atr=25.0,
+            rsi=40.0,
+            vwap=25050.0,
+            ema_fast=25010.0,
+            ema_slow=25020.0,
+            strategy_id="MR-B",
+        )
+        if idx == 0
+        else None
+    )
+    res_a = bt_a.run(df_a)
+    assert len(res_a["trades"]) == 1
+    tr_a = res_a["trades"][0]
+    assert tr_a.strategy_id == "MR-B"
+    assert tr_a.contracts == 2
+    assert tr_a.take_profit == 25050.0
+    assert tr_a.stop_loss == 25001.75
+    assert tr_a.exit_reason == "TIME"
+    assert tr_a.exit_time == ts_a[45]
+
+    # Scenario B: PREEMPT_V42 + 0 overlaps + v4.2 flat-bar priority
+    # Bar 4 drops to hit both TP1 (+2R=24939.75) and Runner TP2 (+5R=24849.75); bar 10 test runs to EOD
+    ts_b = list(pd.date_range("2026-10-20 10:20:00", periods=14, freq="2min", tz="America/New_York").tz_convert("UTC")) + [
+        pd.Timestamp("2026-10-20 15:56:00", tz="America/New_York").tz_convert("UTC")
+    ]
+    df_b = pd.DataFrame(
+        {
+            "timestamp": ts_b,
+            "open": [25000.0] * 15,
+            "high": [25005.0] * 15,
+            "low": [24995.0] * 15,
+            "close": [25000.0] * 15,
+            "volume": [1000.0] * 15,
+        }
+    )
+    df_b.at[4, "low"] = 24845.0
+    df_b.at[4, "close"] = 24850.0
+
+    bt_b = Backtester(cfg, commission_per_side_usd=0.62, slippage_ticks=1)
+    bt_b.strategy.prepare_dataframe = lambda d: d
+    bt_b.strategy.evaluate_bar = lambda d, idx=-1: (
+        TradeSignal(
+            timestamp=d.iloc[idx]["timestamp"],
+            direction="SHORT",
+            reason="v4.2 Test",
+            entry_price=25000.0,
+            stop_loss=25030.0,
+            take_profit=24990.0,
+            stop_distance_points=30.0,
+            atr=25.0,
+            rsi=42.0,
+            vwap=25010.0,
+            ema_fast=24995.0,
+            ema_slow=25005.0,
+            strategy_id="v4.2",
+        )
+        if idx in (2, 10)
+        else None
+    )
+    bt_b.strategy.evaluate_mr_b_bar = lambda d, idx=-1, daily_bull_50=None: (
+        TradeSignal(
+            timestamp=d.iloc[idx]["timestamp"],
+            direction="LONG",
+            reason="MR-B Test",
+            entry_price=25000.0,
+            stop_loss=24960.0,
+            take_profit=25050.0,
+            stop_distance_points=40.0,
+            atr=25.0,
+            rsi=40.0,
+            vwap=25050.0,
+            ema_fast=25010.0,
+            ema_slow=25020.0,
+            strategy_id="MR-B",
+        )
+        if idx in (0, 10)
+        else None
+    )
+    res_b = bt_b.run(df_b)
+    trades_b = res_b["trades"]
+    assert trades_b[0].strategy_id == "MR-B" and trades_b[0].exit_reason == "PREEMPT_V42"
+    assert trades_b[1].strategy_id == "v4.2"
+    assert trades_b[0].exit_time <= trades_b[1].entry_time  # strict 0-overlap guarantee
+    # Flat bar 10 where both v4.2 and MR-B signal: v4.2 takes strict priority
+    assert trades_b[-1].strategy_id == "v4.2" and trades_b[-1].entry_time == ts_b[10]
+
+    # Scenario C: Pre-FOMC 13:56 ET Flatten
+    ts_fomc = pd.date_range("2026-10-28 13:44:00", periods=10, freq="2min", tz="America/New_York").tz_convert("UTC")
+    df_c = pd.DataFrame(
+        {
+            "timestamp": ts_fomc,
+            "open": [25000.0] * 10,
+            "high": [25005.0] * 10,
+            "low": [24995.0] * 10,
+            "close": [25000.0] * 10,
+            "volume": [1000.0] * 10,
+        }
+    )
+    bt_c = Backtester(cfg, commission_per_side_usd=0.62, slippage_ticks=1)
+    bt_c.strategy.prepare_dataframe = lambda d: d
+    bt_c.strategy.evaluate_bar = lambda d, idx=-1: None
+    bt_c.strategy.evaluate_mr_b_bar = lambda d, idx=-1, daily_bull_50=None: (
+        TradeSignal(
+            timestamp=d.iloc[idx]["timestamp"],
+            direction="LONG",
+            reason="MR-B FOMC Test",
+            entry_price=25000.0,
+            stop_loss=24960.0,
+            take_profit=25050.0,
+            stop_distance_points=40.0,
+            atr=25.0,
+            rsi=40.0,
+            vwap=25050.0,
+            ema_fast=25010.0,
+            ema_slow=25020.0,
+            strategy_id="MR-B",
+        )
+        if idx == 0
+        else None
+    )
+    res_c = bt_c.run(df_c)
+    assert len(res_c["trades"]) == 1
+    assert res_c["trades"][0].exit_reason == "FOMC_FLAT"
+    assert res_c["metrics"]["by_strategy"]["MR-B"]["trades"] == 1
+
+
+def test_runner_mr_b_bracket_no_scaleout_reanchor_preempt_and_recovery(tmp_path) -> None:
+    """Verify live runner MR-B single-bracket, fixed VWAP TP re-anchor, PREEMPT_V42 flatten/abort, and recovery."""
+    from types import SimpleNamespace
+    from ib_async import Future, LimitOrder, StopOrder
+    from ibkr_execution import IBKRNQBotRunner
+    from strategy import TradeSignal
+    from trade_journal import TradeJournal
+
+    cfg = BotConfig()
+    cfg.strategy.enable_mr_b = True
+    cfg.risk.fixed_contracts = 2
+    cfg.risk.mr_b_contracts = 2
+    cfg.risk.enable_partial_tp = True
+    cfg.risk.max_daily_loss_usd = 1000.0
+
+    runner = IBKRNQBotRunner(cfg, mode="paper")
+    runner.journal = TradeJournal(base_dir=str(tmp_path / "j_mrb"), timezone="America/New_York")
+    runner.contract = Future(conId=815824267, symbol="MNQ", localSymbol="MNQZ6", multiplier="2", exchange="CME", currency="USD")
+    runner._send_discord_alert = lambda *a, **k: None
+    runner._generate_trade_chart = lambda *a, **k: None
+    runner._daily_bull_50 = True
+    runner._daily_regime_date = pd.Timestamp("2026-10-20").date()
+
+    req_counter = iter(range(7000, 7200))
+    placed_orders = []
+    open_trades = []
+    positions = []
+
+    def _fake_place(c, o):
+        placed_orders.append(o)
+        if getattr(o, "orderType", "") == "MKT" and positions:
+            positions.clear()
+            open_trades.clear()
+        else:
+            open_trades.append(SimpleNamespace(contract=c, order=o, orderStatus=SimpleNamespace(status="Submitted")))
+        return SimpleNamespace(contract=c, order=o)
+
+    def _fake_cancel(o):
+        open_trades[:] = [t for t in open_trades if getattr(t.order, "orderId", None) != getattr(o, "orderId", None)]
+
+    runner.ib.client = SimpleNamespace(getReqId=lambda: next(req_counter), isConnected=lambda: False)
+    runner.ib.placeOrder = _fake_place
+    runner.ib.cancelOrder = _fake_cancel
+    runner.ib.openTrades = lambda: list(open_trades)
+    runner.ib.trades = lambda: list(open_trades)
+    runner.ib.positions = lambda: list(positions)
+
+    # 1. Single 3-order bracket for 2 MNQ MR-B + orderRef tag
+    sig_mrb = TradeSignal(
+        timestamp=pd.Timestamp("2026-10-20 10:20:00-04:00"),
+        direction="LONG",
+        reason="MR-B Dip",
+        entry_price=25000.0,
+        stop_loss=24955.0,
+        take_profit=25050.0,
+        stop_distance_points=45.0,
+        atr=30.0,
+        rsi=40.0,
+        vwap=25050.0,
+        ema_fast=25010.0,
+        ema_slow=25020.0,
+        strategy_id="MR-B",
+    )
+    runner.place_bracket_order(sig_mrb, quantity=2)
+    assert len(placed_orders) == 3  # NO partial scale-out split!
+    p_mrb, tp_mrb, sl_mrb = placed_orders
+    assert p_mrb.totalQuantity == 2
+    assert p_mrb.orderRef.startswith("MR-B:")
+    assert tp_mrb.lmtPrice == 25050.0
+    assert runner._active_tp1_order is None
+
+    # 2. Entry fill @ 25001.00 re-anchors SL to 24956.00 while preserving fixed VWAP TP = 25050.00!
+    positions.append(SimpleNamespace(contract=runner.contract, position=2.0, avgCost=25001.0 * 2.0))
+    fill_t = pd.Timestamp("2026-10-20 14:20:05", tz="UTC")
+    runner._on_exec_details(
+        SimpleNamespace(),
+        SimpleNamespace(contract=runner.contract, execution=SimpleNamespace(orderId=p_mrb.orderId, side="BOT", shares=2, price=25001.0, time=fill_t)),
+    )
+    assert sl_mrb.auxPrice == 24956.0
+    assert tp_mrb.lmtPrice == 25050.0  # Fixed VWAP TP MUST stay intact!
+    assert sig_mrb.take_profit == 25050.0
+
+    # 3. PREEMPT_V42 happy path + delayed MR-B commissionReport must not corrupt active v4.2 trade
+    placed_orders.clear()
+    v42_sig = TradeSignal(
+        timestamp=pd.Timestamp("2026-10-20 10:24:00-04:00"),
+        direction="SHORT",
+        reason="Bearish Pullback",
+        entry_price=24990.0,
+        stop_loss=25020.0,
+        take_profit=24900.0,
+        stop_distance_points=30.0,
+        atr=28.0,
+        rsi=42.0,
+        vwap=25010.0,
+        ema_fast=24995.0,
+        ema_slow=25005.0,
+        strategy_id="v4.2",
+    )
+    runner.strategy.prepare_dataframe = lambda d: pd.DataFrame(
+        {
+            "timestamp": d["timestamp"],
+            "open": d["open"],
+            "high": d["high"],
+            "low": d["low"],
+            "close": d["close"],
+            "volume": d["volume"],
+            "vwap": 25010.0,
+            "ema_fast": 24995.0,
+            "ema_slow": 25005.0,
+            "vwap_z": -0.5,
+            "hurst": 0.55,
+            "kalman_vel_atr": -0.2,
+        }
+    )
+    runner.strategy.evaluate_bar = lambda d, idx=-1: v42_sig
+    bar_df = pd.DataFrame(
+        {
+            "timestamp": [
+                pd.Timestamp("2026-10-20 14:22:00", tz="UTC"),
+                pd.Timestamp("2026-10-20 14:24:00", tz="UTC"),
+            ],
+            "open": [25001.0, 24998.0],
+            "high": [25003.0, 24999.0],
+            "low": [24995.0, 24989.0],
+            "close": [24998.0, 24990.0],
+            "volume": [1000.0, 1200.0],
+        }
+    )
+    runner._on_bar_update(bar_df, has_new_bar=True)
+
+    # First placed order is MarketOrder flatten for MR-B, followed by 6 orders for 2-ct v4.2 bracket!
+    assert placed_orders[0].orderType == "MKT" and placed_orders[0].orderRef == "MR-B:PREEMPT_V42"
+    mkt_close_oid = placed_orders[0].orderId
+    assert len(placed_orders) == 7
+    assert runner._active_strategy_id == "v4.2"
+    assert runner._active_signal is v42_sig
+
+    # Now delayed commissionReport arrives for the preempted MR-B MKT order -> goes ONLY to MR-B counters!
+    runner._on_commission_report(
+        SimpleNamespace(order=placed_orders[0]),
+        SimpleNamespace(execution=SimpleNamespace(orderId=mkt_close_oid, shares=2, price=24990.0, time=pd.Timestamp("2026-10-20 14:24:01", tz="UTC"))),
+        SimpleNamespace(realizedPNL=-46.48, commission=2.48),
+    )
+    assert runner.risk.state.mr_b_trades_taken == 1
+    assert runner.risk.state.mr_b_losses == 1
+    assert runner.risk.state.rth_trades_taken == 0
+    assert abs(runner.risk.state.mr_b_realized_pnl_usd - (-46.48)) < 1e-6
+    assert runner._active_signal is v42_sig  # Live v4.2 state untouched!
+
+    # 4. PREEMPT_V42 fail-safe abort when IBKR refuses to confirm flat
+    runner_abort = IBKRNQBotRunner(cfg, mode="paper")
+    runner_abort.contract = runner.contract
+    runner_abort._send_discord_alert = lambda *a, **k: None
+    runner_abort._active_signal = sig_mrb
+    runner_abort._active_strategy_id = "MR-B"
+    runner_abort._active_parent_order = p_mrb
+    sticky_positions = [SimpleNamespace(contract=runner.contract, position=2.0)]
+    abort_placed = []
+    runner_abort.ib.positions = lambda: list(sticky_positions)
+    runner_abort.ib.openTrades = lambda: []
+    runner_abort.ib.client = SimpleNamespace(getReqId=lambda: 8801, isConnected=lambda: False)
+    runner_abort.ib.placeOrder = lambda c, o: abort_placed.append(o) or SimpleNamespace(order=o)
+    ok_preempt = runner_abort._preempt_mr_b_for_v42(v42_sig, pd.Timestamp("2026-10-20 14:26:00", tz="UTC"), 24990.0, has_pos=True)
+    assert ok_preempt is False
+    assert len(abort_placed) == 1  # Flatten MarketOrder attempted, ZERO v4.2 brackets submitted!
+
+    # 5. Restart recovery (_recover_active_trade & _restore_daily_risk_state)
+    runner_rec = IBKRNQBotRunner(cfg, mode="paper")
+    runner_rec.contract = runner.contract
+    runner_rec.ib.positions = lambda: [SimpleNamespace(contract=runner.contract, position=2.0, avgCost=25000.0 * 2.0)]
+    stp_rec = StopOrder(action="SELL", totalQuantity=2, stopPrice=24955.0)
+    stp_rec.orderRef = "MR-B:9001"
+    tp_rec = LimitOrder(action="BUY", totalQuantity=2, lmtPrice=25050.0)
+    tp_rec.parentId = 9001
+    tp_rec.orderRef = "MR-B:9001"
+    runner_rec.ib.reqAllOpenOrders = lambda: [
+        SimpleNamespace(contract=runner.contract, order=stp_rec),
+        SimpleNamespace(contract=runner.contract, order=tp_rec),
+    ]
+    runner_rec._recover_active_trade()
+    assert runner_rec._active_strategy_id == "MR-B"
+    assert runner_rec._active_signal.strategy_id == "MR-B"
+    assert runner_rec._tp1_filled is False
+
+    now_rth_utc = pd.Timestamp.now(tz="America/New_York").replace(hour=11, minute=0, second=0, microsecond=0).tz_convert("UTC")
+    j_rec = TradeJournal(base_dir=str(tmp_path / "j_rec_dual"), timezone="America/New_York")
+    j_rec.log("trade_closed", bar_ts=now_rth_utc, strategy_id="MR-B", direction="LONG", net_pnl_usd=-120.0)
+    j_rec.log("trade_closed", bar_ts=now_rth_utc, strategy_id="v4.2", direction="SHORT", net_pnl_usd=-90.0)
+    runner_state = IBKRNQBotRunner(cfg, mode="paper")
+    runner_state.journal = j_rec
+    runner_state._restore_daily_risk_state()
+    assert runner_state.risk.state.mr_b_trades_taken == 1
+    assert runner_state.risk.state.mr_b_losses == 1
+    assert runner_state.risk.state.trades_taken == 1
+    assert runner_state.risk.state.consecutive_losses == 1
+    assert abs(runner_state.risk.state.rth_realized_pnl_usd - (-210.0)) < 1e-6
+
+    # 6. Daily EMA50_d TradingView fallback + fail-closed <50 days check
+    hist_dates = pd.bdate_range(end="2026-10-19", periods=60)
+    tv_daily_ok = pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp(d, tz="America/New_York").tz_convert("UTC") for d in hist_dates]
+            + [pd.Timestamp("2026-10-20 09:30:00", tz="America/New_York").tz_convert("UTC")],
+            "open": [20000.0 + i * 10.0 for i in range(61)],
+            "high": [20010.0 + i * 10.0 for i in range(61)],
+            "low": [19990.0 + i * 10.0 for i in range(61)],
+            "close": [20000.0 + i * 10.0 for i in range(60)] + [15000.0],  # today's uncompleted bar ignored
+            "volume": [1000.0] * 61,
+        }
+    )
+    runner_tv = IBKRNQBotRunner(cfg, mode="paper")
+    runner_tv.tv_feed = SimpleNamespace(fetch_daily_bars=lambda base_symbol="MNQ", n_bars=150: tv_daily_ok)
+    ok_reg = runner_tv._refresh_daily_regime(pd.Timestamp("2026-10-20 10:00:00-04:00"))
+    assert ok_reg is True
+    assert runner_tv._daily_bull_50 is True
+
+    runner_short = IBKRNQBotRunner(cfg, mode="paper")
+    runner_short.tv_feed = SimpleNamespace(fetch_daily_bars=lambda base_symbol="MNQ", n_bars=150: tv_daily_ok.iloc[:10])
+    ok_short = runner_short._refresh_daily_regime(pd.Timestamp("2026-10-20 10:00:00-04:00"))
+    assert ok_short is False
+    assert runner_short._daily_bull_50 is False
