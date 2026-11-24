@@ -124,10 +124,11 @@ class RiskConfig:
 
     # Order execution improvements (Marketable Stop-Limit Collar + Fast/Runaway Unfilled Order Guards)
     entry_limit_slippage_ticks: int = 8   # Submit Limit entry 8 ticks (2.00 pts) marketable to prevent missed breakouts
-    entry_collar_points: float = 6.0      # Stop-Limit protection band (pts) so delayed signals never fill far past entry/SL
+    entry_collar_points: float = 3.5      # Tightened Stop-Limit protection band (pts): keeps mild pullbacks while rejecting >-3.5 pt falling knives
     cancel_unfilled_entry_bars: int = 1   # Automatically cancel unfilled parent entry order after 1 closed bar (2 mins)
     cancel_unfilled_entry_seconds: float = 60.0  # Cancel unfilled parent entry order if still flat after 60s
     runaway_cancel_points: float = 15.0   # Cancel unfilled parent entry order if price runs >=15 pts in signal direction without fill
+    max_signal_bar_lag_sec: float = 20.0  # Skip fresh entries when real-time bar processing lag exceeds 20s (stalled feed poll)
 
     # Stop Loss, Take Profit, +1R Break-Even & v4 Time-Decay Stagnant Stop Tightening
     stop_mode: Literal["atr", "fixed_points"] = "atr"

@@ -1110,6 +1110,13 @@ class IBKRNQBotRunner:
         )
         return True
 
+    def _is_signal_bar_stale(self, processed_lag_sec: float) -> tuple[bool, str]:
+        """Block fresh signal submission when live feed lag stalls between max_signal_bar_lag_sec and 300s."""
+        max_lag = float(getattr(self.cfg.risk, "max_signal_bar_lag_sec", 0.0) or 0.0)
+        if max_lag > 0.0 and max_lag < processed_lag_sec < 300.0:
+            return True, f"Stale signal bar lag ({processed_lag_sec:.1f}s > {max_lag:.0f}s)"
+        return False, ""
+
     def _check_pending_entry_guards(self, raw_bars: BarDataList | pd.DataFrame) -> bool:
         """
         Evaluate real-time sub-bar / inter-poll P1 guards on an unfilled working parent order:
@@ -1678,6 +1685,11 @@ class IBKRNQBotRunner:
         # Journal the closed bar exactly as the live bot saw it (for feed-accuracy reconciliation)
         _lb = df.iloc[-1]
         _tv = self.tv_feed
+        processed_lag_sec = (
+            pd.Timestamp.now(tz="UTC")
+            - (pd.Timestamp(latest_closed_ts).tz_convert("UTC") + pd.Timedelta(minutes=2))
+        ).total_seconds()
+        stale_bar, stale_reason = self._is_signal_bar_stale(processed_lag_sec)
         self.journal.log(
             "bar",
             bar_ts=latest_closed_ts,
@@ -1690,7 +1702,7 @@ class IBKRNQBotRunner:
             tv_basis=getattr(_tv, "last_basis_points", None) if _tv else None,
             tv_stitched_bars=getattr(_tv, "last_stitched_bars_count", None) if _tv else None,
             tv_cme_mode=getattr(_tv, "last_cme_update_mode", None) if _tv else None,
-            processed_lag_sec=(pd.Timestamp.now(tz="UTC") - (pd.Timestamp(latest_closed_ts).tz_convert("UTC") + pd.Timedelta(minutes=2))).total_seconds(),
+            processed_lag_sec=processed_lag_sec,
         )
         # 0. Check if a pending 10-bar post-trade review chart is ready to be dispatched
         if self._pending_post_trade_chart is not None:
@@ -1776,7 +1788,21 @@ class IBKRNQBotRunner:
                 v42_ok, _ = self.risk.can_open_trade(latest_closed_ts, self.bar_count)
                 v42_sig = self.strategy.evaluate_bar(enriched, idx=-1) if v42_ok else None
                 if v42_sig is not None:
-                    self._preempt_mr_b_for_v42(v42_sig, latest_closed_ts, close_p, has_pos)
+                    if stale_bar:
+                        logger.warning("Blocked PREEMPT_V42 %s due to %s", v42_sig.direction, stale_reason)
+                        self.journal.log(
+                            "signal_blocked",
+                            bar_ts=latest_closed_ts,
+                            strategy_id="v4.2",
+                            direction=v42_sig.direction,
+                            reason=v42_sig.reason,
+                            entry_price=v42_sig.entry_price,
+                            atr=v42_sig.atr,
+                            block_reason=stale_reason,
+                            processed_lag_sec=round(processed_lag_sec, 2),
+                        )
+                    else:
+                        self._preempt_mr_b_for_v42(v42_sig, latest_closed_ts, close_p, has_pos)
                     return
 
             if (
@@ -2156,6 +2182,25 @@ class IBKRNQBotRunner:
 
         # 5. Execute priority v4.2 signal or fall back to MR-B when enabled
         if signal is not None:
+            if stale_bar:
+                logger.warning(
+                    "Blocked [v4.2] %s signal @ %.2f due to %s",
+                    signal.direction,
+                    signal.entry_price,
+                    stale_reason,
+                )
+                self.journal.log(
+                    "signal_blocked",
+                    bar_ts=latest_closed_ts,
+                    strategy_id="v4.2",
+                    direction=signal.direction,
+                    reason=signal.reason,
+                    entry_price=signal.entry_price,
+                    atr=signal.atr,
+                    block_reason=stale_reason,
+                    processed_lag_sec=round(processed_lag_sec, 2),
+                )
+                return
             qty = self.risk.calculate_contracts(signal.stop_distance_points)
             self.journal.log(
                 "signal",
@@ -2186,6 +2231,25 @@ class IBKRNQBotRunner:
                     daily_bull_50=bool(self._daily_bull_50),
                 )
                 if mr_signal is not None:
+                    if stale_bar:
+                        logger.warning(
+                            "Blocked [MR-B] %s signal @ %.2f due to %s",
+                            mr_signal.direction,
+                            mr_signal.entry_price,
+                            stale_reason,
+                        )
+                        self.journal.log(
+                            "signal_blocked",
+                            bar_ts=latest_closed_ts,
+                            strategy_id="MR-B",
+                            direction=mr_signal.direction,
+                            reason=mr_signal.reason,
+                            entry_price=mr_signal.entry_price,
+                            atr=mr_signal.atr,
+                            block_reason=stale_reason,
+                            processed_lag_sec=round(processed_lag_sec, 2),
+                        )
+                        return
                     mr_qty = self.risk.calculate_mr_b_contracts()
                     raw_atr_pct = last.get("atr_pct", np.nan)
                     self.journal.log(
@@ -2565,25 +2629,8 @@ class IBKRNQBotRunner:
                     ):
                         self.ib.cancelOrder(ot.order)
 
-            # Reset multi-leg tracking once full position has closed
-            self._current_trade_realized_pnl = 0.0
-            self._current_trade_commissions = 0.0
-            self._current_trade_closed_qty = 0
-            self._current_trade_filled_qty = 0
-            self._closing_exec_qty = 0
-            self._last_exit_exec_utc = None
-            self._active_signal = None
-            self._active_strategy_id = "v4.2"
-            self._active_parent_order = None
-            self._active_parent_orders = []
-            self._active_tp_orders = []
-            self._active_stop_orders = []
-            self._active_tp1_order = None
-            self._active_tp_order = None
-            self._active_stop_order = None
-            self._trade_initial_tp1 = None
-            self._tp1_filled = False
-            self._entry_fill_handled = False
+            # Reset full active trade & signal state once full position has closed
+            self._reset_active_trade_state()
 
             halt_active = (
                 self.risk.state.account_halted
@@ -2676,6 +2723,16 @@ class IBKRNQBotRunner:
                     self._active_tp_order = None
                     self._active_tp_orders = []
                     self._active_tp1_order = None
+                    if self.contract is not None:
+                        terminal = ("Cancelled", "ApiCancelled", "Filled", "Inactive")
+                        for ot in self.ib.openTrades():
+                            ot_oid = int(getattr(getattr(ot, "order", None), "orderId", 0) or 0)
+                            if (
+                                ot.contract.conId == self.contract.conId
+                                and ot_oid not in (exec_oid, trade_oid)
+                                and getattr(getattr(ot, "orderStatus", None), "status", "") not in terminal
+                            ):
+                                self.ib.cancelOrder(ot.order)
             return
 
         self._current_trade_filled_qty += int(e.shares)

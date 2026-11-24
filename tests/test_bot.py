@@ -262,7 +262,7 @@ def test_delayed_paper_execution_collar_and_unset_double() -> None:
     assert isinstance(parent, StopLimitOrder)
     assert parent.action == "SELL"
     assert parent.lmtPrice == 27098.25  # 8 ticks (2.00 pts) marketable below 27100.25 signal
-    assert parent.auxPrice == 27106.25  # +6.0 pt collar prevents filling at 27147.75 / 27252.00
+    assert parent.auxPrice == 27103.75  # +3.5 pt collar prevents filling at 27147.75 / 27252.00
 
     # Simulate fill within collar at 27104.25 (+4.0 pts above signal) and verify SL/TP re-anchor & UNSET_DOUBLE
     fake_fill = SimpleNamespace(
@@ -1202,7 +1202,7 @@ def test_p1_entry_guards_and_p3_dynamic_sl_cap(tmp_path) -> None:
     runner.place_bracket_order(sig_short, quantity=1)
     p_short = runner._active_parent_order
     assert p_short.lmtPrice == 25614.25  # -2.00 pts marketable SHORT limit
-    assert p_short.auxPrice == 25622.25  # +6.00 pts collar stop trigger
+    assert p_short.auxPrice == 25619.75  # +3.50 pts collar stop trigger
 
     # Check LONG limit/collar symmetry before testing runaway cancel
     placed_orders.clear()
@@ -1224,7 +1224,7 @@ def test_p1_entry_guards_and_p3_dynamic_sl_cap(tmp_path) -> None:
     runner.place_bracket_order(sig_long, quantity=1)
     p_long = runner._active_parent_order
     assert p_long.lmtPrice == 25002.00  # +2.00 pts marketable LONG limit
-    assert p_long.auxPrice == 24994.00  # -6.00 pts collar stop trigger
+    assert p_long.auxPrice == 24996.50  # -3.50 pts collar stop trigger
 
     # Re-submit SHORT @ 25616.25 and feed forming bar where price runs -21.25 pts (low=25595.00) without fill
     placed_orders.clear()
@@ -1893,3 +1893,137 @@ def test_runner_mr_b_bracket_no_scaleout_reanchor_preempt_and_recovery(tmp_path)
     ok_short = runner_short._refresh_daily_regime(pd.Timestamp("2026-10-20 10:00:00-04:00"))
     assert ok_short is False
     assert runner_short._daily_bull_50 is False
+
+
+def test_collar_35_stale_lag_guard_and_immediate_close_cleanup(tmp_path) -> None:
+    """Verify 3.5pt collar, 20s stale-bar guard, immediate exit sibling cancel, and full state reset."""
+    import json
+    from types import SimpleNamespace
+    from ib_async import Future, LimitOrder, StopOrder
+    from ibkr_execution import IBKRNQBotRunner
+    from strategy import TradeSignal
+    from trade_journal import TradeJournal
+
+    cfg = BotConfig()
+    assert cfg.risk.entry_collar_points == 3.5
+    assert cfg.risk.max_signal_bar_lag_sec == 20.0
+    cfg.risk.fixed_contracts = 2
+    cfg.risk.enable_partial_tp = True
+    cfg.risk.max_daily_loss_usd = 1000.0
+
+    # Verify _is_signal_bar_stale bounds (20s..300s blocked; fresh <=20s & delayed >=300s allowed)
+    runner = IBKRNQBotRunner(cfg, mode="paper")
+    assert runner._is_signal_bar_stale(4.0)[0] is False
+    stale, reason = runner._is_signal_bar_stale(35.0)
+    assert stale is True and "Stale signal bar lag" in reason
+    assert runner._is_signal_bar_stale(600.0)[0] is False  # IBKR 10m delayed fallback unaffected
+
+    runner.journal = TradeJournal(base_dir=str(tmp_path / "j_lag"), timezone="America/New_York")
+    runner.contract = Future(conId=815824267, symbol="MNQ", localSymbol="MNQZ6", multiplier="2", exchange="CME", currency="USD")
+    runner._send_discord_alert = lambda *a, **k: None
+    runner._daily_regime_date = pd.Timestamp.now(tz="America/New_York").date()
+    runner._daily_bull_50 = False
+
+    req_ids = iter(range(7000, 7200))
+    placed_orders = []
+    cancelled_orders = []
+    open_trades = []
+    runner.ib.client = SimpleNamespace(getReqId=lambda: next(req_ids), isConnected=lambda: False)
+    runner.ib.placeOrder = lambda c, o: placed_orders.append(o) or open_trades.append(
+        SimpleNamespace(contract=c, order=o, orderStatus=SimpleNamespace(status="Submitted"))
+    )
+    runner.ib.cancelOrder = lambda o: cancelled_orders.append(o)
+    runner.ib.openTrades = lambda: list(open_trades)
+    runner.ib.trades = lambda: list(open_trades)
+    runner.ib.positions = lambda: []
+
+    # Prepare two signals matching LONG / SHORT 3.5pt collar
+    now_utc = pd.Timestamp.now(tz="UTC")
+    stale_closed_ts = now_utc - pd.Timedelta(seconds=155)  # bar end = now - 35s => lag ~35s
+    fresh_closed_ts = now_utc - pd.Timedelta(seconds=124)  # bar end = now - 4s  => lag ~4s
+
+    sig_l = TradeSignal(
+        timestamp=fresh_closed_ts, direction="LONG", reason="Bullish Pullback",
+        entry_price=26300.0, stop_loss=26260.0, take_profit=26500.0,
+        stop_distance_points=40.0, atr=45.0, rsi=55.0, vwap=26250.0, ema_fast=26295.0, ema_slow=26280.0,
+    )
+    sig_s = TradeSignal(
+        timestamp=fresh_closed_ts, direction="SHORT", reason="Bearish Pullback",
+        entry_price=26300.0, stop_loss=26340.0, take_profit=26100.0,
+        stop_distance_points=40.0, atr=45.0, rsi=42.0, vwap=26350.0, ema_fast=26305.0, ema_slow=26320.0,
+    )
+    runner.place_bracket_order(sig_l, quantity=2)
+    assert runner._active_parent_orders[0].auxPrice == 26296.5  # -3.50 pt LONG collar
+    runner._reset_active_trade_state()
+    placed_orders.clear()
+    open_trades.clear()
+
+    runner.place_bracket_order(sig_s, quantity=2)
+    assert runner._active_parent_orders[0].auxPrice == 26303.5  # +3.50 pt SHORT collar
+    runner._reset_active_trade_state()
+    placed_orders.clear()
+    open_trades.clear()
+
+    # Stale bar (~35s lag) must block v4.2 signal and log signal_blocked with 0 orders
+    runner.risk.should_flatten_eod = lambda ts: False
+    runner.risk.can_open_trade = lambda ts, idx=None: (True, "OK")
+    runner.strategy.prepare_dataframe = lambda d: d.assign(
+        atr=45.0, vwap=26250.0, vwap_z=1.1, ema_fast=26295.0, ema_slow=26280.0,
+        hurst_vr=0.55, kalman_vel_atr=0.2,
+    )
+    runner.strategy.evaluate_bar = lambda d, idx=-1: TradeSignal(
+        timestamp=d.iloc[-1]["timestamp"], direction="LONG", reason="Bullish Pullback",
+        entry_price=26300.0, stop_loss=26260.0, take_profit=26500.0,
+        stop_distance_points=40.0, atr=45.0, rsi=55.0, vwap=26250.0, ema_fast=26295.0, ema_slow=26280.0,
+    )
+
+    def _two_bar_df(closed_ts):
+        return pd.DataFrame(
+            {
+                "timestamp": [closed_ts - pd.Timedelta(minutes=2), closed_ts],
+                "open": [26290.0, 26295.0],
+                "high": [26298.0, 26302.0],
+                "low": [26288.0, 26292.0],
+                "close": [26295.0, 26300.0],
+                "volume": [1000.0, 1200.0],
+            }
+        )
+
+    runner._on_bar_update(_two_bar_df(stale_closed_ts), has_new_bar=True)
+    assert len(placed_orders) == 0
+    evs = [
+        json.loads(line)
+        for p in sorted((tmp_path / "j_lag" / "events").glob("*.jsonl"))
+        for line in p.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    blocked = [e for e in evs if e.get("event") == "signal_blocked"]
+    assert len(blocked) == 1 and "Stale signal bar lag" in blocked[0]["block_reason"]
+
+    # Fresh bar (~4s lag) executes normally, and closing fill immediately cancels orphan sibling + resets full state
+    runner._on_bar_update(_two_bar_df(fresh_closed_ts), has_new_bar=True)
+    assert len(placed_orders) == 6  # 2 legs x (parent + TP + SL)
+    p1 = runner._active_parent_orders[0]
+    tp1 = runner._active_tp1_order
+    orphan_stp = StopOrder(action="SELL", totalQuantity=2, stopPrice=26260.0)
+    orphan_stp.orderId = 9999
+    open_trades.append(SimpleNamespace(contract=runner.contract, order=orphan_stp, orderStatus=SimpleNamespace(status="Submitted")))
+
+    runner._on_exec_details(
+        SimpleNamespace(),
+        SimpleNamespace(contract=runner.contract, execution=SimpleNamespace(orderId=p1.orderId, side="BOT", shares=2, price=26300.0, time=now_utc)),
+    )
+    runner._be_moved = True
+    # Simulated 2-contract closing fill (not matching tp1_order.orderId -> exercises closing-leg branch)
+    close_exec = SimpleNamespace(orderId=8888, side="SLD", shares=2, price=26260.0, time=now_utc)
+    runner._on_exec_details(SimpleNamespace(), SimpleNamespace(contract=runner.contract, execution=close_exec))
+    assert orphan_stp in cancelled_orders
+
+    runner._on_commission_report(
+        SimpleNamespace(),
+        SimpleNamespace(execution=close_exec),
+        SimpleNamespace(realizedPNL=-162.48, commission=2.48),
+    )
+    assert runner._signal_bar_ts is None
+    assert runner._trade_entry_price is None
+    assert runner._be_moved is False
